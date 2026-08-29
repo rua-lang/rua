@@ -261,7 +261,41 @@ pub enum Key {
     /// f64 bits, so that 1.0 and 1 hash alike.
     Num(u64),
     Bool(bool),
+    /// A raw C pointer used as a key.
     Ptr(usize),
+    /// A table or function used as a key: identity is its address, but the
+    /// value is kept so the entry holds it alive and hands the *same* thing
+    /// back — an address alone would be both a dangling identity and, once
+    /// returned to a script, a forged `cdata` pointer.
+    Obj(ObjKey),
+}
+
+/// A table or function as a table key: hashed and compared by identity.
+#[derive(Clone, Debug)]
+pub struct ObjKey(pub Value);
+
+impl ObjKey {
+    fn addr(&self) -> usize {
+        match &self.0 {
+            Value::Table(t) => Rc::as_ptr(t) as usize,
+            Value::Func(f) => Rc::as_ptr(f) as usize,
+            Value::Native(n) => Rc::as_ptr(n) as usize,
+            other => other as *const Value as usize,
+        }
+    }
+}
+
+impl PartialEq for ObjKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr() == other.addr()
+    }
+}
+impl Eq for ObjKey {}
+
+impl std::hash::Hash for ObjKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr().hash(state)
+    }
 }
 
 impl Key {
@@ -270,9 +304,7 @@ impl Key {
             Value::Str(s) => Key::Str(s.clone()),
             Value::Num(n) => Key::Num(n.to_bits()),
             Value::Bool(b) => Key::Bool(*b),
-            Value::Table(t) => Key::Ptr(Rc::as_ptr(t) as usize),
-            Value::Func(t) => Key::Ptr(Rc::as_ptr(t) as usize),
-            Value::Native(t) => Key::Ptr(Rc::as_ptr(t) as usize),
+            Value::Table(_) | Value::Func(_) | Value::Native(_) => Key::Obj(ObjKey(v.clone())),
             Value::Ptr(p) => Key::Ptr(*p as usize),
             Value::Cell(c) => return Key::from_value(&c.borrow()),
             Value::Nil => return err("table index is nil"),
@@ -285,6 +317,7 @@ impl Key {
             Key::Num(b) => Value::Num(f64::from_bits(*b)),
             Key::Bool(b) => Value::Bool(*b),
             Key::Ptr(p) => Value::Ptr(*p as *mut c_void),
+            Key::Obj(o) => o.0.clone(),
         }
     }
 }

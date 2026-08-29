@@ -934,3 +934,26 @@ fn a_failed_require_can_be_retried() {
     let src = format!(r#"require("{p}").n"#, p = path.display());
     assert_eq!(vm.eval(&src).unwrap()[0], Value::Num(7.0));
 }
+
+/// A table or function used as a key stays alive and comes back as itself —
+/// it used to be stored as a bare address, which both dangled and handed
+/// scripts a forged `cdata` pointer out of `keys()`.
+#[test]
+fn object_keys_keep_their_identity() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let m = #{}
+        let k = [1, 2]
+        m[k] = "value"
+        let back = m.keys()[0]
+        return type(back), m[k], m[back], back.len()
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out[0].to_string(), "table", "a table key comes back a table");
+    assert_eq!(out[1].to_string(), "value");
+    assert_eq!(out[2].to_string(), "value", "the key still finds its entry");
+    assert_eq!(out[3], Value::Num(2.0));
+}

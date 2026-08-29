@@ -1804,6 +1804,12 @@ impl Ctx {
     }
 
     fn call(&mut self, f: &Expr, args: &[Expr]) -> Lower<TokenStream> {
+        // A callee can trap — on its own depth check, or on a table that is not
+        // dense numbers — and a trap unwinds to the interpreter, which re-runs
+        // the whole call. That is only safe while nothing has been written yet.
+        if self.writes {
+            return Err("a call from code that also writes".into());
+        }
         // self recursion: call the very symbol we are generating
         let is_self = match f {
             Expr::Upval(i, _) => Some(*i) == self.self_ref.upval,
