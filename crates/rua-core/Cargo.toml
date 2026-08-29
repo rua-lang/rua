@@ -1,0 +1,11 @@
+[package]
+name = "rua-core"
+version = "0.1.0"
+edition = "2021"
+description = "rua runtime: values, tables, interpreter and standard library"
+license = "MIT"
+
+[dependencies]
+rua-syntax = { path = "../rua-syntax", version = "0.1.0" }
+rua-jit = { path = "../rua-jit", version = "0.1.0" }
+rua-ffi = { path = "../rua-ffi", version = "0.1.0" }

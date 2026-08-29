@@ -1,0 +1,13 @@
+#!/usr/bin/env rua
+// Multi file scripts: `require` runs a file once and returns its value.
+let vec2 = require("examples/lib/vec2.rua");
+
+// `::` calls a function out of the table; `.` would pass the table as the
+// receiver, exactly as in Rust
+let a = vec2::make(3, 4);
+let b = vec2::make(1, 1);
+let sum = vec2::add(a, b);
+
+print("len(a)      =", vec2::len(a));
+print("a + b       =", format("({}, {})", sum.x, sum.y));
+print("loaded once =", require("examples/lib/vec2.rua") == vec2);

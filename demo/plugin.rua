@@ -1,0 +1,10 @@
+// Calling a Rust cdylib from rua. Same door as C: the `extern "C"` ABI.
+let plugin = ffi::load("./demo/libruaplugin.so");
+
+let add = ffi::cdef(plugin, "double rust_add(double a, double b)");
+let fib = ffi::cdef(plugin, "int rust_fib(int n)");
+let shout = ffi::cdef(plugin, "const char *rust_shout(const char *s)");
+
+print("rust_add(1.5, 2.25) =", add(1.5, 2.25));
+print("rust_fib(30)        =", fib(30));
+print("rust_shout(...)     =", shout("rua is rust shaped"));

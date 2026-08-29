@@ -1,0 +1,10 @@
+[package]
+name = "rua-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "rua FFI: a small C declaration parser and libffi dispatch"
+license = "MIT"
+
+[dependencies]
+libffi = "5"
+libloading = "0.9"

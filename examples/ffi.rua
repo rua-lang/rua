@@ -1,0 +1,16 @@
+// Call C from rua, LuaJIT style.
+let m = ffi::load("m");                                 // libm
+let cos = ffi::cdef(m, "double cos(double x)");
+let pow = ffi::cdef(m, "double pow(double x, double y)");
+
+print("cos(0)     =", cos(0));
+print("pow(2, 10) =", pow(2, 10));
+
+// ffi::C is this process, so libc is already there
+let strlen = ffi::cdef(ffi::C, "size_t strlen(const char *s)");
+let getenv = ffi::cdef(ffi::C, "char *getenv(const char *name)");
+let abs = ffi::cdef("int abs(int n)");                  // library defaults to ffi::C
+
+print("strlen     =", strlen("hello, rua"));
+print("abs(-42)   =", abs(-42));
+print("HOME       =", getenv("HOME"));

@@ -1,0 +1,14 @@
+[package]
+name = "rua-jit"
+version = "0.1.0"
+edition = "2021"
+description = "rua JIT: lowers the numeric subset to Rust, compiles it with rustc, loads it back"
+license = "MIT"
+
+[dependencies]
+rua-syntax = { path = "../rua-syntax", version = "0.1.0" }
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full", "parsing", "printing"] }
+prettyplease = "0.2"
+libloading = "0.9"

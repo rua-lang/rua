@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/*"]
+
+[package]
+name = "rua"
+version = "0.1.0"
+edition = "2021"
+description = "A small Rust-shaped scripting language: interpreter, rustc-backed JIT, and C/Rust FFI"
+license = "MIT"
+
+# The `rua` crate is the facade: it re-exports the pieces below. `rua-capi` is
+# deliberately not a dependency — it builds `librua.so` for C, and that name
+# would collide with this crate.
+[dependencies]
+rua-syntax = { path = "crates/rua-syntax", version = "0.1.0" }
+rua-core = { path = "crates/rua-core", version = "0.1.0" }
+rua-jit = { path = "crates/rua-jit", version = "0.1.0" }
+rua-ffi = { path = "crates/rua-ffi", version = "0.1.0" }
+
+[profile.release]
+opt-level = 3

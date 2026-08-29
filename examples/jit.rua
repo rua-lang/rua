@@ -1,0 +1,37 @@
+// Hot numeric functions get compiled by rustc and called as native code.
+fn fib(n) {
+    if n < 2 { return n; }
+    fib(n - 1) + fib(n - 2)
+}
+
+fn mandel(cx, cy) {
+    let zx = 0.0;
+    let zy = 0.0;
+    let i = 0;
+    while i < 200 && zx * zx + zy * zy < 4.0 {
+        let nx = zx * zx - zy * zy + cx;
+        zy = 2.0 * zx * zy + cy;
+        zx = nx;
+        i += 1;
+    }
+    i
+}
+
+let t0 = os::clock();
+print("fib(28) =", fib(28));
+print(format("elapsed: {:.3}s", os::clock() - t0));
+
+let total = 0;
+let y = -1.0;
+while y < 1.0 {
+    let x = -2.0;
+    while x < 0.5 {
+        total += mandel(x, y);
+        x += 0.02;
+    }
+    y += 0.05;
+}
+print("mandel total:", total);
+
+let (on, compiled, bailed, why) = jit::status();
+print("jit:", on, "compiled:", compiled, "bailed:", bailed, why);

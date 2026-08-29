@@ -1,0 +1,720 @@
+//! Recursive descent + precedence climbing over the Rust-shaped grammar.
+//!
+//! The one rule worth stating out loud: a block's last expression, written
+//! without a trailing `;`, is the block's value — as in Rust.
+
+use crate::ast::*;
+use crate::lexer::{Lexed, Lexer, Tok};
+use std::rc::Rc;
+
+pub struct Parser {
+    toks: Vec<Lexed>,
+    pos: usize,
+    anon: usize,
+}
+
+type PResult<T> = Result<T, String>;
+
+pub fn parse(src: &str) -> PResult<Block> {
+    let toks = Lexer::tokenize(src)?;
+    let mut p = Parser { toks, pos: 0, anon: 0 };
+    let b = p.block_body(Tok::Eof)?;
+    p.expect(Tok::Eof)?;
+    Ok(b)
+}
+
+impl Parser {
+    fn peek(&self) -> &Tok {
+        &self.toks[self.pos].tok
+    }
+    fn line(&self) -> u32 {
+        self.toks[self.pos].line
+    }
+    fn bump(&mut self) -> Tok {
+        let t = self.toks[self.pos].tok.clone();
+        if self.pos + 1 < self.toks.len() {
+            self.pos += 1;
+        }
+        t
+    }
+    fn accept(&mut self, t: Tok) -> bool {
+        if *self.peek() == t {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, t: Tok) -> PResult<()> {
+        if *self.peek() == t {
+            self.bump();
+            Ok(())
+        } else {
+            Err(format!("line {}: expected {:?}, found {:?}", self.line(), t, self.peek()))
+        }
+    }
+    fn name(&mut self) -> PResult<Rc<str>> {
+        let line = self.line();
+        match self.bump() {
+            Tok::Name(n) => Ok(n.into()),
+            other => Err(format!("line {line}: expected a name, found {other:?}")),
+        }
+    }
+
+    /// `{ ... }`
+    fn block(&mut self) -> PResult<Block> {
+        self.expect(Tok::LBrace)?;
+        let b = self.block_body(Tok::RBrace)?;
+        self.expect(Tok::RBrace)?;
+        Ok(b)
+    }
+
+    fn block_body(&mut self, end: Tok) -> PResult<Block> {
+        let mut stats = Vec::new();
+        let mut lines = Vec::new();
+        let mut tail = None;
+        let mut tail_line = 0;
+        while *self.peek() != end && *self.peek() != Tok::Eof {
+            if self.accept(Tok::Semi) {
+                continue;
+            }
+            let line = self.line();
+            match self.statement()? {
+                Item::Stat(s) => {
+                    stats.push(s);
+                    lines.push(line);
+                }
+                Item::Value(e) => {
+                    // an expression with no `;`: the block's value if it is last
+                    if *self.peek() == end || *self.peek() == Tok::Eof {
+                        tail = Some(Box::new(e));
+                        tail_line = line;
+                        break;
+                    }
+                    stats.push(Stat::Expr(e));
+                    lines.push(line);
+                }
+            }
+        }
+        Ok(Block { stats, lines, tail, tail_line })
+    }
+
+    fn statement(&mut self) -> PResult<Item> {
+        let line = self.line();
+        match self.peek().clone() {
+            Tok::Let => {
+                self.bump();
+                let names = self.let_pattern()?;
+                let exprs = if self.accept(Tok::Assign) {
+                    self.exprlist()?
+                } else {
+                    Vec::new()
+                };
+                self.accept(Tok::Semi);
+                Ok(Item::Stat(Stat::Let(names, exprs)))
+            }
+            Tok::Fn => {
+                self.bump();
+                let name = self.name()?;
+                let f = self.funcbody(name.to_string(), line)?;
+                // `fn f() {}` binds a local, so recursion and shadowing work
+                Ok(Item::Stat(Stat::FnDecl(name, f)))
+            }
+            Tok::Return => {
+                self.bump();
+                let exprs = if matches!(self.peek(), Tok::Semi | Tok::RBrace | Tok::Eof) {
+                    Vec::new()
+                } else {
+                    self.exprlist()?
+                };
+                self.accept(Tok::Semi);
+                Ok(Item::Stat(Stat::Return(exprs)))
+            }
+            Tok::Break => {
+                self.bump();
+                self.accept(Tok::Semi);
+                Ok(Item::Stat(Stat::Break))
+            }
+            Tok::Continue => {
+                self.bump();
+                self.accept(Tok::Semi);
+                Ok(Item::Stat(Stat::Continue))
+            }
+            Tok::While => {
+                self.bump();
+                let cond = self.expr_no_struct()?;
+                let body = self.block()?;
+                Ok(Item::Stat(Stat::While(next_loop_id(), cond, body)))
+            }
+            Tok::Loop => {
+                self.bump();
+                let body = self.block()?;
+                Ok(Item::Stat(Stat::Loop(next_loop_id(), body)))
+            }
+            Tok::For => {
+                self.bump();
+                let vars = self.let_pattern()?;
+                self.expect(Tok::In)?;
+                let iter = self.expr_no_struct()?;
+                let body = self.block()?;
+                Ok(Item::Stat(match iter {
+                    // `for i in a..b` is a counted loop: the JIT can compile it
+                    Expr::Range(start, end, inclusive) if vars.len() == 1 => Stat::ForRange {
+                        id: next_loop_id(),
+                        var: vars.into_iter().next().unwrap(),
+                        binding: None,
+                        start: *start,
+                        end: *end,
+                        inclusive,
+                        body,
+                    },
+                    other => Stat::ForIn {
+                        id: next_loop_id(),
+                        vars,
+                        bindings: Vec::new(),
+                        iter: other,
+                        body,
+                    },
+                }))
+            }
+            _ => {
+                let e = self.expr()?;
+                // assignment?
+                if let Some(op) = compound_op(self.peek()) {
+                    self.bump();
+                    let v = self.expr()?;
+                    self.accept(Tok::Semi);
+                    check_target(&e, line)?;
+                    return Ok(Item::Stat(Stat::OpAssign(e, op, v)));
+                }
+                if self.accept(Tok::Assign) {
+                    let vals = self.exprlist()?;
+                    self.accept(Tok::Semi);
+                    check_target(&e, line)?;
+                    return Ok(Item::Stat(Stat::Assign(vec![e], vals)));
+                }
+                if self.accept(Tok::Semi) {
+                    return Ok(Item::Stat(Stat::Expr(e)));
+                }
+                // a block-shaped expression can stand alone as a statement
+                if matches!(e, Expr::If(..) | Expr::Do(_)) && !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                    return Ok(Item::Stat(Stat::Expr(e)));
+                }
+                Ok(Item::Value(e))
+            }
+        }
+    }
+
+    /// `x`, `mut x`, or `(a, b)` — the shapes `let` and `for` accept.
+    fn let_pattern(&mut self) -> PResult<Vec<Rc<str>>> {
+        self.accept(Tok::Mut);
+        if self.accept(Tok::LParen) {
+            let mut names = Vec::new();
+            loop {
+                self.accept(Tok::Mut);
+                names.push(self.name()?);
+                if !self.accept(Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+            Ok(names)
+        } else {
+            Ok(vec![self.name()?])
+        }
+    }
+
+    fn funcbody(&mut self, name: String, line: u32) -> PResult<Expr> {
+        self.expect(Tok::LParen)?;
+        let mut params = Vec::new();
+        if !self.accept(Tok::RParen) {
+            loop {
+                self.accept(Tok::Mut);
+                params.push(self.name()?);
+                if !self.accept(Tok::Comma) {
+                    break;
+                }
+            }
+            self.expect(Tok::RParen)?;
+        }
+        // an optional `-> T` is accepted and ignored: rua is dynamically typed
+        if self.accept(Tok::Arrow) {
+            self.name()?;
+        }
+        let body = self.block()?;
+        Ok(Expr::Func(Rc::new(FuncDef::new(name, params, body, line))))
+    }
+
+    fn closure(&mut self) -> PResult<Expr> {
+        let line = self.line();
+        let mut params = Vec::new();
+        if self.accept(Tok::OrOr) {
+            // `||` — no parameters
+        } else {
+            self.expect(Tok::Pipe)?;
+            if !self.accept(Tok::Pipe) {
+                loop {
+                    self.accept(Tok::Mut);
+                    params.push(self.name()?);
+                    if !self.accept(Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Tok::Pipe)?;
+            }
+        }
+        self.anon += 1;
+        let name = String::new(); // anonymous: nothing useful to put in an error
+        let body = if *self.peek() == Tok::LBrace {
+            self.block()?
+        } else {
+            Block {
+                stats: Vec::new(),
+                lines: Vec::new(),
+                tail: Some(Box::new(self.expr()?)),
+                tail_line: line,
+            }
+        };
+        Ok(Expr::Func(Rc::new(FuncDef::new(name, params, body, line))))
+    }
+
+    fn exprlist(&mut self) -> PResult<Vec<Expr>> {
+        let mut v = vec![self.expr()?];
+        while self.accept(Tok::Comma) {
+            v.push(self.expr()?);
+        }
+        Ok(v)
+    }
+
+    fn expr(&mut self) -> PResult<Expr> {
+        self.binexpr(0, true)
+    }
+
+    /// Conditions and `for` iterables: a `{` here opens the body, not a map.
+    fn expr_no_struct(&mut self) -> PResult<Expr> {
+        self.binexpr(0, false)
+    }
+
+    fn binexpr(&mut self, limit: u8, structs: bool) -> PResult<Expr> {
+        let mut left = match self.peek().clone() {
+            Tok::Bang => {
+                self.bump();
+                Expr::Un(UnOp::Not, Box::new(self.binexpr(UNARY_PRI, structs)?))
+            }
+            Tok::Minus => {
+                self.bump();
+                Expr::Un(UnOp::Neg, Box::new(self.binexpr(UNARY_PRI, structs)?))
+            }
+            _ => self.simple(structs)?,
+        };
+        loop {
+            // ranges sit between comparison and `+`, and never chain
+            if matches!(self.peek(), Tok::DotDot | Tok::DotDotEq) && RANGE_PRI > limit {
+                let inclusive = *self.peek() == Tok::DotDotEq;
+                self.bump();
+                let end = self.binexpr(RANGE_PRI, structs)?;
+                left = Expr::Range(Box::new(left), Box::new(end), inclusive);
+                continue;
+            }
+            let Some((op, lp, rp)) = binop(self.peek()) else { break };
+            if lp <= limit {
+                break;
+            }
+            self.bump();
+            let right = self.binexpr(rp, structs)?;
+            left = Expr::Bin(op, Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn simple(&mut self, structs: bool) -> PResult<Expr> {
+        match self.peek().clone() {
+            Tok::Pipe | Tok::OrOr => self.closure(),
+            Tok::Fn => {
+                let line = self.line();
+                self.bump();
+                self.anon += 1;
+                self.funcbody(String::new(), line)
+            }
+            _ => self.suffixed(structs),
+        }
+    }
+
+    fn array(&mut self) -> PResult<Expr> {
+        self.expect(Tok::LBracket)?;
+        let mut items = Vec::new();
+        while !self.accept(Tok::RBracket) {
+            items.push(self.expr()?);
+            if !self.accept(Tok::Comma) {
+                self.expect(Tok::RBracket)?;
+                break;
+            }
+        }
+        Ok(Expr::Array(items))
+    }
+
+    /// `#{ name: "x", [k]: v }`
+    fn map(&mut self) -> PResult<Expr> {
+        self.expect(Tok::Hash)?;
+        self.expect(Tok::LBrace)?;
+        let mut items = Vec::new();
+        while !self.accept(Tok::RBrace) {
+            let key = match self.peek().clone() {
+                Tok::LBracket => {
+                    self.bump();
+                    let k = self.expr()?;
+                    self.expect(Tok::RBracket)?;
+                    k
+                }
+                Tok::Str(s) => {
+                    self.bump();
+                    Expr::Str(s.into())
+                }
+                Tok::Num(n) => {
+                    self.bump();
+                    Expr::Num(n)
+                }
+                _ => Expr::Str(self.name()?),
+            };
+            self.expect(Tok::Colon)?;
+            items.push((key, self.expr()?));
+            if !self.accept(Tok::Comma) {
+                self.expect(Tok::RBrace)?;
+                break;
+            }
+        }
+        Ok(Expr::Map(items))
+    }
+
+    /// `match x { 0 => "zero", n if n > 9 => "big", _ => "other" }`
+    fn match_expr(&mut self) -> PResult<Expr> {
+        self.expect(Tok::Match)?;
+        let subject = self.expr_no_struct()?;
+        self.expect(Tok::LBrace)?;
+        let mut arms = Vec::new();
+        while !self.accept(Tok::RBrace) {
+            let mut patterns = vec![self.pattern()?];
+            while self.accept(Tok::Pipe) {
+                patterns.push(self.pattern()?);
+            }
+            let guard = if self.accept(Tok::If) { Some(self.expr_no_struct()?) } else { None };
+            self.expect(Tok::FatArrow)?;
+            let body = if *self.peek() == Tok::LBrace {
+                self.block()?
+            } else {
+                let line = self.line();
+                Block {
+                    stats: Vec::new(),
+                    lines: Vec::new(),
+                    tail: Some(Box::new(self.expr()?)),
+                    tail_line: line,
+                }
+            };
+            arms.push(Arm { patterns, guard, body });
+            if !self.accept(Tok::Comma) {
+                self.expect(Tok::RBrace)?;
+                break;
+            }
+        }
+        Ok(Expr::Match(Box::new(subject), arms))
+    }
+
+    fn pattern(&mut self) -> PResult<Pattern> {
+        let line = self.line();
+        Ok(match self.peek().clone() {
+            Tok::Name(n) if n == "_" => {
+                self.bump();
+                Pattern::Wild
+            }
+            Tok::Name(n) => {
+                self.bump();
+                Pattern::Bind(n.into(), None)
+            }
+            Tok::Num(_) | Tok::Str(_) | Tok::True | Tok::False | Tok::Nil => {
+                Pattern::Lit(self.primary(false)?)
+            }
+            Tok::Minus => {
+                self.bump();
+                match self.bump() {
+                    Tok::Num(n) => Pattern::Lit(Expr::Num(-n)),
+                    other => return Err(format!("line {line}: expected a number, found {other:?}")),
+                }
+            }
+            other => return Err(format!("line {line}: {other:?} is not a pattern")),
+        })
+    }
+
+    fn if_expr(&mut self) -> PResult<Expr> {
+        self.expect(Tok::If)?;
+        let mut arms = Vec::new();
+        let cond = self.expr_no_struct()?;
+        arms.push((cond, self.block()?));
+        let mut els = None;
+        while self.accept(Tok::Else) {
+            if *self.peek() == Tok::If {
+                self.bump();
+                let c = self.expr_no_struct()?;
+                arms.push((c, self.block()?));
+            } else {
+                els = Some(self.block()?);
+                break;
+            }
+        }
+        Ok(Expr::If(arms, els))
+    }
+
+    fn primary(&mut self, structs: bool) -> PResult<Expr> {
+        match self.peek().clone() {
+            Tok::Num(n) => {
+                self.bump();
+                Ok(Expr::Num(n))
+            }
+            Tok::Str(text) => {
+                let line = self.line();
+                self.bump();
+                interpolate(&text, line)
+            }
+            Tok::Nil => {
+                self.bump();
+                Ok(Expr::Nil)
+            }
+            Tok::True => {
+                self.bump();
+                Ok(Expr::Bool(true))
+            }
+            Tok::False => {
+                self.bump();
+                Ok(Expr::Bool(false))
+            }
+            Tok::Name(n) => {
+                self.bump();
+                Ok(Expr::Var(n.into()))
+            }
+            Tok::LParen => {
+                self.bump();
+                let e = self.expr()?;
+                self.expect(Tok::RParen)?;
+                Ok(e)
+            }
+            Tok::LBracket => self.array(),
+            Tok::Hash if structs => self.map(),
+            Tok::If => self.if_expr(),
+            Tok::Match => self.match_expr(),
+            Tok::LBrace if structs => Ok(Expr::Do(self.block()?)),
+            other => Err(format!("line {}: unexpected {:?}", self.line(), other)),
+        }
+    }
+
+    fn suffixed(&mut self, structs: bool) -> PResult<Expr> {
+        let mut e = self.primary(structs)?;
+        loop {
+            match self.peek().clone() {
+                // `a.b(x)` is a method call: `a` becomes the first argument
+                Tok::Dot => {
+                    self.bump();
+                    let k = self.name()?;
+                    if *self.peek() == Tok::LParen {
+                        let args = self.callargs()?;
+                        e = Expr::Method(Box::new(e), k, args);
+                    } else {
+                        e = Expr::Index(Box::new(e), Box::new(Expr::Str(k)));
+                    }
+                }
+                // `a::b(x)` is a plain path call, no receiver
+                Tok::ColonColon => {
+                    self.bump();
+                    let k = self.name()?;
+                    e = Expr::Index(Box::new(e), Box::new(Expr::Str(k)));
+                }
+                Tok::LBracket => {
+                    self.bump();
+                    let k = self.expr()?;
+                    self.expect(Tok::RBracket)?;
+                    e = Expr::Index(Box::new(e), Box::new(k));
+                }
+                Tok::LParen => {
+                    let args = self.callargs()?;
+                    e = Expr::Call(Box::new(e), args);
+                }
+                _ => return Ok(e),
+            }
+        }
+    }
+
+    fn callargs(&mut self) -> PResult<Vec<Expr>> {
+        self.expect(Tok::LParen)?;
+        if self.accept(Tok::RParen) {
+            return Ok(Vec::new());
+        }
+        let args = self.exprlist()?;
+        self.expect(Tok::RParen)?;
+        Ok(args)
+    }
+}
+
+/// `"a {x} b"` becomes `"a " + x + " b"`, and `{x:.2}` routes through
+/// `format`. `{{` and `}}` are literal braces.
+fn interpolate(text: &str, line: u32) -> PResult<Expr> {
+    if !text.contains('{') {
+        return Ok(Expr::Str(text.into()));
+    }
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut literal = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                chars.next();
+                literal.push('{');
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                chars.next();
+                literal.push('}');
+            }
+            // `{}` and `{:.2}` are `format` placeholders, not interpolation
+            '{' if matches!(chars.peek(), Some('}') | Some(':')) => {
+                literal.push('{');
+                for c in chars.by_ref() {
+                    literal.push(c);
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            '{' => {
+                let mut src = String::new();
+                let mut depth = 0usize;
+                let mut closed = false;
+                for c in chars.by_ref() {
+                    match c {
+                        '}' if depth == 0 => {
+                            closed = true;
+                            break;
+                        }
+                        '(' | '[' | '{' => {
+                            depth += 1;
+                            src.push(c);
+                        }
+                        ')' | ']' | '}' => {
+                            depth = depth.saturating_sub(1);
+                            src.push(c);
+                        }
+                        c => src.push(c),
+                    }
+                }
+                if !closed {
+                    return Err(format!("line {line}: unclosed `{{` in a string"));
+                }
+                if !literal.is_empty() {
+                    parts.push(Expr::Str(std::mem::take(&mut literal).into()));
+                }
+                let (expr_src, spec) = split_spec(&src);
+                let inner = parse_fragment(&expr_src, line)?;
+                parts.push(match spec {
+                    // `{x:.2}` is `format("{:.2}", x)`
+                    Some(spec) => Expr::Call(
+                        Box::new(Expr::Var("format".into())),
+                        vec![Expr::Str(format!("{{:{spec}}}").into()), inner],
+                    ),
+                    None => inner,
+                });
+            }
+            c => literal.push(c),
+        }
+    }
+    if !literal.is_empty() || parts.is_empty() {
+        parts.push(Expr::Str(literal.into()));
+    }
+    // start from a string so that `+` concatenates rather than adds
+    let mut out = match parts.first() {
+        Some(Expr::Str(_)) => parts.remove(0),
+        _ => Expr::Str("".into()),
+    };
+    for p in parts {
+        out = Expr::Bin(BinOp::Add, Box::new(out), Box::new(p));
+    }
+    Ok(out)
+}
+
+/// Split `expr:spec`, ignoring the `::` path operator and anything nested.
+fn split_spec(src: &str) -> (String, Option<String>) {
+    let bytes: Vec<char> = src.chars().collect();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                if bytes.get(i + 1) == Some(&':') {
+                    i += 2;
+                    continue;
+                }
+                let spec: String = bytes[i + 1..].iter().collect();
+                let expr: String = bytes[..i].iter().collect();
+                return (expr, Some(spec));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (src.to_string(), None)
+}
+
+/// Parse one expression out of a fragment of source, for interpolation.
+fn parse_fragment(src: &str, line: u32) -> PResult<Expr> {
+    let toks = Lexer::tokenize(src).map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
+    let mut p = Parser { toks, pos: 0, anon: 0 };
+    let e = p.expr().map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
+    if *p.peek() != Tok::Eof {
+        return Err(format!("line {line}: `{{{src}}}` is not a single expression"));
+    }
+    Ok(e)
+}
+
+enum Item {
+    Stat(Stat),
+    /// An expression with no trailing `;`.
+    Value(Expr),
+}
+
+fn check_target(e: &Expr, line: u32) -> PResult<()> {
+    match e {
+        Expr::Var(_) | Expr::Index(..) => Ok(()),
+        _ => Err(format!("line {line}: cannot assign to this expression")),
+    }
+}
+
+fn compound_op(t: &Tok) -> Option<BinOp> {
+    Some(match t {
+        Tok::PlusEq => BinOp::Add,
+        Tok::MinusEq => BinOp::Sub,
+        Tok::StarEq => BinOp::Mul,
+        Tok::SlashEq => BinOp::Div,
+        Tok::PercentEq => BinOp::Rem,
+        _ => return None,
+    })
+}
+
+const UNARY_PRI: u8 = 9;
+const RANGE_PRI: u8 = 4;
+
+/// (op, left priority, right priority).
+fn binop(t: &Tok) -> Option<(BinOp, u8, u8)> {
+    Some(match t {
+        Tok::OrOr => (BinOp::Or, 1, 1),
+        Tok::AndAnd => (BinOp::And, 2, 2),
+        Tok::Lt => (BinOp::Lt, 3, 3),
+        Tok::Gt => (BinOp::Gt, 3, 3),
+        Tok::Le => (BinOp::Le, 3, 3),
+        Tok::Ge => (BinOp::Ge, 3, 3),
+        Tok::Ne => (BinOp::Ne, 3, 3),
+        Tok::EqEq => (BinOp::Eq, 3, 3),
+        Tok::Plus => (BinOp::Add, 6, 6),
+        Tok::Minus => (BinOp::Sub, 6, 6),
+        Tok::Star => (BinOp::Mul, 7, 7),
+        Tok::Slash => (BinOp::Div, 7, 7),
+        Tok::Percent => (BinOp::Rem, 7, 7),
+        _ => return None,
+    })
+}

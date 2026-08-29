@@ -1,0 +1,8 @@
+// A module: the file's last expression is what `require` hands back.
+fn make(x, y) { #{ x: x, y: y } }
+
+fn add(a, b) { make(a.x + b.x, a.y + b.y) }
+
+fn len(v) { math::sqrt(v.x * v.x + v.y * v.y) }
+
+#{ make: make, add: add, len: len }

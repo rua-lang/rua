@@ -1,0 +1,40 @@
+// The usual.
+print("hello from rua");
+
+fn greet(who) {
+    "hello, " + who          // a block's last expression is its value
+}
+print(greet("world"));
+
+// arrays are zero based, and module functions double as methods
+let xs = [3, 1, 2];
+xs.push(4);
+xs.sort();
+print(xs.len(), xs.join(", "), xs[0]);
+
+for (i, v) in xs.iter() {
+    io::write(v, if i < xs.len() - 1 { " -> " } else { "\n" });
+}
+
+// maps
+let point = #{ x: 3, y: 4 };
+print(format("({}, {}) is {:.3} from the origin",
+             point.x, point.y, math::sqrt(point.x * point.x + point.y * point.y)));
+
+// closures
+fn counter() {
+    let n = 0;
+    || { n += 1; n }
+}
+let next_id = counter();
+print(next_id(), next_id(), next_id());
+
+// if is an expression
+let n = 7;
+let kind = if n % 2 == 0 { "even" } else { "odd" };
+print("{} is {}".format(n, kind));
+
+// ranges
+let total = 0;
+for i in 0..10 { total += i; }
+print("sum 0..10 =", total);

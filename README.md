@@ -1,0 +1,327 @@
+# rua
+
+A small scripting language with Rust's syntax, Lua's shape, and a JIT that is
+just `rustc`.
+
+```rust
+fn fib(n) {
+    if n < 2 { return n; }
+    fib(n - 1) + fib(n - 2)      // a block's last expression is its value
+}
+
+let xs = [3, 1, 2];
+xs.sort();
+for (i, v) in xs.iter() { print("{}: {}".format(i, v)); }
+
+let cos = ffi::cdef(ffi::load("m"), "double cos(double x)");
+print(cos(0));                   // 1
+```
+
+Three things make it interesting:
+
+1. **It JITs through `rustc`.** Hot numeric functions are lowered to Rust source
+   with `quote`, checked with `syn`, compiled by `rustc -O` into a cdylib, and
+   dlopen'd back into the running process.
+2. **It speaks C.** Scripts call C libraries with `ffi::cdef`, the way LuaJIT
+   does, and C programs embed the VM through `include/rua.h`.
+3. **It speaks Rust.** `Vm::register` exposes Rust closures to scripts, and
+   `extern "C"` Rust cdylibs load through the same `ffi::cdef` door as C.
+
+## Quick start
+
+```sh
+cargo build --release --workspace
+./target/release/rua examples/hello.rua
+./target/release/rua                        # REPL (top level `let` binds a global there)
+./target/release/rua -e 'print(6 * 7)'
+```
+
+```
+rua [options] [script.rua] [args...]
+  -e CHUNK      evaluate CHUNK
+  -i            REPL after the script
+  --no-jit      interpret everything
+  --jit N       compile a function after N calls (default 50)
+  --dump-jit    print the Rust the JIT generates
+```
+
+## The language
+
+Rust's surface, dynamically typed, everything an `f64` or a reference:
+
+```rust
+// items, closures, blocks-as-values
+fn counter() {
+    let n = 0;
+    || { n += 1; n }                  // closures capture by reference
+}
+let next = counter();
+print(next(), next(), next());        // 1 2 3
+
+let kind = if n % 2 == 0 { "even" } else { "odd" };
+
+// arrays (zero based) and maps
+let xs = [3, 1, 2];
+xs.push(4);
+xs.sort();
+print(xs.len(), xs.join(", "), xs[0]);
+
+let p = #{ x: 3, y: 4 };
+p.len = |self| math::sqrt(self.x * self.x + self.y * self.y);
+print(p.len());                       // 5
+
+// loops
+for i in 0..10 { if i % 2 == 0 { continue; } print(i); }
+for (k, v) in p.iter() { print(k, v); }
+while i < 10 { i += 1; }
+loop { break; }
+
+// multiple returns, destructured
+fn divmod(a, b) { return math::floor(a / b), a % b; }
+let (q, r) = divmod(17, 5);
+
+// errors are values
+let (ok, why) = try(|| error("boom"));
+```
+
+`.` is a method call and passes the receiver; `::` is a plain path, no
+receiver — exactly the Rust distinction. That is why `"ab".upper()` and
+`math::sqrt(2)` both read right: module functions *are* the methods, with the
+receiver as their first argument.
+
+Multiple files, since one file is rarely enough:
+
+```rust
+// vec2.rua — a file's last expression is what `require` hands back
+fn make(x, y) { #{ x: x, y: y } }
+fn len(v) { math::sqrt(v.x * v.x + v.y * v.y) }
+#{ make: make, len: len }
+```
+
+```rust
+let vec2 = require("vec2.rua");     // runs once, cached by path
+print(vec2::len(vec2::make(3, 4))); // 5
+```
+
+A top level `fn` is a global, the way a Rust item belongs to its module — that
+is how `require`, and an embedder, find it. A `fn` inside a block is a local.
+Scripts can start with `#!/usr/bin/env rua` and be run directly.
+
+When something goes wrong, the error says where:
+
+```
+rua: examples/x.rua:12: no method `nope` on a table value (in render)
+```
+
+Present: numbers, strings, booleans, `nil`, arrays, maps, closures, multiple
+returns, `if`/`while`/`loop`/`for`, ranges (`0..n`, `0..=n`), `break`,
+`continue`, `try`, `require`, and the `math` `string` `table` `os` `io` modules.
+`let mut` parses and is ignored — everything is mutable. So does `-> T` on a
+function.
+
+Absent on purpose: static types, traits, borrow checking, pattern matching,
+modules, integer/float distinction, string patterns, coroutines. This is a
+scripting language that reads like Rust, not Rust.
+
+## The JIT
+
+Three things get compiled, all of them through `rustc`:
+
+**Hot functions.** Every function counts its calls. Past the threshold (50, or
+`--jit N`) the compiler looks at it, and if the whole body lives in the *numeric
+subset* — arithmetic, comparisons, `&&`/`||`/`!`, locals, `if`, loops,
+`math::*`, calls to other compiled functions, self recursion — it lowers it to
+Rust. This:
+
+```rust
+fn collatz(n) {
+    let steps = 0;
+    while n > 1 {
+        if n % 2 == 0 { n = n / 2; } else { n = 3 * n + 1; }
+        steps += 1;
+    }
+    steps
+}
+```
+
+becomes this (`--dump-jit` output, verbatim):
+
+```rust
+#[no_mangle]
+pub extern "C" fn rua_jit_0(mut v0: f64) -> f64 {
+    let __t0: f64 = 0f64;
+    let mut v1: f64 = __t0;
+    while (v0 > 1f64) {
+        if (rua_rem(v0, 2f64) == 0f64) {
+            let __a0: f64 = (v0 / 2f64);
+            v0 = __a0;
+        } else {
+            let __a0: f64 = ((3f64 * v0) + 1f64);
+            v0 = __a0;
+        }
+        v1 += 1f64;
+    }
+    v1
+}
+```
+
+**Hot loops, mid-flight.** A loop that runs long enough inside a single call —
+50,000 iterations across its life — is compiled into a function over the numeric
+locals it touches, and the interpreter hands control to it *while the loop is
+running*, then picks the locals back up. That is on-stack replacement, and it is
+what makes a script's top level, or a `main` that is only ever called once, run
+at compiled speed.
+
+**Calls between compiled functions.** Compiling a function first compiles the
+helpers it calls, then emits direct calls to their machine code — no interpreter
+in between. If you later reassign one of those globals, every function that
+inlined it has its code thrown away and recompiles:
+
+```rust
+fn square(x) { x * x }
+fn hyp(a, b) { math::sqrt(square(a) + square(b)) }   // calls square directly
+
+square = |x| x * x * 10;                             // hyp is recompiled
+```
+
+Every value in compiled code is an `f64`; booleans are 1.0/0.0. Anything outside
+the subset — strings, tables, closures, captured locals, calls to interpreted
+functions, a body that can fall through and return nil — falls back to the
+interpreter. Results are identical either way, and `jit::status()` reports what
+compiled, what didn't, and why.
+
+Compiled code is cached in `~/.cache/rua-jit` (or `$XDG_CACHE_HOME`), keyed by a
+hash of the generated Rust, so the second run of a script skips `rustc`
+entirely. `RUA_JIT_CACHE=0` turns that off, `RUA_JIT_DIR` moves it.
+
+## Speed
+
+Same machine, same programs, best of three, `lua5.4` and `luajit` for scale.
+"rua + JIT" is a warm cache; a cold one adds about 50ms per compiled function or
+loop, once.
+
+| | rua interp | rua + JIT | lua 5.4 | luajit |
+|---|---|---|---|---|
+| `fib(30)` | 0.518s | **0.006s** | 0.056s | 0.009s |
+| 5M iteration loop, top level | 0.402s | **0.085s** | 0.107s | 0.014s |
+| 5M iteration loop in a function called once | 0.412s | **0.083s** | 0.085s | 0.013s |
+| 2M calls through two helper functions | 1.566s | **0.211s** | 0.207s | 0.017s |
+| 2000 calls × 500 iteration loop | 0.049s | **0.008s** | 0.010s | 0.004s |
+| build + sum a 300k array | 0.075s | 0.087s | 0.013s | 0.004s |
+
+Read that honestly:
+
+* **Numeric code that the JIT accepts lands at or below Lua 5.4**, sometimes
+  well below, because it really is `rustc -O` output being called directly.
+  LuaJIT still wins on the mixed cases; it is LuaJIT.
+* **The interpreter alone is 4–6x slower than Lua 5.4.** It is a tree-walker,
+  not a bytecode VM. What it does do is resolve every local to a frame slot
+  ahead of time, give globals array slots with inline caches, and keep calls
+  allocation-free — worth about 3x over the naive version it started as.
+* **Table-heavy code is not compiled at all** and is the weakest spot: the JIT
+  is a numeric compiler, so an array loop stays interpreted (and pays a little
+  for the attempt).
+
+## FFI: calling C
+
+```rust
+let m = ffi::load("m");                                   // dlopen libm
+let cos = ffi::cdef(m, "double cos(double x)");
+print(cos(0));                                            // 1
+
+let strlen = ffi::cdef("size_t strlen(const char *s)");   // defaults to ffi::C
+let getenv = ffi::cdef("char *getenv(const char *name)");
+print(strlen("hello"), getenv("HOME"));
+```
+
+Declarations are real C declarations, parsed from a small subset: the scalar
+types, `void`, and one level of pointer. `char *` crosses the boundary as a rua
+string, any other pointer as opaque `cdata`. Calls go through libffi, so the
+signature you write is the signature that is used — a wrong declaration is a
+wrong declaration, exactly as in LuaJIT.
+
+## FFI: calling Rust
+
+Rust's own ABI is unstable, so the boundary is `extern "C"` — the same door:
+
+```rust
+#[no_mangle]
+pub extern "C" fn rust_add(a: f64, b: f64) -> f64 { a + b }
+```
+
+```rust
+let plugin = ffi::load("./demo/libruaplugin.so");
+let add = ffi::cdef(plugin, "double rust_add(double a, double b)");
+print(add(1.5, 2.25));                                    // 3.75
+```
+
+`sh demo/run.sh` builds and runs this, plus the C embedding demo below.
+
+## Embedding in Rust
+
+```rust
+use rua::{Value, Vm};
+
+let mut vm = Vm::new();
+vm.register("hypot", |_vm, args| {
+    let (a, b) = (args[0].as_num()?, args[1].as_num()?);
+    Ok(vec![Value::Num((a * a + b * b).sqrt())])
+});
+vm.set_global("scale", Value::Num(3.0));
+vm.eval("fn area(r) { math::pi * r * r * scale }")?;
+
+let area = vm.get_global("area");          // top level `fn` is a global
+let out = vm.call(&area, vec![Value::Num(2.0)])?;
+```
+
+Full version: `cargo run --example embed`.
+
+## Embedding in C
+
+```c
+#include "rua.h"
+
+rua_State *S = rua_new();
+rua_register(S, "hypot", c_hypot);          /* double f(const double*, int) */
+rua_eval(S, "return hypot(3, 4);");
+printf("%g\n", rua_result_number(S, 0));    /* 5 */
+rua_close(S);
+```
+
+```sh
+cargo build --release --workspace
+cc demo/embed.c -I include -L target/release -lrua -lm -o embed
+LD_LIBRARY_PATH=target/release ./embed
+```
+
+## Layout
+
+A workspace, because the pieces genuinely do not need each other:
+
+```
+crates/rua-syntax    lexer, AST, parser, resolver          (no dependencies)
+crates/rua-jit       AST -> quote/syn -> rustc -> dlopen   (depends on syntax)
+crates/rua-ffi       C declaration parser, libffi calls    (knows nothing of rua values)
+crates/rua-core      values, tables, interpreter, stdlib   (depends on the three above)
+crates/rua-capi      the rua_* C ABI, built as librua.so
+crates/rua-cli       the `rua` command
+.                    the `rua` facade crate: re-exports the rest
+```
+
+The direction of the arrows is the point: the JIT sees only the AST and returns
+a function pointer, so the runtime owns every policy decision about when to
+compile. The FFI crate never sees a `Value`; `rua-core/src/cffi.rs` is the
+twenty lines that translate.
+
+## Tests
+
+```sh
+cargo test --workspace     # 24 tests: language, JIT-equals-interpreter, FFI, modules
+```
+
+The JIT tests run the same program with and without compilation and assert the
+results match. That is the invariant that matters.
+
+## License
+
+MIT

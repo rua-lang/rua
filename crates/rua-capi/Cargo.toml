@@ -1,0 +1,13 @@
+[package]
+name = "rua-capi"
+version = "0.1.0"
+edition = "2021"
+description = "rua C ABI: embed the VM in a C program (see include/rua.h)"
+license = "MIT"
+
+[lib]
+name = "rua"
+crate-type = ["cdylib"]
+
+[dependencies]
+rua-core = { path = "../rua-core", version = "0.1.0" }
