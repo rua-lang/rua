@@ -5,16 +5,18 @@ just `rustc`.
 
 ```rust
 fn fib(n) {
-    if n < 2 { return n; }
-    fib(n - 1) + fib(n - 2)      // a block's last expression is its value
+    if n < 2 { return n }        // a block's last expression is its value
+    fib(n - 1) + fib(n - 2)
 }
 
-let xs = [3, 1, 2];
-xs.sort();
-for (i, v) in xs.iter() { print("{}: {}".format(i, v)); }
+let xs = [3, 1, 2]               // semicolons optional
+xs.sort()
+for (i, v) in xs.iter() { print("{i}: {v}") }        // interpolation
 
-let cos = ffi::cdef(ffi::load("m"), "double cos(double x)");
-print(cos(0));                   // 1
+let size = match xs.len() { 0 => "empty", 1 | 2 => "small", n => "{n} items" }
+
+let cos = ffi::cdef(ffi::load("m"), "double cos(double x)")
+print(cos(0))                    // 1
 ```
 
 Three things make it interesting:
@@ -77,8 +79,16 @@ while i < 10 { i += 1; }
 loop { break; }
 
 // multiple returns, destructured
-fn divmod(a, b) { return math::floor(a / b), a % b; }
-let (q, r) = divmod(17, 5);
+fn divmod(a, b) { return math::floor(a / b), a % b }
+let (q, r) = divmod(17, 5)
+
+// match, with alternatives, bindings and guards
+let kind = match n {
+    0 => "zero",
+    1 | 2 | 3 => "small",
+    x if x < 0 => "negative",
+    x => "big: {x}",
+}
 
 // errors are values
 let (ok, why) = try(|| error("boom"));
@@ -114,14 +124,16 @@ rua: examples/x.rua:12: no method `nope` on a table value (in render)
 ```
 
 Present: numbers, strings, booleans, `nil`, arrays, maps, closures, multiple
-returns, `if`/`while`/`loop`/`for`, ranges (`0..n`, `0..=n`), `break`,
-`continue`, `try`, `require`, and the `math` `string` `table` `os` `io` modules.
-`let mut` parses and is ignored — everything is mutable. So does `-> T` on a
-function.
+returns, `match`, string interpolation, `if`/`while`/`loop`/`for`, ranges
+(`0..n`, `0..=n`), `break`, `continue`, `try`, `require`, and the `math`
+`string` `table` `os` `io` modules. Semicolons are optional; the one place a
+`;` changes meaning is at the end of a block, where it discards the value
+instead of returning it. `let mut` parses and is ignored — everything is
+mutable. So does `-> T` on a function.
 
-Absent on purpose: static types, traits, borrow checking, pattern matching,
-modules, integer/float distinction, string patterns, coroutines. This is a
-scripting language that reads like Rust, not Rust.
+Absent on purpose: static types, traits, borrow checking, destructuring
+patterns beyond `let (a, b)`, integer/float distinction, string patterns,
+coroutines. This is a scripting language that reads like Rust, not Rust.
 
 ## The JIT
 
@@ -165,12 +177,29 @@ pub extern "C" fn rua_jit_0(mut v0: f64) -> f64 {
 }
 ```
 
-**Hot loops, mid-flight.** A loop that runs long enough inside a single call —
-50,000 iterations across its life — is compiled into a function over the numeric
-locals it touches, and the interpreter hands control to it *while the loop is
-running*, then picks the locals back up. That is on-stack replacement, and it is
-what makes a script's top level, or a `main` that is only ever called once, run
-at compiled speed.
+**Hot loops, mid-flight.** A loop that runs 50,000 iterations across its life is
+compiled into a function over the locals it touches, and the interpreter hands
+control to it *while the loop is running*, then picks the locals back up. That
+is on-stack replacement, and it is what makes a script's top level, or a `main`
+that is only ever called once, run at compiled speed.
+
+**Tables, read-only.** A parameter that is only ever indexed or asked for its
+length is passed as a table. Compiled code gets a contiguous view of its array
+part — built on demand, thrown away by any write to the table, so it can never
+go stale — and reads elements straight out of it with a bounds check:
+
+```rust
+fn dot(a, b) {
+    let s = 0
+    for i in 0..a.len() { s += a[i] * b[i] }    // 4M reads: 0.028s, vs 0.063s in Lua
+    s
+}
+```
+
+If an element turns out not to be a number, compiled code *traps*: it sets a
+flag and returns, and the interpreter runs the call instead. That is sound
+precisely because compiled code never writes anything, so there is nothing to
+undo.
 
 **Calls between compiled functions.** Compiling a function first compiles the
 helpers it calls, then emits direct calls to their machine code — no interpreter
@@ -196,31 +225,31 @@ entirely. `RUA_JIT_CACHE=0` turns that off, `RUA_JIT_DIR` moves it.
 
 ## Speed
 
-Same machine, same programs, best of three, `lua5.4` and `luajit` for scale.
-"rua + JIT" is a warm cache; a cold one adds about 50ms per compiled function or
-loop, once.
+Same machine, same programs, best of three. `rua + JIT` is a warm cache; a cold
+one adds about 50ms per compiled function or loop, once.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| `fib(30)` | 0.518s | **0.006s** | 0.056s | 0.009s |
-| 5M iteration loop, top level | 0.402s | **0.085s** | 0.107s | 0.014s |
-| 5M iteration loop in a function called once | 0.412s | **0.083s** | 0.085s | 0.013s |
-| 2M calls through two helper functions | 1.566s | **0.211s** | 0.207s | 0.017s |
-| 2000 calls × 500 iteration loop | 0.049s | **0.008s** | 0.010s | 0.004s |
-| build + sum a 300k array | 0.075s | 0.087s | 0.013s | 0.004s |
+| `fib(30)` | 0.280s | **0.008s** | 0.053s | 0.009s |
+| 5M iteration loop, top level | 0.224s | **0.031s** | 0.087s | 0.022s |
+| 5M iteration loop in a function called once | 0.230s | **0.032s** | 0.084s | 0.013s |
+| 2M calls through two helper functions | 0.927s | **0.046s** | 0.205s | 0.024s |
+| 2000 calls × 500 iteration loop | 0.045s | **0.008s** | 0.010s | 0.008s |
+| dot product, 4M array reads | 0.487s | **0.028s** | 0.063s | 0.004s |
+| build + sum a 300k array | 0.069s | 0.053s | 0.013s | 0.007s |
 
 Read that honestly:
 
-* **Numeric code that the JIT accepts lands at or below Lua 5.4**, sometimes
-  well below, because it really is `rustc -O` output being called directly.
-  LuaJIT still wins on the mixed cases; it is LuaJIT.
-* **The interpreter alone is 4–6x slower than Lua 5.4.** It is a tree-walker,
-  not a bytecode VM. What it does do is resolve every local to a frame slot
-  ahead of time, give globals array slots with inline caches, and keep calls
-  allocation-free — worth about 3x over the naive version it started as.
-* **Table-heavy code is not compiled at all** and is the weakest spot: the JIT
-  is a numeric compiler, so an array loop stays interpreted (and pays a little
-  for the attempt).
+* **Numeric code the JIT accepts lands at or below LuaJIT**, because it really
+  is `rustc -O` output being called directly. The gap on the mixed cases is
+  LuaJIT's tracing compiler doing what it does.
+* **The interpreter alone is 2–4x slower than Lua 5.4.** It is a register
+  bytecode VM over slots the resolver assigned, with calls that pass arguments
+  and results through the register stack without allocating, but Lua's VM has
+  had twenty years of tuning.
+* **Building a table is the weak spot**: `push` is a method call the JIT does
+  not compile, so filling an array stays interpreted even though reading it
+  afterwards does not.
 
 ## FFI: calling C
 
@@ -302,7 +331,7 @@ A workspace, because the pieces genuinely do not need each other:
 crates/rua-syntax    lexer, AST, parser, resolver          (no dependencies)
 crates/rua-jit       AST -> quote/syn -> rustc -> dlopen   (depends on syntax)
 crates/rua-ffi       C declaration parser, libffi calls    (knows nothing of rua values)
-crates/rua-core      values, tables, interpreter, stdlib   (depends on the three above)
+crates/rua-core      values, bytecode compiler, VM, stdlib (depends on the three above)
 crates/rua-capi      the rua_* C ABI, built as librua.so
 crates/rua-cli       the `rua` command
 .                    the `rua` facade crate: re-exports the rest
@@ -313,10 +342,14 @@ a function pointer, so the runtime owns every policy decision about when to
 compile. The FFI crate never sees a `Value`; `rua-core/src/cffi.rs` is the
 twenty lines that translate.
 
+Inside `rua-core`, source becomes bytecode in `compile.rs` (registers are the
+resolver's slots, plus scratch above them) and runs in `vm.rs`. The AST stays
+alive next to the bytecode, because that is what the JIT reads.
+
 ## Tests
 
 ```sh
-cargo test --workspace     # 24 tests: language, JIT-equals-interpreter, FFI, modules
+cargo test --workspace     # 34 tests: language, JIT-equals-interpreter, FFI, modules
 ```
 
 The JIT tests run the same program with and without compilation and assert the
