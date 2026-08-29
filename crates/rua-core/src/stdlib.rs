@@ -25,6 +25,11 @@ where
     Value::Native(Rc::new(Native { name: name.to_string(), f: Box::new(f) }))
 }
 
+/// Everything after the first argument, without panicking when there is none.
+fn rest(args: &[Value]) -> &[Value] {
+    args.get(1..).unwrap_or(&[])
+}
+
 fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).cloned().unwrap_or(Value::Nil)
 }
@@ -79,7 +84,7 @@ fn base(vm: &mut Vm) {
         Ok(Vec::new())
     });
     vm.register("format", |_vm, args| {
-        one(Value::str(format_impl(&str_arg(args, 0)?, &args[1..])?))
+        one(Value::str(format_impl(&str_arg(args, 0)?, rest(args))?))
     });
     vm.register("type", |_vm, args| one(Value::str(arg(args, 0).type_name())));
     vm.register("str", |_vm, args| one(Value::str(arg(args, 0).to_string())));
@@ -153,7 +158,14 @@ fn base(vm: &mut Vm) {
         }
         // insert before running, so a cycle sees nil instead of looping
         vm.modules.insert(key.clone(), Value::Nil);
-        let out = vm.eval_file(&path)?;
+        let out = match vm.eval_file(&path) {
+            Ok(out) => out,
+            Err(e) => {
+                // a module that failed must be loadable again later
+                vm.modules.remove(&key);
+                return Err(e);
+            }
+        };
         let v = out.into_iter().next().unwrap_or(Value::Nil);
         vm.modules.insert(key, v.clone());
         one(v)
@@ -221,14 +233,14 @@ fn math(vm: &mut Vm) -> Rc<RefCell<Table>> {
             })),
             ("max", native("max", |_vm, args| {
                 let mut m = num_arg(args, 0)?;
-                for a in &args[1..] {
+                for a in rest(args) {
                     m = m.max(a.as_num()?);
                 }
                 one(Value::Num(m))
             })),
             ("min", native("min", |_vm, args| {
                 let mut m = num_arg(args, 0)?;
-                for a in &args[1..] {
+                for a in rest(args) {
                     m = m.min(a.as_num()?);
                 }
                 one(Value::Num(m))
@@ -293,8 +305,14 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(Value::str(str_arg(args, 0)?.trim()))
             })),
             ("repeat", native("repeat", |_vm, args| {
+                let s = str_arg(args, 0)?;
                 let n = num_arg(args, 1)?.max(0.0) as usize;
-                one(Value::str(str_arg(args, 0)?.repeat(n)))
+                // a script asking for a petabyte of text gets an error, not an
+                // allocator abort
+                if s.len().saturating_mul(n) > MAX_STRING {
+                    return err("repeat: the result would be too large");
+                }
+                one(Value::str(s.repeat(n)))
             })),
             ("reverse", native("reverse", |_vm, args| {
                 one(Value::str(str_arg(args, 0)?.chars().rev().collect::<String>()))
@@ -347,7 +365,7 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 })
             })),
             ("format", native("format", |_vm, args| {
-                one(Value::str(format_impl(&str_arg(args, 0)?, &args[1..])?))
+                one(Value::str(format_impl(&str_arg(args, 0)?, rest(args))?))
             })),
         ],
     )
@@ -358,6 +376,13 @@ fn clamp_index(v: Option<&Value>, default: f64, len: usize) -> usize {
     let raw = if raw < 0.0 { len as f64 + raw } else { raw };
     raw.max(0.0).min(len as f64) as usize
 }
+
+/// The most padding or precision a format spec may ask for. Without a cap a
+/// script can ask for gigabytes of spaces.
+const MAX_FORMAT_WIDTH: usize = 4096;
+
+/// The largest string a builtin will construct: 256MB.
+const MAX_STRING: usize = 256 << 20;
 
 /// Rust-flavoured formatting: `{}` placeholders, `{:.2}` precision, `{:x}`,
 /// and `{{` for a literal brace.
@@ -396,6 +421,9 @@ fn format_impl(fmt: &str, args: &[Value]) -> Res<String> {
                         let p: usize = s[1..]
                             .parse()
                             .map_err(|_| Error(format!("format: bad precision `{s}`")))?;
+                        if p > MAX_FORMAT_WIDTH {
+                            return err(format!("format: precision {p} is too large"));
+                        }
                         format!("{:.*}", p, v.as_num()?)
                     }
                     s => {
@@ -407,6 +435,9 @@ fn format_impl(fmt: &str, args: &[Value]) -> Res<String> {
                         let w: usize = digits
                             .parse()
                             .map_err(|_| Error(format!("format: unsupported spec `{s}`")))?;
+                        if w > MAX_FORMAT_WIDTH {
+                            return err(format!("format: width {w} is too large"));
+                        }
                         let text = v.to_string();
                         if text.len() >= w {
                             text
@@ -434,7 +465,7 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
             })),
             ("push", native("push", |_vm, args| {
                 let t = table_arg(args, 0)?;
-                for v in &args[1..] {
+                for v in rest(args) {
                     t.borrow_mut().push(v.clone());
                 }
                 Ok(Vec::new())

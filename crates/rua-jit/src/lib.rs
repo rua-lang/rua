@@ -65,6 +65,10 @@ pub struct RtCtx {
     pub push: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
+    /// The interpreter's call depth counter, which compiled code keeps up to
+    /// date so that recursion hits the same limit either way.
+    pub depth: *mut i64,
+    pub max_depth: i64,
 }
 
 /// The hook addresses, before they are put in an [`RtCtx`].
@@ -141,8 +145,9 @@ pub struct SelfRef {
     pub global: Option<String>,
     /// Globals that currently hold an already compiled function: calls to
     /// these become direct calls to their machine code. The runtime promises
-    /// to throw the result away if any of them is reassigned.
-    pub compiled_globals: HashMap<String, (usize, usize)>,
+    /// to throw the result away if any of them is reassigned. The kinds are
+    /// the callee's parameters — a direct call can only pass numbers.
+    pub compiled_globals: HashMap<String, (usize, Vec<Kind>)>,
     /// Addresses of the runtime hooks compiled code calls for table reads.
     pub hooks: RtHooks,
 }
@@ -232,9 +237,11 @@ impl Jit {
         if def.body.tail.is_none() && !ends_with_return {
             return Err("the body can fall through, so it would return nil".into());
         }
-        self.generation += 1;
         let symbol = format!("rua_jit_{}", def.id);
-        let file_stem = format!("{symbol}_{}", self.generation);
+        // The file is named after a hash of its contents (see `build`), which
+        // is both the cache key and what keeps dlopen — which caches by path —
+        // honest when a function is recompiled into different code.
+        let file_stem = symbol.clone();
         let (src, inlined, param_kinds) = self.lower_function(def, &symbol, self_ref)?;
 
         let addr = self.build(&file_stem, &symbol, &src, &def.name)?;
@@ -275,7 +282,7 @@ impl Jit {
         }
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
-        let kinds = infer_kinds(&wrapper)?;
+        let kinds = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
         let kind_list: Vec<Kind> =
             slots.iter().map(|s| kinds.get(s).copied().unwrap_or(Kind::Num)).collect();
         let mut cx = Ctx {
@@ -284,9 +291,12 @@ impl Jit {
             self_ref,
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
+            self_params_numeric: true,
             writes: kinds.values().any(|k| *k == Kind::TableOut),
             kinds,
             in_range: Vec::new(),
+            loop_labels: Vec::new(),
+            labels: 0,
             on_trap: quote! { return; },
         };
         // mid-loop entry: the induction variable already holds its current
@@ -294,16 +304,35 @@ impl Jit {
         let body = match st {
             Stat::ForRange { binding, start, end, inclusive, body, .. } => {
                 let b = binding.ok_or("unresolved `for`")?;
+                // The interpreter evaluated the bound once, before the loop.
+                // Taking the loop over mid-flight re-evaluates it, so it may
+                // only depend on things the body leaves alone.
+                if let Expr::Local(lb, name) = end {
+                    if writes_slot(body, lb.slot) {
+                        return Err(format!("the loop bound `{name}` changes in the body"));
+                    }
+                }
+                if let Expr::Method(obj, _, _) = end {
+                    if let Expr::Local(lb, name) = &**obj {
+                        if writes_slot(body, lb.slot) {
+                            return Err(format!("the loop bound `{name}` changes in the body"));
+                        }
+                    }
+                }
                 let id = ident(b.slot);
                 let e = cx.expr(end)?;
-                let fact = cx.range_fact(b, start, end, *inclusive);
+                let fact = cx.range_fact(b, start, end, *inclusive, body);
                 if let Some(f) = fact {
                     cx.in_range.push(f);
                 }
-                let inner = cx.block(body, false)?;
+                let label = cx.fresh_label();
+                cx.loop_labels.push(Some(label.clone()));
+                let inner = cx.block(body, false);
+                cx.loop_labels.pop();
                 if fact.is_some() {
                     cx.in_range.pop();
                 }
+                let inner = inner?;
                 let test = if *inclusive {
                     quote! { #id <= __end }
                 } else {
@@ -312,12 +341,17 @@ impl Jit {
                 quote! {
                     let __end: f64 = #e;
                     while #test {
-                        #inner
+                        #label: { #inner }
                         #id += 1.0;
                     }
                 }
             }
-            other => cx.stat(other)?,
+            other => {
+                cx.loop_labels.push(None);
+                let out = cx.stat(other);
+                cx.loop_labels.pop();
+                out?
+            }
         };
         self.generation += 1;
         let symbol = format!("rua_loop_{}", self.generation);
@@ -389,7 +423,9 @@ impl Jit {
         // the hash makes the file unique per generated source, which both keys
         // the cache and keeps dlopen (which caches by path) honest
         let stem = format!("{stem}_{:016x}", source_hash(src));
-        let rs = self.dir.join(format!("{stem}.rs"));
+        // another process may be compiling the same function into this shared
+        // directory, so the input file is private too
+        let rs = self.dir.join(format!("{stem}_p{}.rs", std::process::id()));
         let so = self.dir.join(format!("lib{stem}.so"));
         if self.dump {
             eprintln!("[rua-jit] {what} ->\n{src}");
@@ -403,7 +439,10 @@ impl Jit {
             let tmp = self.dir.join(format!("lib{stem}.{}.tmp", std::process::id()));
             let out = Command::new("rustc")
                 .args([
-                    "--edition", "2021", "-O", "-C", "debuginfo=0", "--crate-type", "cdylib", "-o",
+                    "--edition", "2021", "-O", "-C", "debuginfo=0", "--crate-type", "cdylib",
+                    // the file name carries a hash and a pid, which is not a
+                    // legal crate name
+                    "--crate-name", "rua_jit_unit", "-o",
                 ])
                 .arg(&tmp)
                 .arg(&rs)
@@ -417,6 +456,7 @@ impl Jit {
                 ));
             }
             std::fs::rename(&tmp, &so).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&rs);
         }
         // SAFETY: a cdylib we just produced, whose symbol we just named. The
         // handle is leaked so the code pages outlive every call site.
@@ -439,7 +479,7 @@ impl Jit {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
         }
-        let kinds = infer_kinds(&def.body)?;
+        let kinds = infer_kinds(&def.body, &self_ref.compiled_globals)?;
         // only parameters may be tables: a local always holds a number
         for (slot, kind) in &kinds {
             if *kind == Kind::Table
@@ -459,9 +499,12 @@ impl Jit {
             self_ref,
             arity: def.params.len(),
             inlined: Vec::new(),
+            self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
             writes: kinds.values().any(|k| *k == Kind::TableOut),
             kinds,
             in_range: Vec::new(),
+            loop_labels: Vec::new(),
+            labels: 0,
             on_trap: quote! { return 0.0; },
         };
         let body = cx.block(&def.body, true)?;
@@ -498,8 +541,23 @@ impl Jit {
                 rt: *const RtCtx,
                 ok: *mut i32,
             ) -> f64 {
-                #(#prologue)*
-                #body
+                // Recursion here is real machine recursion, so it has to
+                // respect the interpreter's limit rather than run the process
+                // out of stack. Tripping it before anything else happens keeps
+                // the trap safe: nothing has been written yet.
+                let __depth = (*rt).depth;
+                *__depth += 1;
+                if *__depth > (*rt).max_depth {
+                    *__depth -= 1;
+                    *ok = 0;
+                    return 0.0;
+                }
+                let __out = (|| -> f64 {
+                    #(#prologue)*
+                    #body
+                })();
+                *__depth -= 1;
+                __out
             }
         };
         let parsed: syn::File =
@@ -651,10 +709,15 @@ fn walk_expr(e: &Expr, out: &mut Vec<String>) {
 
 /// Work out what each slot holds: a table if it is indexed or asked for its
 /// length, a number otherwise. Disagreement means the JIT stays out of it.
-fn infer_kinds(b: &Block) -> Result<HashMap<u16, Kind>, String> {
+fn infer_kinds(
+    b: &Block,
+    callees: &HashMap<String, (usize, Vec<Kind>)>,
+) -> Result<HashMap<u16, Kind>, String> {
     let mut kinds = HashMap::new();
     let mut bad = None;
-    kinds_block(b, &mut kinds, &mut bad);
+    // a local passed straight to a compiled function takes that parameter's
+    // kind, which is how a table reaches a helper
+    kinds_block(b, &mut kinds, &mut bad, callees);
     match bad {
         Some(why) => Err(why),
         None => Ok(kinds),
@@ -670,61 +733,79 @@ fn note(slot: u16, kind: Kind, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<
     }
 }
 
-fn kinds_block(b: &Block, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
+/// What the inference walk needs to know about the functions being called.
+type Callees = HashMap<String, (usize, Vec<Kind>)>;
+
+fn kinds_block(
+    b: &Block,
+    kinds: &mut HashMap<u16, Kind>,
+    bad: &mut Option<String>,
+    callees: &Callees,
+) {
     for st in &b.stats {
-        kinds_stat(st, kinds, bad);
+        kinds_stat(st, kinds, bad, callees);
     }
     if let Some(t) = &b.tail {
-        kinds_expr(t, kinds, bad);
+        kinds_expr(t, kinds, bad, callees);
     }
 }
 
-fn kinds_stat(st: &Stat, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
+fn kinds_stat(
+    st: &Stat,
+    kinds: &mut HashMap<u16, Kind>,
+    bad: &mut Option<String>,
+    callees: &Callees,
+) {
     match st {
-        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| kinds_expr(e, kinds, bad)),
+        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees)),
         Stat::LetSlots(bs, es) => {
             for b in bs {
                 note(b.slot, Kind::Num, kinds, bad);
             }
-            es.iter().for_each(|e| kinds_expr(e, kinds, bad));
+            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees));
         }
-        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => kinds_expr(e, kinds, bad),
-        Stat::Assign(ts, es) => ts.iter().chain(es).for_each(|e| kinds_expr(e, kinds, bad)),
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => kinds_expr(e, kinds, bad, callees),
+        Stat::Assign(ts, es) => ts.iter().chain(es).for_each(|e| kinds_expr(e, kinds, bad, callees)),
         Stat::OpAssign(t, _, e) => {
-            kinds_expr(t, kinds, bad);
-            kinds_expr(e, kinds, bad);
+            kinds_expr(t, kinds, bad, callees);
+            kinds_expr(e, kinds, bad, callees);
         }
         Stat::While(_, c, b) => {
-            kinds_expr(c, kinds, bad);
-            kinds_block(b, kinds, bad);
+            kinds_expr(c, kinds, bad, callees);
+            kinds_block(b, kinds, bad, callees);
         }
-        Stat::Loop(_, b) => kinds_block(b, kinds, bad),
+        Stat::Loop(_, b) => kinds_block(b, kinds, bad, callees),
         Stat::ForRange { binding, start, end, body, .. } => {
             if let Some(b) = binding {
                 note(b.slot, Kind::Num, kinds, bad);
             }
-            kinds_expr(start, kinds, bad);
-            kinds_expr(end, kinds, bad);
-            kinds_block(body, kinds, bad);
+            kinds_expr(start, kinds, bad, callees);
+            kinds_expr(end, kinds, bad, callees);
+            kinds_block(body, kinds, bad, callees);
         }
         Stat::ForIn { body, iter, .. } => {
-            kinds_expr(iter, kinds, bad);
-            kinds_block(body, kinds, bad);
+            kinds_expr(iter, kinds, bad, callees);
+            kinds_block(body, kinds, bad, callees);
         }
         Stat::Break | Stat::Continue => {}
     }
 }
 
-fn kinds_expr(e: &Expr, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
+fn kinds_expr(
+    e: &Expr,
+    kinds: &mut HashMap<u16, Kind>,
+    bad: &mut Option<String>,
+    callees: &Callees,
+) {
     match e {
         // `t[i]` and `t.len()` are what make a slot a table
         Expr::Index(obj, key) => {
             if let Expr::Local(b, _) = &**obj {
                 note(b.slot, Kind::Table, kinds, bad);
             } else {
-                kinds_expr(obj, kinds, bad);
+                kinds_expr(obj, kinds, bad, callees);
             }
-            kinds_expr(key, kinds, bad);
+            kinds_expr(key, kinds, bad, callees);
         }
         Expr::Method(obj, name, args) => {
             match (&**obj, &**name) {
@@ -732,51 +813,68 @@ fn kinds_expr(e: &Expr, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>
                 // about which kind this is
                 (Expr::Local(_, _), "len") => {}
                 (Expr::Local(b, _), "push") => note(b.slot, Kind::TableOut, kinds, bad),
-                _ => kinds_expr(obj, kinds, bad),
+                _ => kinds_expr(obj, kinds, bad, callees),
             }
-            args.iter().for_each(|a| kinds_expr(a, kinds, bad));
+            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees));
         }
         Expr::Local(b, _) => note(b.slot, Kind::Num, kinds, bad),
         Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
-            kinds_expr(a, kinds, bad);
-            kinds_expr(b, kinds, bad);
+            kinds_expr(a, kinds, bad, callees);
+            kinds_expr(b, kinds, bad, callees);
         }
-        Expr::Un(_, a) => kinds_expr(a, kinds, bad),
+        Expr::Un(_, a) => kinds_expr(a, kinds, bad, callees),
         Expr::Call(f, args) => {
-            kinds_expr(f, kinds, bad);
-            args.iter().for_each(|a| kinds_expr(a, kinds, bad));
+            // an argument handed to a compiled function takes that
+            // parameter's kind: that is how a table reaches a helper
+            if let Expr::Global(name, _) = &**f {
+                if let Some((_, param_kinds)) = callees.get(&**name) {
+                    if param_kinds.len() == args.len() {
+                        for (a, kind) in args.iter().zip(param_kinds) {
+                            match (a, kind) {
+                                (Expr::Local(b, _), Kind::Table | Kind::TableOut) => {
+                                    note(b.slot, *kind, kinds, bad)
+                                }
+                                _ => kinds_expr(a, kinds, bad, callees),
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            kinds_expr(f, kinds, bad, callees);
+            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees));
         }
-        Expr::Array(items) => items.iter().for_each(|i| kinds_expr(i, kinds, bad)),
+        Expr::Array(items) => items.iter().for_each(|i| kinds_expr(i, kinds, bad, callees)),
         Expr::Map(items) => items.iter().for_each(|(k, v)| {
-            kinds_expr(k, kinds, bad);
-            kinds_expr(v, kinds, bad);
+            kinds_expr(k, kinds, bad, callees);
+            kinds_expr(v, kinds, bad, callees);
         }),
         Expr::If(arms, els) => {
             for (c, b) in arms {
-                kinds_expr(c, kinds, bad);
-                kinds_block(b, kinds, bad);
+                kinds_expr(c, kinds, bad, callees);
+                kinds_block(b, kinds, bad, callees);
             }
             if let Some(b) = els {
-                kinds_block(b, kinds, bad);
+                kinds_block(b, kinds, bad, callees);
             }
         }
         Expr::Match(subject, arms) => {
-            kinds_expr(subject, kinds, bad);
+            kinds_expr(subject, kinds, bad, callees);
             for arm in arms {
                 for p in &arm.patterns {
                     match p {
-                        Pattern::Lit(e) => kinds_expr(e, kinds, bad),
+                        Pattern::Lit(e) => kinds_expr(e, kinds, bad, callees),
                         Pattern::Bind(_, Some(b)) => note(b.slot, Kind::Num, kinds, bad),
                         _ => {}
                     }
                 }
                 if let Some(g) = &arm.guard {
-                    kinds_expr(g, kinds, bad);
+                    kinds_expr(g, kinds, bad, callees);
                 }
-                kinds_block(&arm.body, kinds, bad);
+                kinds_block(&arm.body, kinds, bad, callees);
             }
         }
-        Expr::Do(b) => kinds_block(b, kinds, bad),
+        Expr::Do(b) => kinds_block(b, kinds, bad, callees),
         Expr::Func(_) | Expr::Upval(..) | Expr::Global(..) | Expr::Var(_) | Expr::Nil
         | Expr::Bool(_) | Expr::Num(_) | Expr::Str(_) => {}
     }
@@ -988,6 +1086,8 @@ fn preamble() -> TokenStream {
             pub span: usize,
             pub push: usize,
             pub callees: *const Callee,
+            pub depth: *mut i64,
+            pub max_depth: i64,
         }
 
         #[inline(always)]
@@ -1056,6 +1156,9 @@ struct Ctx {
     /// Globals compiled in as direct calls.
     inlined: Vec<String>,
     arity: usize,
+    /// Whether every parameter of this function is a number, which is what a
+    /// direct self call is able to pass.
+    self_params_numeric: bool,
     /// What each slot holds: a number, or a table reached through the hooks.
     kinds: HashMap<u16, Kind>,
     /// True when this code appends to a table. Once it has written something,
@@ -1065,9 +1168,87 @@ struct Ctx {
     /// Loop variables known to be a valid index into a given table, from
     /// `for i in 0..t.len()`.
     in_range: Vec<(u16, u16)>,
+    /// For each enclosing loop, the label to break to for `continue`. A counted
+    /// loop wraps its body in a labeled block so that `continue` still runs the
+    /// increment; a `while` needs no label.
+    loop_labels: Vec<Option<syn::Lifetime>>,
+    labels: usize,
     /// How to leave this entry point when a table read traps. Functions return
     /// a number; loops return nothing.
     on_trap: TokenStream,
+}
+
+/// Does this block assign to a given frame slot anywhere inside it? A proof
+/// that an index stays in range is only worth anything if nothing moves it.
+fn writes_slot(b: &Block, slot: u16) -> bool {
+    b.stats.iter().any(|st| writes_slot_stat(st, slot))
+        || b.tail.as_deref().map(|e| writes_slot_expr(e, slot)).unwrap_or(false)
+}
+
+fn writes_slot_stat(st: &Stat, slot: u16) -> bool {
+    let target_is = |e: &Expr| matches!(e, Expr::Local(b, _) if b.slot == slot);
+    match st {
+        Stat::LetSlots(bs, es) => {
+            bs.iter().any(|b| b.slot == slot) || es.iter().any(|e| writes_slot_expr(e, slot))
+        }
+        Stat::Let(_, es) | Stat::Return(es) => es.iter().any(|e| writes_slot_expr(e, slot)),
+        Stat::FnSlot(b, e) => b.slot == slot || writes_slot_expr(e, slot),
+        Stat::FnDecl(_, e) | Stat::Expr(e) => writes_slot_expr(e, slot),
+        Stat::Assign(ts, es) => {
+            ts.iter().any(target_is) || es.iter().any(|e| writes_slot_expr(e, slot))
+        }
+        Stat::OpAssign(t, _, e) => target_is(t) || writes_slot_expr(e, slot),
+        Stat::While(_, c, b) => writes_slot_expr(c, slot) || writes_slot(b, slot),
+        Stat::Loop(_, b) => writes_slot(b, slot),
+        Stat::ForRange { binding, start, end, body, .. } => {
+            binding.map(|b| b.slot == slot).unwrap_or(false)
+                || writes_slot_expr(start, slot)
+                || writes_slot_expr(end, slot)
+                || writes_slot(body, slot)
+        }
+        Stat::ForIn { bindings, iter, body, .. } => {
+            bindings.iter().any(|b| b.slot == slot)
+                || writes_slot_expr(iter, slot)
+                || writes_slot(body, slot)
+        }
+        Stat::Break | Stat::Continue => false,
+    }
+}
+
+fn writes_slot_expr(e: &Expr, slot: u16) -> bool {
+    match e {
+        Expr::Do(b) => writes_slot(b, slot),
+        Expr::If(arms, els) => {
+            arms.iter().any(|(c, b)| writes_slot_expr(c, slot) || writes_slot(b, slot))
+                || els.as_ref().map(|b| writes_slot(b, slot)).unwrap_or(false)
+        }
+        Expr::Match(subject, arms) => {
+            writes_slot_expr(subject, slot)
+                || arms.iter().any(|a| {
+                    a.patterns.iter().any(|p| matches!(p, Pattern::Bind(_, Some(b)) if b.slot == slot))
+                        || a.guard.as_ref().map(|g| writes_slot_expr(g, slot)).unwrap_or(false)
+                        || writes_slot(&a.body, slot)
+                })
+        }
+        Expr::Bin(_, a, b) | Expr::Index(a, b) | Expr::Range(a, b, _) => {
+            writes_slot_expr(a, slot) || writes_slot_expr(b, slot)
+        }
+        Expr::Un(_, a) => writes_slot_expr(a, slot),
+        Expr::Call(f, args) => {
+            writes_slot_expr(f, slot) || args.iter().any(|a| writes_slot_expr(a, slot))
+        }
+        Expr::Method(o, _, args) => {
+            writes_slot_expr(o, slot) || args.iter().any(|a| writes_slot_expr(a, slot))
+        }
+        Expr::Array(items) => items.iter().any(|i| writes_slot_expr(i, slot)),
+        Expr::Map(items) => {
+            items.iter().any(|(k, v)| writes_slot_expr(k, slot) || writes_slot_expr(v, slot))
+        }
+        // a nested function could capture and write the slot, but a captured
+        // local is a cell and never gets a range fact in the first place
+        Expr::Func(_) => false,
+        _ => false,
+    }
 }
 
 /// The pointer and length holding a table slot's array view.
@@ -1137,11 +1318,10 @@ impl Ctx {
                 }
                 for (i, b) in bindings.iter().enumerate() {
                     let id = ident(b.slot);
-                    let v = match tmps.get(i) {
-                        Some(t) => quote! { #t },
-                        None => num(0.0),
+                    let Some(t) = tmps.get(i) else {
+                        return Err("a binding with no value (that is nil, not 0)".into());
                     };
-                    out.extend(quote! { let mut #id: f64 = #v; });
+                    out.extend(quote! { let mut #id: f64 = #t; });
                     self.known.insert(b.slot);
                 }
                 out
@@ -1161,9 +1341,8 @@ impl Ctx {
                 }
                 for (i, t) in targets.iter().enumerate() {
                     let id = self.local(t)?;
-                    let v = match tmps.get(i) {
-                        Some(t) => quote! { #t },
-                        None => num(0.0),
+                    let Some(v) = tmps.get(i) else {
+                        return Err("an assignment with no value (that is nil, not 0)".into());
                     };
                     out.extend(quote! { #id = #v; });
                 }
@@ -1190,14 +1369,26 @@ impl Ctx {
                 _ => return Err("multiple return values".into()),
             },
             Stat::Break => quote! { break; },
-            Stat::Continue => quote! { continue; },
+            Stat::Continue => match self.loop_labels.last() {
+                // in a counted loop, `continue` leaves the body block so that
+                // the increment below it still runs
+                Some(Some(label)) => quote! { break #label; },
+                Some(None) => quote! { continue; },
+                None => return Err("`continue` outside a loop".into()),
+            },
             Stat::While(_, cond, body) => {
                 let c = self.truthy(cond)?;
-                let b = self.block(body, false)?;
+                self.loop_labels.push(None);
+                let b = self.block(body, false);
+                self.loop_labels.pop();
+                let b = b?;
                 quote! { while #c #b }
             }
             Stat::Loop(_, body) => {
-                let b = self.block(body, false)?;
+                self.loop_labels.push(None);
+                let b = self.block(body, false);
+                self.loop_labels.pop();
+                let b = b?;
                 quote! { loop #b }
             }
             Stat::ForRange { binding, start, end, inclusive, body, .. } => {
@@ -1212,14 +1403,18 @@ impl Ctx {
                 let id = ident(binding.slot);
                 // `for i in 0..t.len()` makes `t[i]` provably in range, which
                 // is what lets code that also writes read a table at all
-                let fact = self.range_fact(binding, start, end, *inclusive);
+                let fact = self.range_fact(binding, start, end, *inclusive, body);
                 if let Some(f) = fact {
                     self.in_range.push(f);
                 }
-                let b = self.block(body, false)?;
+                let label = self.fresh_label();
+                self.loop_labels.push(Some(label.clone()));
+                let b = self.block(body, false);
+                self.loop_labels.pop();
                 if fact.is_some() {
                     self.in_range.pop();
                 }
+                let b = b?;
                 self.known = saved;
                 let test = if *inclusive {
                     quote! { #id <= __end }
@@ -1231,7 +1426,7 @@ impl Ctx {
                         let __end: f64 = #e;
                         let mut #id: f64 = #s;
                         while #test {
-                            #b
+                            #label: { #b }
                             #id += 1.0;
                         }
                     }
@@ -1372,33 +1567,43 @@ impl Ctx {
         Ok(quote! { if #c #b #tail })
     }
 
-    /// rua truthiness over the numeric subset: non-zero is true.
+    /// A condition, which must be *provably* a boolean.
+    ///
+    /// Everything in compiled code is an `f64`, so a boolean and the number it
+    /// would be encoded as are indistinguishable — and rua is Lua-shaped, where
+    /// `0` is true. Rather than guess, anything that is not a comparison or a
+    /// combination of comparisons sends the function back to the interpreter.
     fn truthy(&mut self, e: &Expr) -> Lower<TokenStream> {
-        // comparisons compile straight to a bool instead of a 1.0/0.0 round trip
-        if let Expr::Bin(op, a, b) = e {
-            if let Some(rust_op) = cmp_op(*op) {
-                let (l, r) = (self.expr(a)?, self.expr(b)?);
-                let o = rust_op;
-                return Ok(quote! { (#l #o #r) });
+        match e {
+            Expr::Bool(b) => {
+                let lit = *b;
+                Ok(quote! { #lit })
             }
-            if matches!(op, BinOp::And | BinOp::Or) {
-                let (l, r) = (self.truthy(a)?, self.truthy(b)?);
-                let o = if *op == BinOp::And { quote!(&&) } else { quote!(||) };
-                return Ok(quote! { (#l #o #r) });
+            Expr::Bin(op, a, b) => {
+                if let Some(o) = cmp_op(*op) {
+                    let (l, r) = (self.expr(a)?, self.expr(b)?);
+                    return Ok(quote! { (#l #o #r) });
+                }
+                if matches!(op, BinOp::And | BinOp::Or) {
+                    let (l, r) = (self.truthy(a)?, self.truthy(b)?);
+                    let o = if *op == BinOp::And { quote!(&&) } else { quote!(||) };
+                    return Ok(quote! { (#l #o #r) });
+                }
+                Err("a condition that is not a comparison".into())
             }
+            Expr::Un(UnOp::Not, a) => {
+                let v = self.truthy(a)?;
+                Ok(quote! { (!#v) })
+            }
+            _ => Err("a condition that is not provably a boolean".into()),
         }
-        if let Expr::Un(UnOp::Not, a) = e {
-            let v = self.truthy(a)?;
-            return Ok(quote! { (!#v) });
-        }
-        let v = self.expr(e)?;
-        Ok(quote! { ((#v) != 0.0) })
     }
 
     fn expr(&mut self, e: &Expr) -> Lower<TokenStream> {
         Ok(match e {
             Expr::Num(n) => num(*n),
-            Expr::Bool(b) => num(if *b { 1.0 } else { 0.0 }),
+            // `true`/`false` are booleans, not the numbers 1 and 0
+            Expr::Bool(_) => return Err("a boolean used as a number".into()),
             Expr::Nil => return Err("nil".into()),
             Expr::Str(_) => return Err("strings".into()),
             // only plain frame locals compile; a captured local (a cell) means
@@ -1417,23 +1622,21 @@ impl Ctx {
             Expr::If(arms, els) => self.if_chain(arms, els.as_ref(), true)?,
             Expr::Match(subject, arms) => self.match_chain(subject, arms, true)?,
             Expr::Un(op, a) => {
+                if matches!(op, UnOp::Not) {
+                    return Err("`!` as a value".into());
+                }
                 let v = self.expr(a)?;
                 match op {
                     UnOp::Neg => quote! { (-(#v)) },
-                    UnOp::Not => quote! { rua_bool((#v) == 0.0) },
+                    UnOp::Not => return Err("`!` as a value".into()),
                 }
             }
             Expr::Bin(op, a, b) => {
                 use BinOp::*;
                 match op {
-                    And => {
-                        let (l, r) = (self.expr(a)?, self.expr(b)?);
-                        quote! { { let __l = #l; if __l != 0.0 { #r } else { __l } } }
-                    }
-                    Or => {
-                        let (l, r) = (self.expr(a)?, self.expr(b)?);
-                        quote! { { let __l = #l; if __l != 0.0 { __l } else { #r } } }
-                    }
+                    // `a && b` yields one of its operands, and rua counts 0 as
+                    // true, so this cannot be expressed in f64-only code
+                    And | Or => return Err("`&&`/`||` as a value".into()),
                     Rem => {
                         let (l, r) = (self.expr(a)?, self.expr(b)?);
                         quote! { rua_rem(#l, #r) }
@@ -1448,11 +1651,9 @@ impl Ctx {
                         };
                         quote! { (#l #o #r) }
                     }
-                    _ => {
-                        let o = cmp_op(*op).expect("all remaining ops are comparisons");
-                        let (l, r) = (self.expr(a)?, self.expr(b)?);
-                        quote! { rua_bool(#l #o #r) }
-                    }
+                    // a comparison produces a boolean, which is a different
+                    // value from the number 1 or 0 that would represent it
+                    _ => return Err("a comparison used as a value".into()),
                 }
             }
             Expr::Call(f, args) => self.call(f, args)?,
@@ -1536,6 +1737,12 @@ impl Ctx {
         })
     }
 
+    /// A fresh label for a counted loop's body block.
+    fn fresh_label(&mut self) -> syn::Lifetime {
+        self.labels += 1;
+        syn::Lifetime::new(&format!("'body{}", self.labels), proc_macro2::Span::call_site())
+    }
+
     /// Is this expression a local the inference decided holds a table?
     fn is_table(&self, e: &Expr) -> bool {
         matches!(e, Expr::Local(b, _)
@@ -1554,8 +1761,18 @@ impl Ctx {
         }
     }
 
-    /// `for i in 0..t.len()` makes `i` a proven index into `t` for the body.
-    fn range_fact(&self, binding: Binding, start: &Expr, end: &Expr, inclusive: bool) -> Option<(u16, u16)> {
+    /// `for i in 0..t.len()` makes `i` a proven index into `t` for the body —
+    /// but only while the body leaves both the counter and the table alone.
+    /// Without that check the generated code would index an f64 view with an
+    /// arbitrary number, which is an out of bounds read.
+    fn range_fact(
+        &self,
+        binding: Binding,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) -> Option<(u16, u16)> {
         if inclusive || binding.cell {
             return None;
         }
@@ -1567,7 +1784,10 @@ impl Ctx {
         if let Expr::Method(obj, name, args) = end {
             if &**name == "len" && args.is_empty() {
                 if let Expr::Local(b, _) = &**obj {
-                    if self.kind_of(b.slot) == Kind::Table {
+                    if self.kind_of(b.slot) == Kind::Table
+                        && !writes_slot(body, binding.slot)
+                        && !writes_slot(body, b.slot)
+                    {
                         return Some((binding.slot, b.slot));
                     }
                 }
@@ -1591,6 +1811,9 @@ impl Ctx {
             _ => false,
         };
         if is_self && args.len() == self.arity {
+            if !self.self_params_numeric {
+                return Err("recursion in a function that takes a table".into());
+            }
             let sym = format_ident!("{}", self.self_symbol);
             let a: Vec<_> = args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
             let trap = self.on_trap.clone();
@@ -1606,37 +1829,73 @@ impl Ctx {
         // a call to another already compiled function becomes a direct call to
         // its machine code, at the address the runtime handed us
         if let Expr::Global(name, _) = f {
-            if let Some((_addr, arity)) = self.self_ref.compiled_globals.get(&**name).copied() {
-                if arity == args.len() {
-                    let a: Vec<_> = args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
-                    let trap = self.on_trap.clone();
-                    // the callee is referred to by index; the runtime fills the
-                    // table in, so the generated source has no addresses in it
-                    let index = match self.inlined.iter().position(|n| n == &**name) {
-                        Some(i) => i,
-                        None => {
-                            self.inlined.push(name.to_string());
-                            self.inlined.len() - 1
+            let entry = self.self_ref.compiled_globals.get(&**name).cloned();
+            if let Some((_addr, kinds)) = entry {
+                if kinds.len() == args.len() {
+                    // A direct call hands over an `RtArg` array, so it can pass
+                    // a table the caller already holds — but never one the
+                    // callee would write, since the callee's aliasing check
+                    // lives in the runtime call path this skips.
+                    let mut cells = Vec::with_capacity(args.len());
+                    let mut ok = true;
+                    for (a, kind) in args.iter().zip(&kinds) {
+                        match kind {
+                            Kind::Num => match self.expr(a) {
+                                Ok(v) => cells.push(quote! {
+                                    RtArg { num: #v, table: std::ptr::null_mut() }
+                                }),
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            Kind::Table => match a {
+                                Expr::Local(b, _)
+                                    if self.kind_of(b.slot) == Kind::Table
+                                        && self.known.contains(&b.slot) =>
+                                {
+                                    let id = ident(b.slot);
+                                    cells.push(quote! { RtArg { num: 0.0, table: #id } });
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            Kind::TableOut => {
+                                ok = false;
+                                break;
+                            }
                         }
-                    };
-                    let index = Literal::usize_suffixed(index);
-                    return Ok(quote! {
-                        {
-                            // SAFETY: the runtime put a compiled function of
-                            // this arity in this slot, and it discards this
-                            // code if that global is reassigned.
-                            let __c = unsafe { *(*rt).callees.add(#index) };
-                            let __f: unsafe extern "C" fn(
-                                *const RtArg,
-                                *const RtCtx,
-                                *mut i32,
-                            ) -> f64 = unsafe { std::mem::transmute(__c.entry as *const ()) };
-                            let __args = [#(RtArg { num: #a, table: std::ptr::null_mut() }),*];
-                            let __r = unsafe { __f(__args.as_ptr(), __c.ctx, ok) };
-                            if unsafe { *ok } == 0 { #trap }
-                            __r
-                        }
-                    });
+                    }
+                    if ok {
+                        let trap = self.on_trap.clone();
+                        let index = match self.inlined.iter().position(|n| n == &**name) {
+                            Some(i) => i,
+                            None => {
+                                self.inlined.push(name.to_string());
+                                self.inlined.len() - 1
+                            }
+                        };
+                        let index = Literal::usize_suffixed(index);
+                        return Ok(quote! {
+                            {
+                                // SAFETY: the runtime put a compiled function of
+                                // this shape in this slot, and it discards this
+                                // code if that global is reassigned.
+                                let __c = unsafe { *(*rt).callees.add(#index) };
+                                let __f: unsafe extern "C" fn(
+                                    *const RtArg,
+                                    *const RtCtx,
+                                    *mut i32,
+                                ) -> f64 = unsafe { std::mem::transmute(__c.entry as *const ()) };
+                                let __args = [#(#cells),*];
+                                let __r = unsafe { __f(__args.as_ptr(), __c.ctx, ok) };
+                                if unsafe { *ok } == 0 { #trap }
+                                __r
+                            }
+                        });
+                    }
                 }
             }
         }

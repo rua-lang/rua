@@ -470,7 +470,10 @@ fn match_expressions() {
     // no arm matches: the match is nil
     assert_eq!(s("type(match 5 { 1 => 1 })"), "nil");
     // patterns bind per arm and do not leak
-    assert_eq!(n("let x = 1; match 42 { x => x } + x"), 43.0);
+    assert_eq!(n("let x = 1; let m = match 42 { x => x }; m + x"), 43.0);
+    // a block-shaped expression in statement position is a statement, as in
+    // Rust: this is `match ...` followed by `+ x`, which is not an expression
+    assert!(Vm::new().eval("let x = 1; match 42 { x => x } + x").is_err());
 }
 
 #[test]
@@ -726,4 +729,208 @@ fn compiled_writes_reject_non_numbers() {
         .unwrap();
     assert_eq!(out[0], Value::Num(10.0));
     assert_eq!(out[1].to_string(), "v0,v1,v0,v1,v0,v1,v0,v1,v0,v1");
+}
+
+// ---- regressions found by the review pass ---------------------------------
+
+/// A call that spreads three or more values used to overwrite the callee's own
+/// return registers while copying them out.
+#[test]
+fn spreading_a_multi_return_keeps_its_values() {
+    let mut vm = Vm::new();
+    let out = vm.eval("fn three() { return 7, 8, 9 } fn pass() { three() } return pass()").unwrap();
+    assert_eq!(out.len(), 3);
+    assert_eq!(
+        out.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+        "7,8,9"
+    );
+    // and forwarding into a destructuring binding fills every slot
+    assert_eq!(
+        n("fn g() { return 1, 2, 3 } fn f() { return g() } let (a, b, c) = f(); a * 100 + b * 10 + c"),
+        123.0
+    );
+}
+
+/// The JIT proved `t[i]` in range from `for i in 0..t.len()`. If the body moves
+/// `i`, that proof is void — it used to emit an unchecked read.
+#[test]
+fn a_moved_loop_variable_voids_the_range_proof() {
+    let src = r#"
+        fn sum(a) {
+            let s = 0
+            for i in 0..a.len() { i = 5; s += a[i] }
+            s
+        }
+        let xs = [1, 2, 3]
+        xs[5] = 9                     // in the hash part: a.len() is still 3
+        let r = 0
+        for k in 0..60 { r = sum(xs) }
+        r
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap()[0].as_num().unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    assert_eq!(jitted.eval(src).unwrap()[0].as_num().unwrap(), want);
+}
+
+/// rua is Lua-shaped: every number is true, including 0. Compiled code cannot
+/// tell a boolean from the number that would encode it, so it must not try.
+#[test]
+fn zero_is_true_in_compiled_code_too() {
+    let src = r#"
+        fn f(x) { if x { 1 } else { 2 } }
+        fn g(x) { if !x { 1 } else { 2 } }
+        let a = 0
+        let b = 0
+        for i in 0..60 { a = f(0); b = g(0) }
+        return a, b
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    let got = jitted.eval(src).unwrap();
+    assert_eq!(want[0], got[0]);
+    assert_eq!(want[1], got[1]);
+}
+
+/// `continue` in a counted loop still has to run the increment.
+#[test]
+fn continue_in_a_compiled_counted_loop_terminates() {
+    let src = r#"
+        fn odd_sum(n) {
+            let s = 0
+            for i in 0..n { if i % 2 == 0 { continue } s += i }
+            s
+        }
+        let r = 0
+        for k in 0..60 { r = odd_sum(10) }
+        r
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap()[0].as_num().unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    assert_eq!(jitted.eval(src).unwrap()[0].as_num().unwrap(), want);
+    assert_eq!(want, 25.0);
+}
+
+/// Reassigning a global has to reach the code of callers two levels up, which
+/// are jumping straight at the old machine code.
+#[test]
+fn invalidation_reaches_indirect_callers() {
+    let src = r#"
+        fn k(x) { x * 2 }
+        fn g(x) { k(x) + 1 }
+        fn h(x) { g(x) + 1 }
+        let r = 0
+        for i in 0..80 { r = h(1) }
+        k = |x| x * 100
+        for i in 0..80 { r = g(1) }        // recompiles g
+        return h(1), g(1), k(1)
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 20;
+    let got = jitted.eval(src).unwrap();
+    for i in 0..3 {
+        assert_eq!(want[i], got[i], "value {i}");
+    }
+}
+
+/// Compiled recursion is real machine recursion, so it has to stop where the
+/// interpreter stops instead of running the process out of stack.
+#[test]
+fn compiled_recursion_respects_the_depth_limit() {
+    let src = r#"
+        fn down(n) { if n < 1 { return 0 } down(n - 1) + 1 }
+        let warm = 0
+        for k in 0..60 { warm = down(5) }
+        let (ok, why) = try(|| down(100000))
+        return ok, why
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    let got = jitted.eval(src).unwrap();
+    assert_eq!(want[0], Value::Bool(false), "the interpreter should refuse");
+    assert_eq!(got[0], want[0], "and so should compiled code");
+    assert!(got[1].to_string().contains("stack overflow"), "got {}", got[1]);
+}
+
+#[test]
+fn builtins_do_not_panic_on_odd_arguments() {
+    let mut vm = Vm::new();
+    // no format string: nothing to format, and above all no panic
+    assert_eq!(vm.eval("format()").unwrap()[0].to_string(), "nil");
+    assert!(vm.eval(r#"format("{:.999999999}", 1)"#).is_err());
+    assert!(vm.eval(r#""ab".repeat(100000000000)"#).is_err());
+    assert!(vm.eval("math::max()").is_err());
+    assert_eq!(vm.eval("let t = []; t.push(); t.len()").unwrap()[0], Value::Num(0.0));
+    // a nil written into an array literal keeps its place
+    assert_eq!(vm.eval("[1, nil, 2].len()").unwrap()[0], Value::Num(3.0));
+}
+
+#[test]
+fn the_parser_rejects_what_it_cannot_mean() {
+    assert!(Vm::new().eval("break").is_err(), "`break` outside a loop");
+    assert!(Vm::new().eval("fn f() { continue }").is_err(), "`continue` outside a loop");
+    // a block-shaped expression in statement position does not swallow the
+    // next line
+    assert_eq!(n("let x = 3\nif x > 2 { 1 }\n(x)\n"), 3.0);
+    // and a local called `format` does not capture an interpolation's call
+    assert_eq!(s(r#"let format = 7; "{math::pi:.2} {format}""#), "3.14 7");
+    // deep nesting is an error, not a crash
+    let deep = format!("let x = {}1{}", "(".repeat(500), ")".repeat(500));
+    assert!(Vm::new().eval(&deep).is_err());
+}
+
+/// `t[k] += v` evaluates the place once, as `t[k] = t[k] + v` written by hand
+/// would not.
+#[test]
+fn compound_assignment_evaluates_its_place_once() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let calls = 0
+        fn key() { calls = calls + 1; 0 }
+        let t = [10]
+        t[key()] += 5
+        return t[0], calls
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out[0], Value::Num(15.0));
+    assert_eq!(out[1], Value::Num(1.0), "the index expression ran twice");
+}
+
+#[test]
+fn a_failed_require_can_be_retried() {
+    let dir = std::env::temp_dir().join("rua-require-retry");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("m.rua");
+    std::fs::write(&path, "error(\"nope\")\n").unwrap();
+
+    let mut vm = Vm::new();
+    let src = format!(r#"let (ok, _) = try(|| require("{p}")); ok"#, p = path.display());
+    assert_eq!(vm.eval(&src).unwrap()[0], Value::Bool(false));
+
+    // the module is fixed, and loading it again must actually load it
+    std::fs::write(&path, "#{ n: 7 }\n").unwrap();
+    let src = format!(r#"require("{p}").n"#, p = path.display());
+    assert_eq!(vm.eval(&src).unwrap()[0], Value::Num(7.0));
 }

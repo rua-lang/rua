@@ -144,7 +144,10 @@ fn parse_type(toks: &[String]) -> Res<CType> {
         return Ok(if joined == "char" { CType::CStr } else { CType::Ptr });
     }
     Ok(match joined.as_str() {
-        "void" | "" => CType::Void,
+        // a bare `unsigned`/`signed` is an int, not nothing
+        "" if unsigned => CType::U32,
+        "void" => CType::Void,
+        "" => CType::Void,
         "char" | "int8_t" => if unsigned { CType::U8 } else { CType::I8 },
         "uint8_t" | "bool" | "_Bool" => CType::U8,
         "short" | "short int" | "int16_t" => if unsigned { CType::U16 } else { CType::I16 },
@@ -156,7 +159,9 @@ fn parse_type(toks: &[String]) -> Res<CType> {
         }
         "uint64_t" | "size_t" | "uintptr_t" => CType::U64,
         "float" => CType::F32,
-        "double" | "long double" => CType::F64,
+        "double" => CType::F64,
+        // 80-bit on x86: passing it as an f64 would silently corrupt the call
+        "long double" => return err("unsupported C type `long double`"),
         other => return err(format!("unsupported C type `{other}`")),
     })
 }

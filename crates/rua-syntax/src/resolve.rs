@@ -12,6 +12,9 @@ use crate::ast::*;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+/// The most locals one function can have: slots are `u16`.
+pub const MAX_SLOTS: usize = u16::MAX as usize - 256;
+
 /// Resolve a chunk, returning it and the number of frame slots it needs.
 pub fn resolve_chunk(block: &Block) -> (Block, usize) {
     let mut r = Resolver { scopes: vec![FuncScope::new(captured_names(block))] };
@@ -181,6 +184,7 @@ impl Resolver {
 
     fn declare(&mut self, name: &Rc<str>) -> Binding {
         let s = self.cur();
+        assert!(s.next_slot < MAX_SLOTS, "a function may hold at most {MAX_SLOTS} locals");
         let binding = Binding { slot: s.next_slot as u16, cell: s.captured.contains(name) };
         s.next_slot += 1;
         s.n_slots = s.n_slots.max(s.next_slot);

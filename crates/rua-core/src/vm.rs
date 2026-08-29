@@ -83,32 +83,36 @@ impl Vm {
 
         let out = self.execute(&proto);
         let copied = match out {
-            Ok((_, MULTI)) => {
-                // the values are in the multi buffer, not in registers
-                let first = self.multi_first();
-                self.stack[ret_to] = first;
-                Ok(true)
-            }
             Ok((rbase, n)) => {
-                let start = self.base + rbase as usize;
-                let want = if nres == MULTI { n } else { nres };
-                for i in 0..want as usize {
-                    let v = if (i as u16) < n {
-                        self.stack[start + i].clone()
-                    } else {
-                        Value::Nil
-                    };
-                    self.stack[ret_to + i] = v;
-                }
-                if nres == MULTI {
-                    // a spread needs them as a list as well
-                    let mut vals = self.take_vec(n as usize);
+                // Collect first: the caller's result registers can overlap the
+                // callee's, so copying in place would read what it just wrote.
+                let mut vals = if n == MULTI {
+                    self.take_multi()
+                } else {
+                    let start = self.base + rbase as usize;
+                    let mut v = self.take_vec(n as usize);
                     for i in 0..n as usize {
-                        vals.push(self.stack[start + i].clone());
+                        v.push(self.stack[start + i].clone());
                     }
-                    self.set_multi(vals);
+                    v
+                };
+                match nres {
+                    // a spread reserves one register and reads the rest from
+                    // the multi buffer
+                    MULTI => {
+                        self.stack[ret_to] = vals.first().cloned().unwrap_or(Value::Nil);
+                        self.set_multi(vals);
+                    }
+                    want => {
+                        for i in 0..want as usize {
+                            self.stack[ret_to + i] =
+                                vals.get(i).cloned().unwrap_or(Value::Nil);
+                        }
+                        vals.clear();
+                        self.recycle_vec(std::mem::take(&mut vals));
+                    }
                 }
-                Ok(false)
+                Ok(())
             }
             Err(e) => Err(e),
         };

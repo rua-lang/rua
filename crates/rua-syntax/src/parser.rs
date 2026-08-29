@@ -11,13 +11,21 @@ pub struct Parser {
     toks: Vec<Lexed>,
     pos: usize,
     anon: usize,
+    /// How many loops we are inside, so `break` outside one is a syntax error.
+    loops: usize,
+    /// Nesting depth, so that pathological input reports an error instead of
+    /// running the parser out of stack.
+    depth: usize,
 }
+
+/// Deep enough for any real program, shallow enough to stay on the stack.
+const MAX_NESTING: usize = 160;
 
 type PResult<T> = Result<T, String>;
 
 pub fn parse(src: &str) -> PResult<Block> {
     let toks = Lexer::tokenize(src)?;
-    let mut p = Parser { toks, pos: 0, anon: 0 };
+    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0 };
     let b = p.block_body(Tok::Eof)?;
     p.expect(Tok::Eof)?;
     Ok(b)
@@ -59,6 +67,14 @@ impl Parser {
             Tok::Name(n) => Ok(n.into()),
             other => Err(format!("line {line}: expected a name, found {other:?}")),
         }
+    }
+
+    /// A loop body, where `break` and `continue` are allowed.
+    fn loop_block(&mut self) -> PResult<Block> {
+        self.loops += 1;
+        let b = self.block();
+        self.loops -= 1;
+        b
     }
 
     /// `{ ... }`
@@ -130,25 +146,25 @@ impl Parser {
                 self.accept(Tok::Semi);
                 Ok(Item::Stat(Stat::Return(exprs)))
             }
-            Tok::Break => {
+            Tok::Break | Tok::Continue => {
+                let word = if *self.peek() == Tok::Break { "break" } else { "continue" };
+                let stat = if word == "break" { Stat::Break } else { Stat::Continue };
                 self.bump();
                 self.accept(Tok::Semi);
-                Ok(Item::Stat(Stat::Break))
-            }
-            Tok::Continue => {
-                self.bump();
-                self.accept(Tok::Semi);
-                Ok(Item::Stat(Stat::Continue))
+                if self.loops == 0 {
+                    return Err(format!("line {line}: `{word}` outside of a loop"));
+                }
+                Ok(Item::Stat(stat))
             }
             Tok::While => {
                 self.bump();
                 let cond = self.expr_no_struct()?;
-                let body = self.block()?;
+                let body = self.loop_block()?;
                 Ok(Item::Stat(Stat::While(next_loop_id(), cond, body)))
             }
             Tok::Loop => {
                 self.bump();
-                let body = self.block()?;
+                let body = self.loop_block()?;
                 Ok(Item::Stat(Stat::Loop(next_loop_id(), body)))
             }
             Tok::For => {
@@ -156,7 +172,7 @@ impl Parser {
                 let vars = self.let_pattern()?;
                 self.expect(Tok::In)?;
                 let iter = self.expr_no_struct()?;
-                let body = self.block()?;
+                let body = self.loop_block()?;
                 Ok(Item::Stat(match iter {
                     // `for i in a..b` is a counted loop: the JIT can compile it
                     Expr::Range(start, end, inclusive) if vars.len() == 1 => Stat::ForRange {
@@ -176,6 +192,21 @@ impl Parser {
                         body,
                     },
                 }))
+            }
+            // A block-shaped expression in statement position is a statement,
+            // as in Rust: `if c { 1 }` followed by `(f)()` is two statements,
+            // not a call of the `if`.
+            Tok::If | Tok::Match | Tok::LBrace => {
+                let e = match self.peek() {
+                    Tok::If => self.if_expr()?,
+                    Tok::Match => self.match_expr()?,
+                    _ => Expr::Do(self.block()?),
+                };
+                self.accept(Tok::Semi);
+                if self.block_ends_here() {
+                    return Ok(Item::Value(e));
+                }
+                Ok(Item::Stat(Stat::Expr(e)))
             }
             _ => {
                 let e = self.expr()?;
@@ -206,6 +237,11 @@ impl Parser {
     }
 
     /// `x`, `mut x`, or `(a, b)` — the shapes `let` and `for` accept.
+    /// Is the next token the end of the enclosing block?
+    fn block_ends_here(&self) -> bool {
+        matches!(self.peek(), Tok::RBrace | Tok::Eof)
+    }
+
     fn let_pattern(&mut self) -> PResult<Vec<Rc<str>>> {
         self.accept(Tok::Mut);
         if self.accept(Tok::LParen) {
@@ -241,7 +277,11 @@ impl Parser {
         if self.accept(Tok::Arrow) {
             self.name()?;
         }
-        let body = self.block()?;
+        // `break` does not cross a function boundary
+        let outer_loops = std::mem::take(&mut self.loops);
+        let body = self.block();
+        self.loops = outer_loops;
+        let body = body?;
         Ok(Expr::Func(Rc::new(FuncDef::new(name, params, body, line))))
     }
 
@@ -296,6 +336,17 @@ impl Parser {
     }
 
     fn binexpr(&mut self, limit: u8, structs: bool) -> PResult<Expr> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            self.depth -= 1;
+            return Err(format!("line {}: expression nests too deeply", self.line()));
+        }
+        let out = self.binexpr_inner(limit, structs);
+        self.depth -= 1;
+        out
+    }
+
+    fn binexpr_inner(&mut self, limit: u8, structs: bool) -> PResult<Expr> {
         let mut left = match self.peek().clone() {
             Tok::Bang => {
                 self.bump();
@@ -613,7 +664,8 @@ fn interpolate(text: &str, line: u32) -> PResult<Expr> {
                 parts.push(match spec {
                     // `{x:.2}` is `format("{:.2}", x)`
                     Some(spec) => Expr::Call(
-                        Box::new(Expr::Var("format".into())),
+                        // the global, so a local called `format` cannot capture it
+                        Box::new(Expr::Global("format".into(), GlobalCache::new())),
                         vec![Expr::Str(format!("{{:{spec}}}").into()), inner],
                     ),
                     None => inner,
@@ -664,7 +716,7 @@ fn split_spec(src: &str) -> (String, Option<String>) {
 /// Parse one expression out of a fragment of source, for interpolation.
 fn parse_fragment(src: &str, line: u32) -> PResult<Expr> {
     let toks = Lexer::tokenize(src).map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
-    let mut p = Parser { toks, pos: 0, anon: 0 };
+    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0 };
     let e = p.expr().map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
     if *p.peek() != Tok::Eof {
         return Err(format!("line {line}: `{{{src}}}` is not a single expression"));

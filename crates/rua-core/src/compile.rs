@@ -239,6 +239,19 @@ impl FnCompiler {
                         return;
                     }
                 }
+                // `t[k] += v` evaluates `t` and `k` once, as an assignment to
+                // the same place would
+                if let Expr::Index(obj, key) = target {
+                    let o = self.operand(obj);
+                    let k = self.operand(key);
+                    let cur = self.alloc();
+                    self.emit(Op::GetIndex { dst: cur, obj: o, key: k }, 0);
+                    let rhs = self.operand(e);
+                    self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
+                    self.emit(Op::SetIndex { obj: o, key: k, val: cur }, 0);
+                    self.release(mark);
+                    return;
+                }
                 let cur = self.alloc();
                 self.expr(target, cur);
                 let rhs = self.operand(e);

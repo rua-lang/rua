@@ -431,10 +431,9 @@ impl Table {
         self.arr.is_empty() && self.map.is_empty()
     }
 
+    /// Append, including a nil: `[1, nil, 2]` keeps its three slots, so that
+    /// `len()` and iteration agree with what was written.
     pub fn push(&mut self, v: Value) {
-        if let Value::Nil = v {
-            return;
-        }
         self.nums = None;
         self.arr.push(v);
         self.absorb_from_map();

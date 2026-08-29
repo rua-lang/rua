@@ -74,10 +74,13 @@ pub struct RtCtxHolder {
     ctx: Box<RtCtx>,
     #[allow(dead_code)]
     callees: Box<[Callee]>,
+    /// Kept alive because the context points at its interior.
+    #[allow(dead_code)]
+    depth: Rc<std::cell::Cell<i64>>,
 }
 
 impl RtCtxHolder {
-    fn new(hooks: RtHooks, callees: Vec<Callee>) -> RtCtxHolder {
+    fn new(hooks: RtHooks, callees: Vec<Callee>, depth: Rc<std::cell::Cell<i64>>) -> RtCtxHolder {
         let callees = callees.into_boxed_slice();
         let ctx = Box::new(RtCtx {
             len: hooks.len,
@@ -85,8 +88,11 @@ impl RtCtxHolder {
             span: hooks.span,
             push: hooks.push,
             callees: callees.as_ptr(),
+            // `Cell<i64>` is a transparent wrapper, so this is the counter
+            depth: depth.as_ptr(),
+            max_depth: MAX_DEPTH,
         });
-        RtCtxHolder { ctx, callees }
+        RtCtxHolder { ctx, callees, depth }
     }
 
     fn as_ptr(&self) -> *const RtCtx {
@@ -124,19 +130,30 @@ pub struct Vm {
     /// Modules already loaded by `require`, keyed by canonical path.
     pub modules: HashMap<String, Value>,
     /// Compiled functions that inlined a call to a global, so that assigning to
-    /// that global can throw their machine code away.
+    /// that global can throw their machine code away. Keyed by global slot, and
+    /// walked transitively: a caller two levels up is calling that code too.
     jit_deps: HashMap<u32, Vec<std::rc::Weak<Function>>>,
+    /// The same for compiled loops, which inline calls just as functions do.
+    loop_deps: HashMap<u32, Vec<u32>>,
     /// Functions the JIT is busy with, so callee-first compilation terminates.
     compiling: std::collections::HashSet<usize>,
+    /// Retired runtime contexts. Compiled code holds raw pointers to these, so
+    /// they may never be freed while the process can still enter that code —
+    /// which, since the shared objects are deliberately leaked, is forever.
+    /// They are a few dozen bytes each and bounded by the number of compiles.
+    retired_ctx: Vec<RtCtxHolder>,
     /// What the JIT knows about each loop it has seen, keyed by loop id.
     loops: HashMap<u32, LoopEntry>,
     /// `string`, `math` and `table`, kept to hand for method dispatch.
     libs: [Option<Rc<RefCell<Table>>>; 3],
     pub(crate) upvals: Rc<Vec<CellRef>>,
-    depth: usize,
+    /// Call depth, shared with compiled code through [`RtCtx`] so that native
+    /// recursion is bounded by the same limit. Boxed because compiled code
+    /// holds its address and the VM itself may move.
+    depth: Rc<std::cell::Cell<i64>>,
 }
 
-const MAX_DEPTH: usize = 200;
+const MAX_DEPTH: i64 = 200;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -167,11 +184,13 @@ impl Vm {
             frames: Vec::new(),
             modules: HashMap::new(),
             jit_deps: HashMap::new(),
+            loop_deps: HashMap::new(),
             compiling: std::collections::HashSet::new(),
+            retired_ctx: Vec::new(),
             loops: HashMap::new(),
             libs: [None, None, None],
             upvals: Rc::new(Vec::new()),
-            depth: 0,
+            depth: Rc::new(std::cell::Cell::new(0)),
         }
     }
 
@@ -197,20 +216,51 @@ impl Vm {
         self.write_global(i, v);
     }
 
-    /// Store a global, and drop the machine code of anything that compiled a
-    /// direct call to its old value.
+    /// Store a global, and drop the machine code of everything that compiled a
+    /// call to its old value — including callers of those callers, since a
+    /// direct call jumps at a fixed address that will not be revisited.
     fn write_global(&mut self, slot: u32, v: Value) {
         let same = matches!((&self.gvals[slot as usize], &v), (Value::Func(a), Value::Func(b)) if Rc::ptr_eq(a, b));
         self.gvals[slot as usize] = v;
         if same {
             return;
         }
-        if let Some(dependents) = self.jit_deps.remove(&slot) {
-            for weak in dependents {
-                if let Some(f) = weak.upgrade() {
-                    f.jit.set(None);
-                    f.jit_state.set(JitState::Cold);
-                    f.hits.set(0);
+        self.invalidate(slot);
+    }
+
+    /// Throw away every piece of compiled code that can reach this global,
+    /// following the dependency edges to a fixed point.
+    fn invalidate(&mut self, slot: u32) {
+        let mut queue = vec![slot];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(slot) = queue.pop() {
+            if !seen.insert(slot) {
+                continue;
+            }
+            for id in self.loop_deps.remove(&slot).unwrap_or_default() {
+                if let Some(entry) = self.loops.get_mut(&id) {
+                    entry.code = None;
+                    entry.iterations = 0;
+                    if let Some(ctx) = entry.ctx.take() {
+                        self.retired_ctx.push(ctx);
+                    }
+                }
+            }
+            for weak in self.jit_deps.remove(&slot).unwrap_or_default() {
+                let Some(f) = weak.upgrade() else { continue };
+                if f.jit.get().is_none() {
+                    continue;
+                }
+                f.jit.set(None);
+                f.jit_state.set(JitState::Cold);
+                f.hits.set(0);
+                if let Some(ctx) = f.rt.borrow_mut().take() {
+                    self.retired_ctx.push(ctx);
+                }
+                // whoever inlined *this* function is now calling dead code too
+                let name = f.proto.name.clone();
+                if let Some(s) = self.gnames.get(&*name).copied() {
+                    queue.push(s);
                 }
             }
         }
@@ -288,7 +338,12 @@ impl Vm {
     pub fn eval_file(&mut self, path: &str) -> Res<Vec<Value>> {
         let src = std::fs::read_to_string(path)
             .map_err(|e| Error(format!("cannot read {path}: {e}")))?;
-        self.eval(&src)
+        // a chunk is a call like any other: one file loading another must not
+        // walk off the end of the stack
+        self.enter_depth().map_err(|s| s.into_error())?;
+        let out = self.eval(&src);
+        self.leave_depth();
+        out
     }
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>) -> Res<Vec<Value>> {
@@ -381,6 +436,11 @@ impl Vm {
             match self.jit.compile_loop(st, req) {
                 Ok(compiled) => {
                     let ctx = self.build_ctx(&compiled.inlined);
+                    for name in &compiled.inlined {
+                        if let Some(slot) = self.gnames.get(name.as_str()).copied() {
+                            self.loop_deps.entry(slot).or_default().push(id);
+                        }
+                    }
                     let entry = self.loops.get_mut(&id).expect("present");
                     entry.ctx = Some(ctx);
                     entry.code = Some(compiled);
@@ -453,20 +513,31 @@ impl Vm {
                 _ => Callee { entry: 0, ctx: std::ptr::null() },
             })
             .collect();
-        RtCtxHolder::new(hooks(), callees)
+        RtCtxHolder::new(hooks(), callees, self.depth.clone())
+    }
+
+    /// Globals that already hold compiled code, with what their parameters
+    /// have to be — a direct call can only pass numbers.
+    fn compiled_globals(&self) -> HashMap<String, (usize, Vec<Kind>)> {
+        let mut out = HashMap::new();
+        for (name, slot) in &self.gnames {
+            if let Value::Func(g) = &self.gvals[*slot as usize] {
+                if let Some(code) = g.jit.get() {
+                    out.insert(name.to_string(), (code.address(), g.param_kinds.borrow().clone()));
+                }
+            }
+        }
+        out
     }
 
     /// Loops may call already compiled global functions directly, too.
     fn self_ref_for_loop(&self) -> SelfRef {
-        let mut compiled_globals = HashMap::new();
-        for (name, slot) in &self.gnames {
-            if let Value::Func(g) = &self.gvals[*slot as usize] {
-                if let Some(code) = g.jit.get() {
-                    compiled_globals.insert(name.to_string(), (code.address(), code.arity()));
-                }
-            }
+        SelfRef {
+            upval: None,
+            global: None,
+            compiled_globals: self.compiled_globals(),
+            hooks: hooks(),
         }
-        SelfRef { upval: None, global: None, compiled_globals, hooks: hooks() }
     }
 
     /// Reserve a frame's registers. The stack only ever grows: frames clear
@@ -492,21 +563,19 @@ impl Vm {
 
     /// Enter a call, refusing to go deeper than the stack allows.
     pub(crate) fn enter_depth(&mut self) -> Eval<bool> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
+        let d = self.depth.get() + 1;
+        self.depth.set(d);
+        if d > MAX_DEPTH {
+            self.depth.set(d - 1);
             return bad("stack overflow");
         }
         Ok(true)
     }
 
     pub(crate) fn leave_depth(&mut self) {
-        self.depth -= 1;
+        self.depth.set(self.depth.get() - 1);
     }
 
-    pub(crate) fn multi_first(&self) -> Value {
-        self.multi.first().cloned().unwrap_or(Value::Nil)
-    }
 
     /// Run a function, using its compiled code when that applies.
     pub(crate) fn call_compiled_or_run(
@@ -682,13 +751,9 @@ impl Vm {
     }
 
     pub(crate) fn call_value(&mut self, f: &Value, args: Vec<Value>) -> Eval<Vec<Value>> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
-            return bad("stack overflow");
-        }
+        self.enter_depth()?;
         let out = self.call_inner(f, args);
-        self.depth -= 1;
+        self.leave_depth();
         out
     }
 
@@ -726,21 +791,17 @@ impl Vm {
             _ => None,
         };
         // globals that already hold compiled functions can be called directly
-        let mut compiled_globals = HashMap::new();
-        for (name, slot) in &self.gnames {
-            if let Value::Func(g) = &self.gvals[*slot as usize] {
-                if let Some(code) = g.jit.get() {
-                    compiled_globals.insert(name.to_string(), (code.address(), code.arity()));
-                }
-            }
-        }
+        let compiled_globals = self.compiled_globals();
         let req = SelfRef { upval, global, compiled_globals, hooks: hooks() };
         match self.jit.compile(func.def(), req) {
             Ok(out) => {
                 let ctx = self.build_ctx(&out.inlined);
                 func.jit.set(Some(out.code));
                 *func.param_kinds.borrow_mut() = out.param_kinds;
-                *func.rt.borrow_mut() = Some(ctx);
+                if let Some(old) = func.rt.borrow_mut().replace(ctx) {
+                    // someone else's compiled code may still call through it
+                    self.retired_ctx.push(old);
+                }
                 func.jit_state.set(JitState::Compiled);
                 for name in out.inlined {
                     if let Some(slot) = self.gnames.get(name.as_str()).copied() {
@@ -913,6 +974,7 @@ pub unsafe extern "C" fn rua_rt_span(
 /// As [`rua_rt_len`].
 #[no_mangle]
 pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64) {
+    debug_assert!(!t.is_null(), "compiled code pushed to a null table");
     if t.is_null() {
         return;
     }
