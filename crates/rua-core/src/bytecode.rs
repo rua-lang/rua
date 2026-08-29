@@ -52,6 +52,8 @@ pub enum Op {
     NewCell { slot: Reg, src: Reg },
 
     Bin { kind: BinKind, dst: Reg, a: Reg, b: Reg },
+    /// The same, with a constant on the right: `i + 1`, `x < n`, `x % 5`.
+    BinK { kind: BinKind, dst: Reg, a: Reg, k: u16 },
     Neg { dst: Reg, a: Reg },
     Not { dst: Reg, a: Reg },
 
@@ -64,6 +66,9 @@ pub enum Op {
     Call { base: Reg, nargs: u16, nres: u16 },
     /// `obj.m(..)`: the receiver is at `base+1` and becomes the first argument.
     Method { base: Reg, name: u16, nargs: u16, nres: u16 },
+    /// A call whose last argument was itself a call: the fixed arguments are
+    /// followed by every value that call produced, as in `print(f())`.
+    CallSpread { base: Reg, nargs: u16, nres: u16, method: u16 },
     /// Return `n` values starting at `base`, or the pending multi-value set.
     Ret { base: Reg, n: u16 },
 
@@ -86,14 +91,16 @@ pub enum Op {
     /// iterator is done.
     IterNext { iter: Reg, base: Reg, count: u16, exit: u32 },
 
-    /// The back edge of a loop: the loop's id, so the JIT can count iterations
-    /// and compile the hot ones, and where to continue when it does.
-    LoopHint { id: u32, exit: u32 },
+    /// The back edge of a loop: the loop's id, a counter slot, and where to
+    /// continue if the JIT takes the loop over.
+    LoopHint { id: u32, hint: u16, exit: u32 },
 }
 
 /// One compiled function: its code, and everything the code refers to.
 pub struct Proto {
     pub def: Rc<FuncDef>,
+    /// The function's name, ready to push onto a traceback without allocating.
+    pub name: Rc<str>,
     pub code: Vec<Op>,
     /// One line number per instruction, for error messages.
     pub lines: Vec<u32>,
@@ -102,6 +109,9 @@ pub struct Proto {
     /// Global names this chunk touches, each with the slot it resolved to.
     pub globals: Vec<GlobalRef>,
     pub n_regs: usize,
+    /// One iteration counter per loop, so counting costs a `Cell` bump rather
+    /// than a hash lookup.
+    pub hints: Vec<Cell<u32>>,
     /// Parameters, in order, with the register each lands in.
     pub params: Vec<ParamSlot>,
 }

@@ -5,16 +5,13 @@
 //! else the compiler needs is a temporary above them.
 
 use crate::bytecode::*;
-use crate::value::{Table, Value};
+use crate::value::Value;
 use rua_syntax::ast::*;
 use std::rc::Rc;
 
 pub fn compile_chunk(body: &Block, n_slots: usize, def: Rc<FuncDef>) -> Rc<Proto> {
     let mut f = FnCompiler::new(def, n_slots);
-    // a chunk's value is its tail expression, returned like any other
-    let dst = f.alloc();
-    f.block(body, Some(dst));
-    f.emit(Op::Ret { base: dst, n: 1 }, 0);
+    f.block_ret(body);
     Rc::new(f.finish())
 }
 
@@ -31,6 +28,7 @@ struct FnCompiler {
     consts: Vec<Value>,
     protos: Vec<Rc<Proto>>,
     globals: Vec<GlobalRef>,
+    hints: usize,
     free: Reg,
     max_regs: Reg,
     loops: Vec<LoopCtx>,
@@ -46,6 +44,7 @@ impl FnCompiler {
             consts: Vec::new(),
             protos: Vec::new(),
             globals: Vec::new(),
+            hints: 0,
             free: n_slots as Reg,
             max_regs: n_slots as Reg,
             loops: Vec::new(),
@@ -61,6 +60,7 @@ impl FnCompiler {
             .map(|b| ParamSlot { reg: b.slot, cell: b.cell })
             .collect();
         Proto {
+            name: Rc::from(self.def.name.as_str()),
             def: self.def,
             code: self.code,
             lines: self.lines,
@@ -68,6 +68,7 @@ impl FnCompiler {
             protos: self.protos,
             globals: self.globals,
             n_regs: self.max_regs as usize + 1,
+            hints: (0..self.hints).map(|_| std::cell::Cell::new(0)).collect(),
             params,
         }
     }
@@ -87,6 +88,28 @@ impl FnCompiler {
 
     fn release(&mut self, mark: Reg) {
         self.free = mark;
+    }
+
+    /// A register holding `e`. A plain local already is one, which is what
+    /// keeps the common `a + b` down to a single instruction.
+    fn operand(&mut self, e: &Expr) -> Reg {
+        match e {
+            Expr::Local(b, _) if !b.cell => b.slot,
+            other => {
+                let r = self.alloc();
+                self.expr(other, r);
+                r
+            }
+        }
+    }
+
+    /// The constant index of a literal number, when there is one: the right
+    /// hand side of most arithmetic is a literal.
+    fn literal(&mut self, e: &Expr) -> Option<u16> {
+        match e {
+            Expr::Num(n) => Some(self.constant(Value::Num(*n))),
+            _ => None,
+        }
     }
 
     fn constant(&mut self, v: Value) -> u16 {
@@ -199,11 +222,27 @@ impl FnCompiler {
             }
             Stat::OpAssign(target, op, e) => {
                 let mark = self.mark();
+                let kind = bin_kind(*op);
+                // `x += 1` on a plain local updates that register in place
+                if let Expr::Local(b, _) = target {
+                    if !b.cell {
+                        match self.literal(e) {
+                            Some(k) => {
+                                self.emit(Op::BinK { kind, dst: b.slot, a: b.slot, k }, 0);
+                            }
+                            None => {
+                                let rhs = self.operand(e);
+                                self.emit(Op::Bin { kind, dst: b.slot, a: b.slot, b: rhs }, 0);
+                            }
+                        }
+                        self.release(mark);
+                        return;
+                    }
+                }
                 let cur = self.alloc();
                 self.expr(target, cur);
-                let rhs = self.alloc();
-                self.expr(e, rhs);
-                self.emit(Op::Bin { kind: bin_kind(*op), dst: cur, a: cur, b: rhs }, 0);
+                let rhs = self.operand(e);
+                self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
                 self.store(target, cur);
                 self.release(mark);
             }
@@ -226,7 +265,7 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, top);
                 }
-                let hint = self.emit(Op::LoopHint { id: *id, exit: 0 }, 0);
+                let hint = self.loop_hint(*id);
                 self.emit(Op::Jump { to: top }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
@@ -241,7 +280,7 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, top);
                 }
-                let hint = self.emit(Op::LoopHint { id: *id, exit: 0 }, 0);
+                let hint = self.loop_hint(*id);
                 self.emit(Op::Jump { to: top }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
@@ -281,7 +320,7 @@ impl FnCompiler {
                     self.patch_to(at, cont);
                 }
                 self.emit(Op::Bin { kind: BinKind::Add, dst: counter, a: counter, b: step }, 0);
-                let hint = self.emit(Op::LoopHint { id: *id, exit: 0 }, 0);
+                let hint = self.loop_hint(*id);
                 self.emit(Op::Jump { to: top }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
@@ -319,7 +358,7 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, cont);
                 }
-                let hint = self.emit(Op::LoopHint { id: *id, exit: 0 }, 0);
+                let hint = self.loop_hint(*id);
                 self.emit(Op::Jump { to: top }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
@@ -369,6 +408,13 @@ impl FnCompiler {
                 unreachable!("the resolver rewrites these")
             }
         }
+    }
+
+    /// Emit a loop's back-edge hint, with a fresh counter slot.
+    fn loop_hint(&mut self, id: u32) -> usize {
+        let hint = self.hints as u16;
+        self.hints += 1;
+        self.emit(Op::LoopHint { id, hint, exit: 0 }, 0)
     }
 
     /// A loop hint points past the loop, for when the JIT takes it over.
@@ -457,10 +503,8 @@ impl FnCompiler {
             }
             Expr::Index(obj, key) => {
                 let mark = self.mark();
-                let o = self.alloc();
-                self.expr(obj, o);
-                let k = self.alloc();
-                self.expr(key, k);
+                let o = self.operand(obj);
+                let k = self.operand(key);
                 self.emit(Op::SetIndex { obj: o, key: k, val: src }, 0);
                 self.release(mark);
             }
@@ -520,10 +564,8 @@ impl FnCompiler {
             }
             Expr::Index(obj, key) => {
                 let mark = self.mark();
-                let o = self.alloc();
-                self.expr(obj, o);
-                let k = self.alloc();
-                self.expr(key, k);
+                let o = self.operand(obj);
+                let k = self.operand(key);
                 self.emit(Op::GetIndex { dst, obj: o, key: k }, 0);
                 self.release(mark);
             }
@@ -595,11 +637,16 @@ impl FnCompiler {
             }
             Expr::Bin(op, a, b) => {
                 let mark = self.mark();
-                let ra = self.alloc();
-                self.expr(a, ra);
-                let rb = self.alloc();
-                self.expr(b, rb);
-                self.emit(Op::Bin { kind: bin_kind(*op), dst, a: ra, b: rb }, 0);
+                let ra = self.operand(a);
+                match self.literal(b) {
+                    Some(k) => {
+                        self.emit(Op::BinK { kind: bin_kind(*op), dst, a: ra, k }, 0);
+                    }
+                    None => {
+                        let rb = self.operand(b);
+                        self.emit(Op::Bin { kind: bin_kind(*op), dst, a: ra, b: rb }, 0);
+                    }
+                }
                 self.release(mark);
             }
             Expr::Do(b) => self.block(b, Some(dst)),
@@ -719,38 +766,126 @@ impl FnCompiler {
     /// VM can hand the callee a contiguous window.
     fn call_expr(&mut self, e: &Expr, dst: Reg, nres: u16) {
         let mark = self.mark();
-        // the call frame has to start above everything still live
-        let base = if dst >= self.def_locals() && dst + 1 >= self.free {
+        // A call writes its results starting at the frame base, so when the
+        // destination is scratch space we put the frame there and the results
+        // land where they are wanted. Register allocation is a stack, so
+        // anything still live sits below `dst` and is safe.
+        let base = if dst >= self.def_locals() {
             self.free = dst;
             self.alloc()
         } else {
+            debug_assert!(nres <= 1, "several results must go to scratch registers");
             self.alloc()
         };
         match e {
             Expr::Call(f, args) => {
                 self.expr(f, base);
-                for a in args {
-                    let r = self.alloc();
-                    self.expr(a, r);
+                let spread = self.args(args);
+                let nargs = args.len() as u16;
+                if spread {
+                    self.emit(Op::CallSpread { base, nargs: nargs - 1, nres, method: u16::MAX }, 0);
+                } else {
+                    self.emit(Op::Call { base, nargs, nres }, 0);
                 }
-                self.emit(Op::Call { base, nargs: args.len() as u16, nres }, 0);
             }
             Expr::Method(obj, name, args) => {
                 let recv = self.alloc();
                 self.expr(obj, recv);
-                for a in args {
-                    let r = self.alloc();
-                    self.expr(a, r);
-                }
+                let spread = self.args(args);
                 let k = self.constant(Value::str(&**name));
-                self.emit(Op::Method { base, name: k, nargs: args.len() as u16, nres }, 0);
+                let nargs = args.len() as u16;
+                if spread {
+                    self.emit(
+                        Op::CallSpread { base, nargs: nargs - 1 + 1, nres, method: k },
+                        0,
+                    );
+                } else {
+                    self.emit(Op::Method { base, name: k, nargs, nres }, 0);
+                }
             }
             _ => unreachable!("not a call"),
         }
         if nres > 0 && base != dst {
             self.emit(Op::Move { dst, src: base }, 0);
         }
-        self.release(mark);
+        // keep the result registers reserved: they are what the caller reads
+        let used = match nres {
+            MULTI | 0 => 1,
+            n => n,
+        };
+        self.release(mark.max(base + used));
+    }
+
+    /// Compile a block that is a function body: its tail is what the function
+    /// returns, and a call in tail position passes on *every* value it made.
+    fn block_ret(&mut self, b: &Block) {
+        for (i, st) in b.stats.iter().enumerate() {
+            self.line = b.lines.get(i).copied().unwrap_or(self.line);
+            self.stat(st);
+        }
+        if b.tail_line > 0 {
+            self.line = b.tail_line;
+        }
+        match b.tail.as_deref() {
+            None => {
+                let r = self.alloc();
+                self.emit(Op::Ret { base: r, n: 0 }, 0);
+            }
+            Some(e) if is_call(e) => {
+                let mark = self.mark();
+                let r = self.alloc();
+                self.call_expr(e, r, MULTI);
+                self.emit(Op::Ret { base: r, n: MULTI }, 0);
+                self.release(mark);
+            }
+            Some(Expr::Do(inner)) => self.block_ret(inner),
+            Some(Expr::If(arms, els)) => self.if_ret(arms, els.as_ref()),
+            Some(e) => {
+                let mark = self.mark();
+                let r = self.alloc();
+                self.expr(e, r);
+                self.emit(Op::Ret { base: r, n: 1 }, 0);
+                self.release(mark);
+            }
+        }
+    }
+
+    /// An `if` in tail position: every branch returns for itself, so a call in
+    /// any of them keeps its extra values.
+    fn if_ret(&mut self, arms: &[(Expr, Block)], els: Option<&Block>) {
+        for (cond, body) in arms {
+            let mark = self.mark();
+            let c = self.alloc();
+            self.expr(cond, c);
+            let next = self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0);
+            self.release(mark);
+            self.block_ret(body);
+            self.patch(next);
+        }
+        match els {
+            Some(b) => self.block_ret(b),
+            None => {
+                let r = self.alloc();
+                self.emit(Op::Ret { base: r, n: 0 }, 0);
+            }
+        }
+    }
+
+    /// Compile a call's arguments. A call in last position spreads: every
+    /// value it produced becomes an argument, as in `print(f())`.
+    fn args(&mut self, args: &[Expr]) -> bool {
+        let n = args.len();
+        let mut spread = false;
+        for (i, a) in args.iter().enumerate() {
+            let r = self.alloc();
+            if i + 1 == n && is_call(a) {
+                self.call_expr(a, r, MULTI);
+                spread = true;
+            } else {
+                self.expr(a, r);
+            }
+        }
+        spread
     }
 
     fn def_locals(&self) -> Reg {
@@ -761,9 +896,7 @@ impl FnCompiler {
 /// Compile a nested function into its own proto.
 fn compile_function(def: &Rc<FuncDef>) -> Rc<Proto> {
     let mut f = FnCompiler::new(def.clone(), def.n_slots);
-    let dst = f.alloc();
-    f.block(&def.body, Some(dst));
-    f.emit(Op::Ret { base: dst, n: 1 }, 0);
+    f.block_ret(&def.body);
     Rc::new(f.finish())
 }
 

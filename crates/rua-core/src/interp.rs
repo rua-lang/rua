@@ -32,7 +32,7 @@ impl From<String> for Signal {
 }
 
 impl Signal {
-    fn into_error(self) -> Error {
+    pub(crate) fn into_error(self) -> Error {
         match self {
             Signal::Err(e) => *e,
             Signal::Break => Error("`break` outside of a loop"),
@@ -42,14 +42,14 @@ impl Signal {
     }
 }
 
-type Eval<T> = Result<T, Signal>;
+pub type Eval<T> = Result<T, Signal>;
 
-fn bad<T>(msg: impl Into<String>) -> Eval<T> {
+pub(crate) fn bad<T>(msg: impl Into<String>) -> Eval<T> {
     Err(Signal::Err(Box::new(Error(msg.into()))))
 }
 
 /// Iterations between checks on a running loop.
-const LOOP_BATCH: u32 = 1000;
+pub(crate) const LOOP_BATCH: u32 = 1000;
 
 /// Total iterations, across every entry, before a loop is worth compiling.
 ///
@@ -106,13 +106,16 @@ pub struct Vm {
     gvals: Vec<Value>,
     gnames: crate::hash::FxMap<Rc<str>, u32>,
     pub jit: Jit,
-    /// Every local lives here: one contiguous run of slots per active call.
-    stack: Vec<Value>,
-    base: usize,
+    /// Every local lives here: one contiguous run of registers per call.
+    pub(crate) stack: Vec<Value>,
+    pub(crate) base: usize,
+    /// One past the highest register in use, which is where the next frame
+    /// starts. `stack.len()` is the high-water mark, not the top.
+    pub(crate) top: usize,
     /// Argument vectors, recycled: a call per node adds up fast.
     pool: Vec<Vec<Value>>,
-    /// Where a `return` leaves its values on the way out.
-    rets: Vec<Value>,
+    /// The values of the last call that produced "as many as there are".
+    multi: Vec<Value>,
     /// The statement being executed, and the call stack above it, so that an
     /// error can say where it happened.
     line: u32,
@@ -128,7 +131,7 @@ pub struct Vm {
     loops: HashMap<u32, LoopEntry>,
     /// `string`, `math` and `table`, kept to hand for method dispatch.
     libs: [Option<Rc<RefCell<Table>>>; 3],
-    upvals: Rc<Vec<CellRef>>,
+    pub(crate) upvals: Rc<Vec<CellRef>>,
     depth: usize,
 }
 
@@ -156,8 +159,9 @@ impl Vm {
             jit: Jit::new(),
             stack: Vec::with_capacity(256),
             base: 0,
+            top: 0,
             pool: Vec::new(),
-            rets: Vec::new(),
+            multi: Vec::new(),
             line: 0,
             frames: Vec::new(),
             modules: HashMap::new(),
@@ -253,19 +257,31 @@ impl Vm {
             where_: None,
             trace: Vec::new(),
         })?;
-        let saved_base = self.base;
-        let saved_upvals = std::mem::replace(&mut self.upvals, Rc::new(Vec::new()));
-        self.base = self.stack.len();
-        self.stack.resize(self.base + n_slots, Value::Nil);
-        let out = self.exec_block(&block);
-        self.stack.truncate(self.base);
-        self.base = saved_base;
-        self.upvals = saved_upvals;
-        match out {
-            Ok(vals) => Ok(vals),
-            Err(Signal::Return) => Ok(self.take_rets()),
-            Err(other) => Err(other.into_error()),
-        }
+        // A chunk is a function of no arguments, compiled the same way. It
+        // keeps its syntax, so the JIT can still find the loops inside it.
+        let def = Rc::new(rua_syntax::ast::FuncDef {
+            id: usize::MAX,
+            name: String::new(),
+            params: Vec::new(),
+            body: block,
+            line: 0,
+            n_slots,
+            param_bindings: Vec::new(),
+            upvals: Vec::new(),
+        });
+        let proto = crate::compile::compile_chunk(&def.body, n_slots, def.clone());
+        let chunk = Rc::new(Function {
+            proto,
+            param_kinds: RefCell::new(Vec::new()),
+            rt: RefCell::new(None),
+            upvals: Rc::new(Vec::new()),
+            hits: std::cell::Cell::new(0),
+            jit: std::cell::Cell::new(None),
+            // a chunk runs once: never worth compiling as a whole
+            jit_state: std::cell::Cell::new(JitState::Blocked),
+        });
+        let args = self.take_vec(0);
+        self.run(&chunk, args).map_err(|s| s.into_error())
     }
 
     pub fn eval_file(&mut self, path: &str) -> Res<Vec<Value>> {
@@ -280,29 +296,24 @@ impl Vm {
 
     // ---- blocks and statements ----------------------------------------------
 
-    /// Runs a block and yields its tail value(s), or none.
-    fn exec_block(&mut self, block: &Block) -> Eval<Vec<Value>> {
-        for (i, st) in block.stats.iter().enumerate() {
-            self.line = block.lines.get(i).copied().unwrap_or(self.line);
-            self.exec(st).map_err(|e| self.locate(e))?;
-        }
-        match &block.tail {
-            Some(e) => {
-                self.line = if block.tail_line > 0 { block.tail_line } else { self.line };
-                let out = self.eval_multi(e);
-                out.map_err(|e| self.locate(e))
-            }
-            None => Ok(Vec::new()),
-        }
+    /// Stamp an error with the line it happened on, once.
+    /// Remember which line we are on, so a call frame can say where it came
+    /// from in a traceback.
+    #[inline]
+    pub(crate) fn set_line(&mut self, line: u32) {
+        self.line = line;
     }
 
-    /// Stamp an error with the line it happened on, once.
-    fn locate(&self, sig: Signal) -> Signal {
+    pub(crate) fn locate_at(&self, line: u32, e: Error) -> Signal {
+        self.locate_signal(line, Signal::Err(Box::new(e)))
+    }
+
+    pub(crate) fn locate_signal(&self, line: u32, sig: Signal) -> Signal {
         match sig {
             Signal::Err(e) if !e.located => Signal::Err(Box::new(Error {
                 message: e.message.clone(),
                 located: true,
-                line: self.line,
+                line,
                 where_: self
                     .frames
                     .last()
@@ -314,183 +325,28 @@ impl Vm {
         }
     }
 
-    /// A block in statement position: its tail value, if any, is discarded.
-    fn exec_block_unit(&mut self, block: &Block) -> Eval<()> {
-        let vals = self.exec_block(block)?;
-        self.recycle(vals);
-        Ok(())
-    }
-
-    fn slot(&mut self, b: Binding, v: Value) {
-        let i = self.base + b.slot as usize;
-        // a captured local gets a fresh cell every time it is declared, so a
-        // closure made in a loop captures that iteration's variable
-        self.stack[i] = if b.cell { Value::Cell(Rc::new(RefCell::new(v))) } else { v };
-    }
-
-    fn exec(&mut self, st: &Stat) -> Eval<()> {
-        match st {
-            Stat::Expr(e) => {
-                let vals = self.eval_multi(e)?;
-                self.recycle(vals);
+    /// A loop has gone round another batch of iterations. Returns whether the
+    /// JIT took it over and ran it to completion.
+    pub(crate) fn note_loop(&mut self, proto: &Rc<crate::bytecode::Proto>, id: u32) -> bool {
+        if !self.jit.enabled {
+            return false;
+        }
+        {
+            let entry = self.loops.entry(id).or_default();
+            entry.iterations = entry.iterations.saturating_add(LOOP_BATCH as u64);
+            if entry.blocked {
+                return false;
             }
-            Stat::LetSlots(bindings, exprs) => {
-                if bindings.len() == 1 && exprs.len() == 1 {
-                    let v = self.eval_expr(&exprs[0])?;
-                    self.slot(bindings[0], v);
-                } else {
-                    let vals = self.explist(exprs)?;
-                    for (i, b) in bindings.iter().enumerate() {
-                        let v = vals.get(i).cloned().unwrap_or(Value::Nil);
-                        self.slot(*b, v);
-                    }
-                    self.recycle(vals);
-                }
-            }
-            Stat::FnSlot(binding, f) => {
-                // bind first (with a cell when captured), then build the
-                // closure: that is what lets a function call itself
-                self.slot(*binding, Value::Nil);
-                let v = self.eval_expr(f)?;
-                let i = self.base + binding.slot as usize;
-                match &self.stack[i] {
-                    Value::Cell(c) => *c.borrow_mut() = v,
-                    _ => self.stack[i] = v,
-                }
-            }
-            Stat::Assign(targets, exprs) => {
-                if targets.len() == 1 && exprs.len() == 1 {
-                    let v = self.eval_expr(&exprs[0])?;
-                    self.assign_to(&targets[0], v)?;
-                } else {
-                    let vals = self.explist(exprs)?;
-                    for (i, t) in targets.iter().enumerate() {
-                        let v = vals.get(i).cloned().unwrap_or(Value::Nil);
-                        self.assign_to(t, v)?;
-                    }
-                    self.recycle(vals);
-                }
-            }
-            Stat::OpAssign(target, op, e) => {
-                let rhs = self.eval_expr(e)?;
-                // `i += 1` on a plain local: read, add and store in place
-                if let Expr::Local(b, _) = target {
-                    if !b.cell {
-                        let i = self.base + b.slot as usize;
-                        if let (Value::Num(x), Value::Num(y)) = (&self.stack[i], &rhs) {
-                            let (x, y) = (*x, *y);
-                            if let Some(v) = fast_num_op(*op, x, y) {
-                                self.stack[i] = Value::Num(v);
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
-                let old = self.eval_expr(target)?;
-                let v = arith(*op, old, rhs)?;
-                self.assign_to(target, v)?;
-            }
-            Stat::While(id, cond, body) => {
-                if self.run_compiled_loop(*id, st)? {
-                    return Ok(());
-                }
-                let mut spins = 0u32;
-                while self.eval_expr(cond)?.truthy() {
-                    match self.exec_block_unit(body) {
-                        Err(Signal::Break) => break,
-                        Err(Signal::Continue) | Ok(()) => {}
-                        Err(other) => return Err(other),
-                    }
-                    spins += 1;
-                    // hot enough to be worth compiling? hand the rest over
-                    if spins % LOOP_BATCH == 0 && self.consider_loop(*id, st)? {
-                        return Ok(());
-                    }
-                }
-            }
-            Stat::Loop(id, body) => {
-                if self.run_compiled_loop(*id, st)? {
-                    return Ok(());
-                }
-                let mut spins = 0u32;
-                loop {
-                    match self.exec_block_unit(body) {
-                        Err(Signal::Break) => break,
-                        Err(Signal::Continue) | Ok(()) => {}
-                        Err(other) => return Err(other),
-                    }
-                    spins += 1;
-                    if spins % LOOP_BATCH == 0 && self.consider_loop(*id, st)? {
-                        return Ok(());
-                    }
-                }
-            }
-            Stat::ForRange { id, binding, start, end, inclusive, body, .. } => {
-                let b = binding.expect("resolved");
-                let mut i = self.eval_expr(start)?.as_num()?;
-                let last = self.eval_expr(end)?.as_num()?;
-                // already compiled? start it where this loop would start
-                self.slot(b, Value::Num(i));
-                if self.run_compiled_loop(*id, st)? {
-                    return Ok(());
-                }
-                let mut spins = 0u32;
-                while if *inclusive { i <= last } else { i < last } {
-                    self.slot(b, Value::Num(i));
-                    match self.exec_block(body) {
-                        Err(Signal::Break) => break,
-                        Err(Signal::Continue) | Ok(_) => {}
-                        Err(other) => return Err(other),
-                    }
-                    i += 1.0;
-                    spins += 1;
-                    if spins % LOOP_BATCH == 0 {
-                        // the compiled form picks the counter up where it is
-                        self.slot(b, Value::Num(i));
-                        if self.consider_loop(*id, st)? {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Stat::ForIn { bindings, iter, body, .. } => {
-                let it = match self.eval_expr(iter)? {
-                    // a table iterates its values, as a Rust `for` over a Vec
-                    Value::Table(t) => crate::stdlib::value_iterator(t),
-                    other => other,
-                };
-                loop {
-                    let empty = self.take_vec(0);
-                    let vals = self.call_value(&it, empty)?;
-                    if matches!(vals.first(), None | Some(Value::Nil)) {
-                        self.recycle(vals);
-                        break;
-                    }
-                    for (i, b) in bindings.iter().enumerate() {
-                        let v = vals.get(i).cloned().unwrap_or(Value::Nil);
-                        self.slot(*b, v);
-                    }
-                    self.recycle(vals);
-                    match self.exec_block(body) {
-                        Err(Signal::Break) => break,
-                        Err(Signal::Continue) | Ok(_) => {}
-                        Err(other) => return Err(other),
-                    }
-                }
-            }
-            Stat::Return(exprs) => {
-                let vals = self.explist(exprs)?;
-                let old = std::mem::replace(&mut self.rets, vals);
-                self.recycle(old);
-                return Err(Signal::Return);
-            }
-            Stat::Break => return Err(Signal::Break),
-            Stat::Continue => return Err(Signal::Continue),
-            Stat::Let(..) | Stat::FnDecl(..) => {
-                return bad("internal: unresolved statement reached the interpreter")
+            if entry.code.is_none() && entry.iterations < LOOP_HOT {
+                return false;
             }
         }
-        Ok(())
+        // the JIT works from the syntax, so find the loop this hint came from
+        let Some(stat) = find_loop(&proto.def.body, id).cloned() else {
+            self.loops.entry(id).or_default().blocked = true;
+            return false;
+        };
+        self.consider_loop(id, &stat).unwrap_or(false)
     }
 
     /// Run a loop that is already compiled, if its locals are all numbers.
@@ -601,68 +457,164 @@ impl Vm {
         SelfRef { upval: None, global: None, compiled_globals, hooks: hooks() }
     }
 
-    fn assign_to(&mut self, target: &Expr, v: Value) -> Eval<()> {
-        match target {
-            Expr::Local(b, _) => {
-                let i = self.base + b.slot as usize;
-                if b.cell {
-                    match &self.stack[i] {
-                        Value::Cell(c) => *c.borrow_mut() = v,
-                        _ => self.stack[i] = Value::Cell(Rc::new(RefCell::new(v))),
-                    }
-                } else {
-                    self.stack[i] = v;
-                }
-                Ok(())
-            }
-            Expr::Upval(i, _) => {
-                *self.upvals[*i as usize].borrow_mut() = v;
-                Ok(())
-            }
-            Expr::Global(name, cache) => {
-                let i = match cache.get() {
-                    Some(i) => i,
-                    None => {
-                        let i = self.global_slot(name);
-                        cache.set(i);
-                        i
-                    }
-                };
-                self.write_global(i, v);
-                Ok(())
-            }
-            Expr::Index(obj, key) => {
-                let o = self.eval_expr(obj)?;
-                let k = Key::from_value(&self.eval_expr(key)?)?;
-                match o {
-                    Value::Table(t) => {
-                        t.borrow_mut().set(k, v);
-                        Ok(())
-                    }
-                    other => bad(format!("cannot index a {} value", other.type_name())),
-                }
-            }
-            _ => bad("cannot assign to this expression"),
+    /// Reserve a frame's registers. The stack only ever grows: frames clear
+    /// their own registers on the way out, so a new frame starts on nils
+    /// without paying to fill them again.
+    pub(crate) fn open_frame(&mut self, n_regs: usize) -> usize {
+        let base = self.top;
+        let need = base + n_regs;
+        if self.stack.len() < need {
+            self.stack.resize(need, Value::Nil);
         }
+        self.top = need;
+        base
     }
 
-    // ---- expressions --------------------------------------------------------
+    /// Give a frame's registers back, dropping whatever they held.
+    pub(crate) fn close_frame(&mut self, base: usize, n_regs: usize) {
+        for i in base..base + n_regs {
+            self.stack[i] = Value::Nil;
+        }
+        self.top = base;
+    }
+
+    /// Enter a call, refusing to go deeper than the stack allows.
+    pub(crate) fn enter_depth(&mut self) -> Eval<bool> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return bad("stack overflow");
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn leave_depth(&mut self) {
+        self.depth -= 1;
+    }
+
+    pub(crate) fn multi_first(&self) -> Value {
+        self.multi.first().cloned().unwrap_or(Value::Nil)
+    }
+
+    /// Run a function, using its compiled code when that applies.
+    pub(crate) fn call_compiled_or_run(
+        &mut self,
+        func: &Rc<Function>,
+        arg_start: usize,
+        nargs: u16,
+        ret_to: usize,
+        nres: u16,
+    ) -> Eval<()> {
+        let hits = func.hits.get().saturating_add(1);
+        func.hits.set(hits);
+        if func.jit_state.get() == JitState::Cold && hits >= self.jit.threshold {
+            self.try_compile(func);
+        }
+        if let Some(code) = func.jit.get() {
+            let kinds = func.param_kinds.borrow();
+            if kinds.len() == nargs as usize {
+                if let Some(rt_args) =
+                    compiled_args(&self.stack[arg_start..arg_start + nargs as usize], &kinds)
+                {
+                    let ctx = func.rt.borrow().as_ref().map(|c| c.as_ptr());
+                    drop(kinds);
+                    if let Some(ctx) = ctx {
+                        // SAFETY: this is the context built for this code.
+                        if let Some(n) = unsafe { code.call(&rt_args, ctx) } {
+                            // compiled code always produces exactly one number
+                            let v = Value::Num(n);
+                            match nres {
+                                0 => {}
+                                crate::bytecode::MULTI => {
+                                    self.stack[ret_to] = v.clone();
+                                    let mut vals = self.take_vec(1);
+                                    vals.push(v);
+                                    self.set_multi(vals);
+                                }
+                                want => {
+                                    self.stack[ret_to] = v;
+                                    for i in 1..want as usize {
+                                        self.stack[ret_to + i] = Value::Nil;
+                                    }
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        self.frames.push((func.proto.name.clone(), self.line));
+        let out = self.run_into(func, arg_start, nargs, ret_to, nres);
+        self.frames.pop();
+        out
+    }
 
     /// Hand a finished vector back for reuse.
-    fn recycle(&mut self, mut v: Vec<Value>) {
+    pub(crate) fn recycle_vec(&mut self, mut v: Vec<Value>) {
         if self.pool.len() < 32 {
             v.clear();
             self.pool.push(v);
         }
     }
 
-    /// Collect the values a `return` left behind.
-    fn take_rets(&mut self) -> Vec<Value> {
+    /// Take the values of the last multi-value call.
+    pub(crate) fn take_multi(&mut self) -> Vec<Value> {
         let empty = self.take_vec(0);
-        std::mem::replace(&mut self.rets, empty)
+        std::mem::replace(&mut self.multi, empty)
     }
 
-    fn take_vec(&mut self, cap: usize) -> Vec<Value> {
+    pub(crate) fn set_multi(&mut self, vals: Vec<Value>) {
+        let old = std::mem::replace(&mut self.multi, vals);
+        self.recycle_vec(old);
+    }
+
+    /// The global slot a chunk's reference points at, resolving it once.
+    pub(crate) fn global_ref(&mut self, proto: &crate::bytecode::Proto, g: u16) -> u32 {
+        let entry = &proto.globals[g as usize];
+        match entry.slot.get() {
+            u32::MAX => {
+                let slot = self.global_slot(&entry.name);
+                entry.slot.set(slot);
+                slot
+            }
+            slot => slot,
+        }
+    }
+
+    pub(crate) fn global_at(&self, slot: u32) -> Value {
+        self.gvals[slot as usize].clone()
+    }
+
+    pub(crate) fn store_global(&mut self, slot: u32, v: Value) {
+        self.write_global(slot, v);
+    }
+
+    /// Build a closure over the current frame: captured locals are shared
+    /// through their cells, and upvalues are passed straight down.
+    pub(crate) fn make_closure(&mut self, proto: Rc<crate::bytecode::Proto>) -> Value {
+        let mut cells = Vec::with_capacity(proto.def.upvals.len());
+        for src in &proto.def.upvals {
+            cells.push(match src {
+                UpvalSrc::ParentLocal(slot) => match &self.stack[self.base + *slot as usize] {
+                    Value::Cell(c) => c.clone(),
+                    other => Rc::new(RefCell::new(other.clone())),
+                },
+                UpvalSrc::ParentUpval(i) => self.upvals[*i as usize].clone(),
+            });
+        }
+        Value::Func(Rc::new(Function {
+            proto,
+            param_kinds: RefCell::new(Vec::new()),
+            rt: RefCell::new(None),
+            upvals: Rc::new(cells),
+            hits: std::cell::Cell::new(0),
+            jit: std::cell::Cell::new(None),
+            jit_state: std::cell::Cell::new(JitState::Cold),
+        }))
+    }
+
+    pub(crate) fn take_vec(&mut self, cap: usize) -> Vec<Value> {
         match self.pool.pop() {
             Some(mut v) => {
                 v.reserve(cap);
@@ -670,233 +622,6 @@ impl Vm {
             }
             None => Vec::with_capacity(cap),
         }
-    }
-
-    /// Evaluates a list, expanding the final call so `let (a, b) = f()` works.
-    fn explist(&mut self, exprs: &[Expr]) -> Eval<Vec<Value>> {
-        let mut out = self.take_vec(exprs.len());
-        for (i, e) in exprs.iter().enumerate() {
-            if i + 1 == exprs.len() {
-                out.extend(self.eval_multi(e)?);
-            } else {
-                out.push(self.eval_expr(e)?);
-            }
-        }
-        Ok(out)
-    }
-
-    fn eval_multi(&mut self, e: &Expr) -> Eval<Vec<Value>> {
-        match e {
-            Expr::Call(f, args) => {
-                let fv = self.eval_expr(f)?;
-                let argv = self.explist(args)?;
-                self.call_value(&fv, argv)
-            }
-            Expr::Method(obj, name, args) => {
-                let o = self.eval_expr(obj)?;
-                let m = self.method(&o, name)?;
-                let mut argv = self.take_vec(args.len() + 1);
-                argv.push(o);
-                argv.extend(self.explist(args)?);
-                self.call_value(&m, argv)
-            }
-            Expr::Do(b) => self.exec_block(b),
-            Expr::Match(subject, arms) => {
-                let subject = self.eval_expr(subject)?;
-                for arm in arms {
-                    if !self.arm_matches(arm, &subject)? {
-                        continue;
-                    }
-                    return self.exec_block(&arm.body);
-                }
-                Ok(Vec::new())
-            }
-            Expr::If(arms, els) => {
-                for (cond, body) in arms {
-                    if self.eval_expr(cond)?.truthy() {
-                        return self.exec_block(body);
-                    }
-                }
-                match els {
-                    Some(b) => self.exec_block(b),
-                    None => Ok(Vec::new()),
-                }
-            }
-            other => Ok(vec![self.eval_expr(other)?]),
-        }
-    }
-
-    /// Does this arm accept the subject? Binding patterns bind on the way.
-    fn arm_matches(&mut self, arm: &Arm, subject: &Value) -> Eval<bool> {
-        let mut hit = false;
-        for p in &arm.patterns {
-            match p {
-                Pattern::Wild => hit = true,
-                Pattern::Bind(_, Some(b)) => {
-                    self.slot(*b, subject.clone());
-                    hit = true;
-                }
-                Pattern::Bind(name, None) => {
-                    return bad(format!("internal: unresolved pattern `{name}`"))
-                }
-                Pattern::Lit(e) => {
-                    if self.eval_expr(e)? == *subject {
-                        hit = true;
-                    }
-                }
-            }
-            if hit {
-                break;
-            }
-        }
-        if !hit {
-            return Ok(false);
-        }
-        match &arm.guard {
-            Some(g) => Ok(self.eval_expr(g)?.truthy()),
-            None => Ok(true),
-        }
-    }
-
-    fn eval_expr(&mut self, e: &Expr) -> Eval<Value> {
-        Ok(match e {
-            Expr::Num(n) => Value::Num(*n),
-            Expr::Local(b, _) => {
-                let v = &self.stack[self.base + b.slot as usize];
-                if b.cell {
-                    match v {
-                        Value::Cell(c) => c.borrow().clone(),
-                        other => other.clone(),
-                    }
-                } else {
-                    v.clone()
-                }
-            }
-            Expr::Upval(i, _) => self.upvals[*i as usize].borrow().clone(),
-            Expr::Global(name, cache) => {
-                let i = match cache.get() {
-                    Some(i) => i,
-                    None => {
-                        let i = self.global_slot(name);
-                        cache.set(i);
-                        i
-                    }
-                };
-                self.gvals[i as usize].clone()
-            }
-            Expr::Str(s) => Value::Str(s.clone()),
-            Expr::Nil => Value::Nil,
-            Expr::Bool(b) => Value::Bool(*b),
-            Expr::Call(..) | Expr::Method(..) | Expr::Do(_) | Expr::If(..) | Expr::Match(..) => {
-                // one value wanted: take it and hand the vector back
-                let mut vals = self.eval_multi(e)?;
-                let out = if vals.is_empty() { Value::Nil } else { vals.swap_remove(0) };
-                self.recycle(vals);
-                out
-            }
-            Expr::Index(obj, key) => {
-                let o = self.eval_expr(obj)?;
-                let k = self.eval_expr(key)?;
-                self.index(&o, &k)?
-            }
-            Expr::Func(def) => {
-                // capture now: a closure owns its upvalue cells
-                let mut cells = Vec::with_capacity(def.upvals.len());
-                for src in &def.upvals {
-                    cells.push(match src {
-                        UpvalSrc::ParentLocal(slot) => {
-                            match &self.stack[self.base + *slot as usize] {
-                                Value::Cell(c) => c.clone(),
-                                other => Rc::new(RefCell::new(other.clone())),
-                            }
-                        }
-                        UpvalSrc::ParentUpval(i) => self.upvals[*i as usize].clone(),
-                    });
-                }
-                Value::Func(Rc::new(Function {
-                    def: def.clone(),
-                    param_kinds: RefCell::new(Vec::new()),
-                    rt: RefCell::new(None),
-                    upvals: Rc::new(cells),
-                    hits: std::cell::Cell::new(0),
-                    jit: std::cell::Cell::new(None),
-                    jit_state: std::cell::Cell::new(JitState::Cold),
-                }))
-            }
-            Expr::Array(items) => {
-                let mut t = Table::new();
-                let n = items.len();
-                for (i, item) in items.iter().enumerate() {
-                    if i + 1 == n {
-                        for v in self.eval_multi(item)? {
-                            t.push(v);
-                        }
-                    } else {
-                        let v = self.eval_expr(item)?;
-                        t.push(v);
-                    }
-                }
-                Value::table(t)
-            }
-            Expr::Map(items) => {
-                let mut t = Table::new();
-                for (k, v) in items {
-                    let kk = Key::from_value(&self.eval_expr(k)?)?;
-                    let vv = self.eval_expr(v)?;
-                    t.set(kk, vv);
-                }
-                Value::table(t)
-            }
-            Expr::Range(a, b, inclusive) => {
-                let start = self.eval_expr(a)?.as_num()?;
-                let end = self.eval_expr(b)?.as_num()?;
-                crate::stdlib::range_iterator(start, end, *inclusive)
-            }
-            Expr::Un(op, a) => {
-                let v = self.eval_expr(a)?;
-                match op {
-                    UnOp::Neg => Value::Num(-v.as_num()?),
-                    UnOp::Not => Value::Bool(!v.truthy()),
-                }
-            }
-            Expr::Bin(op, a, b) => {
-                match op {
-                    BinOp::And => {
-                        let l = self.eval_expr(a)?;
-                        return Ok(if l.truthy() { self.eval_expr(b)? } else { l });
-                    }
-                    BinOp::Or => {
-                        let l = self.eval_expr(a)?;
-                        return Ok(if l.truthy() { l } else { self.eval_expr(b)? });
-                    }
-                    _ => {}
-                }
-                let l = self.eval_expr(a)?;
-                let r = self.eval_expr(b)?;
-                // the overwhelmingly common case, kept off the generic path
-                if let (Value::Num(x), Value::Num(y)) = (&l, &r) {
-                    let (x, y) = (*x, *y);
-                    return Ok(match op {
-                        BinOp::Add => Value::Num(x + y),
-                        BinOp::Sub => Value::Num(x - y),
-                        BinOp::Mul => Value::Num(x * y),
-                        BinOp::Div => Value::Num(x / y),
-                        BinOp::Rem => Value::Num(x - (x / y).floor() * y),
-                        BinOp::Lt => Value::Bool(x < y),
-                        BinOp::Le => Value::Bool(x <= y),
-                        BinOp::Gt => Value::Bool(x > y),
-                        BinOp::Ge => Value::Bool(x >= y),
-                        BinOp::Eq => Value::Bool(x == y),
-                        BinOp::Ne => Value::Bool(x != y),
-                        BinOp::And | BinOp::Or => unreachable!("short circuited above"),
-                    });
-                }
-                arith(*op, l, r)?
-            }
-            Expr::Var(name) => {
-                return bad(format!("internal: unresolved name `{name}`"));
-            }
-        })
     }
 
     /// `a[k]` and `a::k`: a plain lookup, no method fallback.
@@ -922,7 +647,7 @@ impl Vm {
 
     /// `a.m(..)`: the receiver's own field first, then its type's library —
     /// this is what makes `[3,1,2].sort()` and `"ab".upper()` work.
-    fn method(&mut self, o: &Value, name: &Rc<str>) -> Res<Value> {
+    pub(crate) fn method(&mut self, o: &Value, name: &Rc<str>) -> Res<Value> {
         let key = Key::Str(name.clone());
         let kind = match o {
             Value::Table(t) => {
@@ -944,7 +669,7 @@ impl Vm {
         }
     }
 
-    fn call_value(&mut self, f: &Value, args: Vec<Value>) -> Eval<Vec<Value>> {
+    pub(crate) fn call_value(&mut self, f: &Value, args: Vec<Value>) -> Eval<Vec<Value>> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
             self.depth -= 1;
@@ -964,17 +689,17 @@ impl Vm {
         // Compile the helpers this function calls first: a direct call can only
         // be generated to machine code that already exists. The guard set stops
         // mutual recursion from looping here.
-        if self.compiling.insert(func.def.id) {
-            for name in rua_jit::called_globals(&func.def) {
+        if self.compiling.insert(func.def().id) {
+            for name in rua_jit::called_globals(func.def()) {
                 let callee = self.get_global(&name);
                 if let Value::Func(g) = callee {
-                    if g.jit_state.get() == JitState::Cold && !self.compiling.contains(&g.def.id) {
+                    if g.jit_state.get() == JitState::Cold && !self.compiling.contains(&g.def().id) {
                         self.try_compile(&g);
                     }
                 }
             }
         }
-        self.compiling.remove(&func.def.id);
+        self.compiling.remove(&func.def().id);
         // Which upvalue, if any, currently holds this very function? That is
         // what `fn fib(n) { .. fib(n - 1) .. }` looks like after resolution,
         // and it is the only call the JIT is willing to compile.
@@ -984,8 +709,8 @@ impl Vm {
             .position(|c| matches!(&*c.borrow(), Value::Func(g) if Rc::ptr_eq(g, func)))
             .map(|i| i as u16);
         // a top level `fn` is a global, and recursion goes through that name
-        let global = match self.get_global(&func.def.name) {
-            Value::Func(g) if Rc::ptr_eq(&g, func) => Some(func.def.name.clone()),
+        let global = match self.get_global(&func.def().name) {
+            Value::Func(g) if Rc::ptr_eq(&g, func) => Some(func.def().name.clone()),
             _ => None,
         };
         // globals that already hold compiled functions can be called directly
@@ -998,7 +723,7 @@ impl Vm {
             }
         }
         let req = SelfRef { upval, global, compiled_globals, hooks: hooks() };
-        match self.jit.compile(&func.def, req) {
+        match self.jit.compile(func.def(), req) {
             Ok(out) => {
                 let ctx = self.build_ctx(&out.inlined);
                 func.jit.set(Some(out.code));
@@ -1037,38 +762,16 @@ impl Vm {
                             // interpreter can simply run the call instead
                             // SAFETY: this is the context built for this code.
                             if let Some(n) = unsafe { code.call(&rt_args, ctx) } {
+                                self.recycle_vec(args);
                                 return Ok(vec![Value::Num(n)]);
                             }
                         }
                     }
                 }
-                let def = &func.def;
-                self.frames.push((Rc::from(def.name.as_str()), self.line));
-                let saved_line = self.line;
-                let saved_base = self.base;
-                let saved_upvals = std::mem::replace(&mut self.upvals, func.upvals.clone());
-                self.base = self.stack.len();
-                self.stack.resize(self.base + def.n_slots, Value::Nil);
-                let mut args = args;
-                for (i, b) in def.param_bindings.iter().enumerate() {
-                    let v = args.get_mut(i).map(std::mem::take).unwrap_or(Value::Nil);
-                    self.slot(*b, v);
-                }
-                args.clear();
-                if self.pool.len() < 32 {
-                    self.pool.push(args);
-                }
-                let out = self.exec_block(&def.body);
-                self.stack.truncate(self.base);
-                self.base = saved_base;
-                self.upvals = saved_upvals;
+                self.frames.push((func.proto.name.clone(), self.line));
+                let out = self.run(func, args);
                 self.frames.pop();
-                self.line = saved_line;
-                match out {
-                    Ok(vals) => Ok(vals),
-                    Err(Signal::Return) => Ok(self.take_rets()),
-                    Err(other) => Err(other),
-                }
+                out
             }
             Value::Cell(c) => {
                 let inner = c.borrow().clone();
@@ -1077,41 +780,11 @@ impl Vm {
             other => bad(format!("cannot call a {} value", other.type_name())),
         }
     }
+
 }
 
-/// The numeric part of `arith`, without the `Value` wrapping.
-/// Turn call arguments into the shape compiled code expects, or `None` when
-/// they do not match what it was compiled for.
-fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
-    if args.len() != kinds.len() {
-        return None;
-    }
-    let mut out = Vec::with_capacity(args.len());
-    for (v, kind) in args.iter().zip(kinds) {
-        out.push(match (v, kind) {
-            (Value::Num(n), Kind::Num) => RtArg::num(*n),
-            (Value::Table(t), Kind::Table) => {
-                RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
-            }
-            _ => return None,
-        });
-    }
-    Some(out)
-}
-
-fn fast_num_op(op: BinOp, x: f64, y: f64) -> Option<f64> {
-    Some(match op {
-        BinOp::Add => x + y,
-        BinOp::Sub => x - y,
-        BinOp::Mul => x * y,
-        BinOp::Div => x / y,
-        BinOp::Rem => x - (x / y).floor() * y,
-        _ => return None,
-    })
-}
-
-pub fn arith(op: BinOp, l: Value, r: Value) -> Res<Value> {
-    use BinOp::*;
+pub fn arith(op: crate::bytecode::BinKind, l: Value, r: Value) -> Res<Value> {
+    use crate::bytecode::BinKind::*;
     Ok(match op {
         // `+` concatenates when either side is a string, as in Rust's String + &str
         Add => match (&l, &r) {
@@ -1144,7 +817,6 @@ pub fn arith(op: BinOp, l: Value, r: Value) -> Res<Value> {
                 _ => ord != Less,
             })
         }
-        And | Or => unreachable!("handled by short circuit"),
     })
 }
 
@@ -1226,5 +898,95 @@ fn hooks() -> RtHooks {
         len: rua_rt_len as *const () as usize,
         get: rua_rt_get as *const () as usize,
         span: rua_rt_span as *const () as usize,
+    }
+}
+
+/// Turn call arguments into the shape compiled code expects, or `None` when
+/// they do not match what it was compiled for.
+fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
+    if args.len() != kinds.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(args.len());
+    for (v, kind) in args.iter().zip(kinds) {
+        out.push(match (v, kind) {
+            (Value::Num(n), Kind::Num) => RtArg::num(*n),
+            (Value::Table(t), Kind::Table) => RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void),
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+/// Find a loop statement by the id the compiler stamped on its back edge.
+fn find_loop(block: &Block, id: u32) -> Option<&Stat> {
+    for st in &block.stats {
+        if let Some(found) = find_loop_stat(st, id) {
+            return Some(found);
+        }
+    }
+    match &block.tail {
+        Some(e) => find_loop_expr(e, id),
+        None => None,
+    }
+}
+
+fn find_loop_stat(st: &Stat, id: u32) -> Option<&Stat> {
+    let (this, body, extra) = match st {
+        Stat::While(i, c, b) => (Some(*i), Some(b), Some(c)),
+        Stat::Loop(i, b) => (Some(*i), Some(b), None),
+        Stat::ForRange { id: i, body, end, .. } => (Some(*i), Some(body), Some(end)),
+        Stat::ForIn { id: i, body, iter, .. } => (Some(*i), Some(body), Some(iter)),
+        Stat::Expr(e) | Stat::FnSlot(_, e) => (None, None, Some(e)),
+        Stat::LetSlots(_, es) | Stat::Return(es) => {
+            return es.iter().find_map(|e| find_loop_expr(e, id))
+        }
+        Stat::Assign(ts, es) => return ts.iter().chain(es).find_map(|e| find_loop_expr(e, id)),
+        Stat::OpAssign(t, _, e) => {
+            return find_loop_expr(t, id).or_else(|| find_loop_expr(e, id))
+        }
+        _ => (None, None, None),
+    };
+    if this == Some(id) {
+        return Some(st);
+    }
+    if let Some(b) = body {
+        if let Some(found) = find_loop(b, id) {
+            return Some(found);
+        }
+    }
+    extra.and_then(|e| find_loop_expr(e, id))
+}
+
+fn find_loop_expr(e: &Expr, id: u32) -> Option<&Stat> {
+    match e {
+        Expr::Do(b) => find_loop(b, id),
+        Expr::If(arms, els) => arms
+            .iter()
+            .find_map(|(c, b)| find_loop_expr(c, id).or_else(|| find_loop(b, id)))
+            .or_else(|| els.as_ref().and_then(|b| find_loop(b, id))),
+        Expr::Match(subject, arms) => find_loop_expr(subject, id).or_else(|| {
+            arms.iter().find_map(|a| {
+                a.guard
+                    .as_ref()
+                    .and_then(|g| find_loop_expr(g, id))
+                    .or_else(|| find_loop(&a.body, id))
+            })
+        }),
+        Expr::Bin(_, a, b) | Expr::Index(a, b) | Expr::Range(a, b, _) => {
+            find_loop_expr(a, id).or_else(|| find_loop_expr(b, id))
+        }
+        Expr::Un(_, a) => find_loop_expr(a, id),
+        Expr::Call(f, args) => {
+            find_loop_expr(f, id).or_else(|| args.iter().find_map(|a| find_loop_expr(a, id)))
+        }
+        Expr::Method(o, _, args) => {
+            find_loop_expr(o, id).or_else(|| args.iter().find_map(|a| find_loop_expr(a, id)))
+        }
+        Expr::Array(items) => items.iter().find_map(|i| find_loop_expr(i, id)),
+        Expr::Map(items) => items
+            .iter()
+            .find_map(|(k, v)| find_loop_expr(k, id).or_else(|| find_loop_expr(v, id))),
+        _ => None,
     }
 }

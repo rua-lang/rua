@@ -116,7 +116,8 @@ pub enum JitState {
 pub type CellRef = Rc<RefCell<Value>>;
 
 pub struct Function {
-    pub def: Rc<FuncDef>,
+    /// The compiled body, which also carries the AST the JIT reads.
+    pub proto: Rc<crate::bytecode::Proto>,
     /// What the compiled entry point expects of each argument, when there is
     /// one. Empty until the JIT has had a look.
     pub param_kinds: RefCell<Vec<rua_jit::Kind>>,
@@ -129,9 +130,16 @@ pub struct Function {
     pub jit_state: Cell<JitState>,
 }
 
+impl Function {
+    /// The syntax this function was compiled from, for the JIT.
+    pub fn def(&self) -> &Rc<FuncDef> {
+        &self.proto.def
+    }
+}
+
 impl fmt::Debug for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "function {}", self.def.name)
+        write!(f, "function {}", self.proto.def.name)
     }
 }
 
@@ -230,7 +238,7 @@ impl fmt::Display for Value {
             }
             Value::Str(s) => write!(f, "{s}"),
             Value::Table(t) => write!(f, "table: {:p}", Rc::as_ptr(t)),
-            Value::Func(x) => write!(f, "function: {}", x.def.name),
+            Value::Func(x) => write!(f, "function: {}", x.proto.def.name),
             Value::Native(x) => write!(f, "function: builtin {}", x.name),
             Value::Ptr(p) => write!(f, "cdata: {p:p}"),
             Value::Cell(c) => write!(f, "{}", c.borrow()),
