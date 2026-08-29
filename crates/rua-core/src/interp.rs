@@ -83,6 +83,7 @@ impl RtCtxHolder {
             len: hooks.len,
             get: hooks.get,
             span: hooks.span,
+            push: hooks.push,
             callees: callees.as_ptr(),
         });
         RtCtxHolder { ctx, callees }
@@ -242,7 +243,7 @@ impl Vm {
     /// Register a Rust function as a rua global.
     pub fn register<F>(&mut self, name: &str, f: F)
     where
-        F: Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static,
+        F: Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
     {
         let v = Value::Native(Rc::new(Native { name: name.to_string(), f: Box::new(f) }));
         self.set_global(name, v);
@@ -400,12 +401,23 @@ impl Vm {
         for (slot, kind) in compiled.slots.iter().zip(&compiled.kinds) {
             match (&self.stack[self.base + *slot as usize], kind) {
                 (Value::Num(n), Kind::Num) => regs.push(RtArg::num(*n)),
-                (Value::Table(t), Kind::Table) => {
+                (Value::Table(t), Kind::Table | Kind::TableOut) => {
                     regs.push(RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void))
                 }
                 // a local does not hold what the compiled code expects: stay
                 // interpreted this time round
                 _ => return false,
+            }
+        }
+        // as in `compiled_args`: never read a view of a table this code writes
+        for (i, ki) in compiled.kinds.iter().enumerate() {
+            if *ki != Kind::TableOut {
+                continue;
+            }
+            for (j, kj) in compiled.kinds.iter().enumerate() {
+                if *kj == Kind::Table && regs[i].table == regs[j].table {
+                    return false;
+                }
             }
         }
         let Some(ctx) = entry.ctx.as_ref().map(|c| c.as_ptr()) else { return false };
@@ -744,7 +756,9 @@ impl Vm {
         match f {
             Value::Native(n) => {
                 let n = n.clone();
-                Ok((n.f)(self, args)?)
+                let out = (n.f)(self, &args)?;
+                self.recycle_vec(args);
+                Ok(out)
             }
             Value::Func(func) => {
                 // profile, then let the JIT have a look
@@ -893,11 +907,25 @@ pub unsafe extern "C" fn rua_rt_span(
     }
 }
 
+/// Append a number to a table, for compiled code.
+///
+/// # Safety
+/// As [`rua_rt_len`].
+#[no_mangle]
+pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64) {
+    if t.is_null() {
+        return;
+    }
+    let table = &*(t as *const RefCell<Table>);
+    (*table.as_ptr()).push(Value::Num(v));
+}
+
 fn hooks() -> RtHooks {
     RtHooks {
         len: rua_rt_len as *const () as usize,
         get: rua_rt_get as *const () as usize,
         span: rua_rt_span as *const () as usize,
+        push: rua_rt_push as *const () as usize,
     }
 }
 
@@ -911,9 +939,26 @@ fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
     for (v, kind) in args.iter().zip(kinds) {
         out.push(match (v, kind) {
             (Value::Num(n), Kind::Num) => RtArg::num(*n),
-            (Value::Table(t), Kind::Table) => RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void),
+            (Value::Table(t), Kind::Table | Kind::TableOut) => {
+                RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
+            }
             _ => return None,
         });
+    }
+    // Compiled code reads one table through a view of its array part and
+    // appends to another. If those are the same table, the view would go
+    // stale as it is written, so this call stays with the interpreter.
+    if kinds.contains(&Kind::TableOut) {
+        for (i, ki) in kinds.iter().enumerate() {
+            if *ki != Kind::TableOut {
+                continue;
+            }
+            for (j, kj) in kinds.iter().enumerate() {
+                if *kj == Kind::Table && out[i].table == out[j].table {
+                    return None;
+                }
+            }
+        }
     }
     Some(out)
 }

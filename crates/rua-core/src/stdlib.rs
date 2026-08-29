@@ -20,7 +20,7 @@ thread_local! {
 
 fn native<F>(name: &str, f: F) -> Value
 where
-    F: Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>> + 'static,
+    F: Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
 {
     Value::Native(Rc::new(Native { name: name.to_string(), f: Box::new(f) }))
 }
@@ -79,20 +79,20 @@ fn base(vm: &mut Vm) {
         Ok(Vec::new())
     });
     vm.register("format", |_vm, args| {
-        one(Value::str(format_impl(&str_arg(&args, 0)?, &args[1..])?))
+        one(Value::str(format_impl(&str_arg(args, 0)?, &args[1..])?))
     });
-    vm.register("type", |_vm, args| one(Value::str(arg(&args, 0).type_name())));
-    vm.register("str", |_vm, args| one(Value::str(arg(&args, 0).to_string())));
+    vm.register("type", |_vm, args| one(Value::str(arg(args, 0).type_name())));
+    vm.register("str", |_vm, args| one(Value::str(arg(args, 0).to_string())));
     vm.register("num", |_vm, args| {
-        one(match arg(&args, 0).as_num() {
+        one(match arg(args, 0).as_num() {
             Ok(n) => Value::Num(n),
             Err(_) => Value::Nil,
         })
     });
-    vm.register("error", |_vm, args| Err(Error(arg(&args, 0).to_string())));
+    vm.register("error", |_vm, args| Err(Error(arg(args, 0).to_string())));
     vm.register("assert", |_vm, args| {
-        if arg(&args, 0).truthy() {
-            Ok(args)
+        if arg(args, 0).truthy() {
+            Ok(args.to_vec())
         } else {
             Err(Error(match args.get(1) {
                 Some(m) => m.to_string(),
@@ -101,12 +101,11 @@ fn base(vm: &mut Vm) {
         }
     });
     // `try(f, args...)` -> (ok, value_or_message)
-    vm.register("try", |vm, mut args| {
-        if args.is_empty() {
+    vm.register("try", |vm, args| {
+        let Some(f) = args.first().cloned() else {
             return err("try needs a function");
-        }
-        let f = args.remove(0);
-        match vm.call(&f, args) {
+        };
+        match vm.call(&f, args[1..].to_vec()) {
             Ok(mut vals) => {
                 let mut out = vec![Value::Bool(true)];
                 out.append(&mut vals);
@@ -115,18 +114,18 @@ fn base(vm: &mut Vm) {
             Err(e) => Ok(vec![Value::Bool(false), Value::str(e.to_string())]),
         }
     });
-    vm.register("len", |_vm, args| match arg(&args, 0) {
+    vm.register("len", |_vm, args| match arg(args, 0) {
         Value::Table(t) => one(Value::Num(t.borrow().len() as f64)),
         Value::Str(s) => one(Value::Num(s.len() as f64)),
         other => err(format!("len: unexpected {}", other.type_name())),
     });
     // dynamic access to the global namespace, since it is not a table
     vm.register("global", |vm, args| {
-        let name = str_arg(&args, 0)?;
+        let name = str_arg(args, 0)?;
         match args.len() {
             0 | 1 => one(vm.get_global(&name)),
             _ => {
-                vm.set_global(&name, arg(&args, 1));
+                vm.set_global(&name, arg(args, 1));
                 Ok(Vec::new())
             }
         }
@@ -139,13 +138,13 @@ fn base(vm: &mut Vm) {
         one(Value::table(t))
     });
     vm.register("dofile", |vm, args| {
-        let path = str_arg(&args, 0)?;
+        let path = str_arg(args, 0)?;
         vm.eval_file(&path)
     });
     // `let m = require("lib.rua")` — runs the file once and returns its value,
     // which is whatever expression the file ends with
     vm.register("require", |vm, args| {
-        let path = str_arg(&args, 0)?;
+        let path = str_arg(args, 0)?;
         let key = std::fs::canonicalize(&*path)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string());
@@ -197,7 +196,7 @@ pub fn range_iterator(start: f64, end: f64, inclusive: bool) -> Value {
 
 fn math(vm: &mut Vm) -> Rc<RefCell<Table>> {
     let f1 = |name: &'static str, f: fn(f64) -> f64| {
-        native(name, move |_vm, args| one(Value::Num(f(num_arg(&args, 0)?))))
+        native(name, move |_vm, args| one(Value::Num(f(num_arg(args, 0)?))))
     };
     module(
         vm,
@@ -218,17 +217,17 @@ fn math(vm: &mut Vm) -> Rc<RefCell<Table>> {
             ("ln", f1("ln", f64::ln)),
             ("log", f1("log", f64::ln)),
             ("pow", native("pow", |_vm, args| {
-                one(Value::Num(num_arg(&args, 0)?.powf(num_arg(&args, 1)?)))
+                one(Value::Num(num_arg(args, 0)?.powf(num_arg(args, 1)?)))
             })),
             ("max", native("max", |_vm, args| {
-                let mut m = num_arg(&args, 0)?;
+                let mut m = num_arg(args, 0)?;
                 for a in &args[1..] {
                     m = m.max(a.as_num()?);
                 }
                 one(Value::Num(m))
             })),
             ("min", native("min", |_vm, args| {
-                let mut m = num_arg(&args, 0)?;
+                let mut m = num_arg(args, 0)?;
                 for a in &args[1..] {
                     m = m.min(a.as_num()?);
                 }
@@ -238,15 +237,15 @@ fn math(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 let r = next_random();
                 one(Value::Num(match args.len() {
                     0 => r,
-                    1 => (r * num_arg(&args, 0)?).floor(),
+                    1 => (r * num_arg(args, 0)?).floor(),
                     _ => {
-                        let (lo, hi) = (num_arg(&args, 0)?, num_arg(&args, 1)?);
+                        let (lo, hi) = (num_arg(args, 0)?, num_arg(args, 1)?);
                         (r * (hi - lo)).floor() + lo
                     }
                 }))
             })),
             ("seed", native("seed", |_vm, args| {
-                let seed = num_arg(&args, 0)? as u64 | 1;
+                let seed = num_arg(args, 0)? as u64 | 1;
                 SEED.with(|c| c.set(seed));
                 Ok(Vec::new())
             })),
@@ -271,11 +270,11 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
         "string",
         vec![
             ("len", native("len", |_vm, args| {
-                one(Value::Num(str_arg(&args, 0)?.len() as f64))
+                one(Value::Num(str_arg(args, 0)?.len() as f64))
             })),
             // zero based, end exclusive: "hello".slice(1, 3) == "el"
             ("slice", native("slice", |_vm, args| {
-                let s = str_arg(&args, 0)?;
+                let s = str_arg(args, 0)?;
                 let b = s.as_bytes();
                 let start = clamp_index(args.get(1), 0.0, b.len());
                 let end = clamp_index(args.get(2), b.len() as f64, b.len());
@@ -285,46 +284,46 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(Value::str(String::from_utf8_lossy(&b[start..end])))
             })),
             ("upper", native("upper", |_vm, args| {
-                one(Value::str(str_arg(&args, 0)?.to_uppercase()))
+                one(Value::str(str_arg(args, 0)?.to_uppercase()))
             })),
             ("lower", native("lower", |_vm, args| {
-                one(Value::str(str_arg(&args, 0)?.to_lowercase()))
+                one(Value::str(str_arg(args, 0)?.to_lowercase()))
             })),
             ("trim", native("trim", |_vm, args| {
-                one(Value::str(str_arg(&args, 0)?.trim()))
+                one(Value::str(str_arg(args, 0)?.trim()))
             })),
             ("repeat", native("repeat", |_vm, args| {
-                let n = num_arg(&args, 1)?.max(0.0) as usize;
-                one(Value::str(str_arg(&args, 0)?.repeat(n)))
+                let n = num_arg(args, 1)?.max(0.0) as usize;
+                one(Value::str(str_arg(args, 0)?.repeat(n)))
             })),
             ("reverse", native("reverse", |_vm, args| {
-                one(Value::str(str_arg(&args, 0)?.chars().rev().collect::<String>()))
+                one(Value::str(str_arg(args, 0)?.chars().rev().collect::<String>()))
             })),
             ("find", native("find", |_vm, args| {
-                let (s, pat) = (str_arg(&args, 0)?, str_arg(&args, 1)?);
+                let (s, pat) = (str_arg(args, 0)?, str_arg(args, 1)?);
                 one(match s.find(&*pat) {
                     Some(i) => Value::Num(i as f64),
                     None => Value::Nil,
                 })
             })),
             ("contains", native("contains", |_vm, args| {
-                let (s, pat) = (str_arg(&args, 0)?, str_arg(&args, 1)?);
+                let (s, pat) = (str_arg(args, 0)?, str_arg(args, 1)?);
                 one(Value::Bool(s.contains(&*pat)))
             })),
             ("starts_with", native("starts_with", |_vm, args| {
-                let (s, pat) = (str_arg(&args, 0)?, str_arg(&args, 1)?);
+                let (s, pat) = (str_arg(args, 0)?, str_arg(args, 1)?);
                 one(Value::Bool(s.starts_with(&*pat)))
             })),
             ("ends_with", native("ends_with", |_vm, args| {
-                let (s, pat) = (str_arg(&args, 0)?, str_arg(&args, 1)?);
+                let (s, pat) = (str_arg(args, 0)?, str_arg(args, 1)?);
                 one(Value::Bool(s.ends_with(&*pat)))
             })),
             ("replace", native("replace", |_vm, args| {
-                let (s, from, to) = (str_arg(&args, 0)?, str_arg(&args, 1)?, str_arg(&args, 2)?);
+                let (s, from, to) = (str_arg(args, 0)?, str_arg(args, 1)?, str_arg(args, 2)?);
                 one(Value::str(s.replace(&*from, &to)))
             })),
             ("split", native("split", |_vm, args| {
-                let (s, sep) = (str_arg(&args, 0)?, str_arg(&args, 1)?);
+                let (s, sep) = (str_arg(args, 0)?, str_arg(args, 1)?);
                 let mut t = Table::new();
                 for part in s.split(&*sep) {
                     t.push(Value::str(part));
@@ -332,7 +331,7 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(Value::table(t))
             })),
             ("chars", native("chars", |_vm, args| {
-                let s = str_arg(&args, 0)?;
+                let s = str_arg(args, 0)?;
                 let mut t = Table::new();
                 for c in s.chars() {
                     t.push(Value::str(c.to_string()));
@@ -340,15 +339,15 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(Value::table(t))
             })),
             ("byte", native("byte", |_vm, args| {
-                let s = str_arg(&args, 0)?;
-                let i = num_arg(&args, 1).unwrap_or(0.0).max(0.0) as usize;
+                let s = str_arg(args, 0)?;
+                let i = num_arg(args, 1).unwrap_or(0.0).max(0.0) as usize;
                 one(match s.as_bytes().get(i) {
                     Some(b) => Value::Num(*b as f64),
                     None => Value::Nil,
                 })
             })),
             ("format", native("format", |_vm, args| {
-                one(Value::str(format_impl(&str_arg(&args, 0)?, &args[1..])?))
+                one(Value::str(format_impl(&str_arg(args, 0)?, &args[1..])?))
             })),
         ],
     )
@@ -431,17 +430,17 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
         "table",
         vec![
             ("len", native("len", |_vm, args| {
-                one(Value::Num(table_arg(&args, 0)?.borrow().len() as f64))
+                one(Value::Num(table_arg(args, 0)?.borrow().len() as f64))
             })),
             ("push", native("push", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 for v in &args[1..] {
                     t.borrow_mut().push(v.clone());
                 }
                 Ok(Vec::new())
             })),
             ("pop", native("pop", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let n = t.borrow().len();
                 if n == 0 {
                     return one(Value::Nil);
@@ -452,9 +451,9 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(v)
             })),
             ("insert", native("insert", |_vm, args| {
-                let t = table_arg(&args, 0)?;
-                let pos = num_arg(&args, 1)?.max(0.0) as usize;
-                let v = arg(&args, 2);
+                let t = table_arg(args, 0)?;
+                let pos = num_arg(args, 1)?.max(0.0) as usize;
+                let v = arg(args, 2);
                 let mut b = t.borrow_mut();
                 let n = b.len();
                 let mut i = n;
@@ -467,13 +466,13 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 Ok(Vec::new())
             })),
             ("remove", native("remove", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let mut b = t.borrow_mut();
                 let n = b.len();
                 if n == 0 {
                     return one(Value::Nil);
                 }
-                let pos = num_arg(&args, 1).unwrap_or((n - 1) as f64).max(0.0) as usize;
+                let pos = num_arg(args, 1).unwrap_or((n - 1) as f64).max(0.0) as usize;
                 if pos >= n {
                     return one(Value::Nil);
                 }
@@ -486,20 +485,20 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(out)
             })),
             ("contains", native("contains", |_vm, args| {
-                let t = table_arg(&args, 0)?;
-                let needle = arg(&args, 1);
+                let t = table_arg(args, 0)?;
+                let needle = arg(args, 1);
                 let b = t.borrow();
                 one(Value::Bool(b.keys().iter().any(|k| b.get(k) == needle)))
             })),
             ("join", native("join", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let sep = args.get(1).map(|v| v.to_string()).unwrap_or_default();
                 let b = t.borrow();
                 let parts: Vec<String> = (0..b.len()).map(|i| b.get_index(i).to_string()).collect();
                 one(Value::str(parts.join(&sep)))
             })),
             ("keys", native("keys", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let mut out = Table::new();
                 for k in t.borrow().keys() {
                     out.push(k.to_value());
@@ -507,7 +506,7 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 one(Value::table(out))
             })),
             ("values", native("values", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let b = t.borrow();
                 let mut out = Table::new();
                 for k in b.keys() {
@@ -517,7 +516,7 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
             })),
             // `for (k, v) in t.iter()`
             ("iter", native("iter", |_vm, args| {
-                let t = table_arg(&args, 0)?;
+                let t = table_arg(args, 0)?;
                 let keys = t.borrow().keys();
                 let i = Cell::new(0usize);
                 one(iterator("table iterator", move || {
@@ -529,8 +528,8 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 }))
             })),
             ("sort", native("sort", |vm, args| {
-                let t = table_arg(&args, 0)?;
-                let cmp = arg(&args, 1);
+                let t = table_arg(args, 0)?;
+                let cmp = arg(args, 1);
                 let mut items: Vec<Value> = {
                     let b = t.borrow();
                     (0..b.len()).map(|i| b.get_index(i)).collect()
@@ -583,13 +582,13 @@ fn os_io(vm: &mut Vm) {
                 one(Value::Num(t as f64))
             })),
             ("getenv", native("getenv", |_vm, args| {
-                one(match std::env::var(&*str_arg(&args, 0)?) {
+                one(match std::env::var(&*str_arg(args, 0)?) {
                     Ok(v) => Value::str(v),
                     Err(_) => Value::Nil,
                 })
             })),
             ("exit", native("exit", |_vm, args| {
-                std::process::exit(num_arg(&args, 0).unwrap_or(0.0) as i32)
+                std::process::exit(num_arg(args, 0).unwrap_or(0.0) as i32)
             })),
         ],
     );
@@ -624,12 +623,12 @@ fn ffi_lib(vm: &mut Vm) {
         vec![
             ("C", process),
             ("load", native("load", |_vm, args| {
-                one(Value::Ptr(ffi::load_library(&str_arg(&args, 0)?).map_err(Error)?))
+                one(Value::Ptr(ffi::load_library(&str_arg(args, 0)?).map_err(Error)?))
             })),
             ("cdef", native("cdef", |vm, args| {
                 // ffi::cdef(lib, "decl") or ffi::cdef("decl") against the process
-                let (handle, decl) = match arg(&args, 0) {
-                    Value::Ptr(p) => (p, str_arg(&args, 1)?),
+                let (handle, decl) = match arg(args, 0) {
+                    Value::Ptr(p) => (p, str_arg(args, 1)?),
                     Value::Str(s) => match vm.index(&vm.get_global("ffi"), &Value::str("C"))? {
                         Value::Ptr(p) => (p, s),
                         _ => return err("ffi::cdef: no process handle"),
@@ -645,7 +644,7 @@ fn ffi_lib(vm: &mut Vm) {
                 let addr = ffi::symbol(handle, &sig.name).map_err(Error)?;
                 one(cffi::make_callable(sig, addr))
             })),
-            ("string", native("string", |_vm, args| match arg(&args, 0) {
+            ("string", native("string", |_vm, args| match arg(args, 0) {
                 Value::Ptr(p) => {
                     // SAFETY: the script asserts this points at a C string.
                     one(Value::str(unsafe { ffi::read_string(p) }))
@@ -672,7 +671,7 @@ fn jit_lib(vm: &mut Vm) {
                 Ok(Vec::new())
             })),
             ("threshold", native("threshold", |vm, args| {
-                vm.jit.threshold = num_arg(&args, 0)?.max(1.0) as u32;
+                vm.jit.threshold = num_arg(args, 0)?.max(1.0) as u32;
                 Ok(Vec::new())
             })),
             ("status", native("status", |vm, _args| {

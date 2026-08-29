@@ -91,9 +91,12 @@ pub fn err<T>(msg: impl Into<String>) -> Res<T> {
 }
 
 /// A function callable from Rust: this is the "Rust ABI" side of the FFI.
+///
+/// Arguments arrive as a slice of the VM's registers, so calling a builtin
+/// copies nothing.
 pub struct Native {
     pub name: String,
-    pub f: Box<dyn Fn(&mut Vm, Vec<Value>) -> Res<Vec<Value>>>,
+    pub f: Box<dyn Fn(&mut Vm, &[Value]) -> Res<Vec<Value>>>,
 }
 
 impl fmt::Debug for Native {

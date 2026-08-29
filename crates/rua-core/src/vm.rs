@@ -355,6 +355,21 @@ impl Vm {
     /// Make a call from registers: `callee`, then `nargs` arguments starting
     /// at `base + 1`, with results written back from `base`.
     fn dispatch(&mut self, callee: &Value, base: Reg, nargs: u16, nres: u16) -> Eval<()> {
+        // a builtin reads the arguments straight out of the registers
+        if let Value::Native(n) = callee {
+            let n = n.clone();
+            let start = self.base + base as usize + 1;
+            let vals = {
+                // SAFETY-free borrow dance: the native gets a snapshot of the
+                // argument window, and natives never resize the register stack
+                // out from under themselves (they call back through `call`,
+                // which pushes a new frame above `top`).
+                let args = self.stack[start..start + nargs as usize].to_vec();
+                (n.f)(self, &args)?
+            };
+            self.place(base, nres, vals);
+            return Ok(());
+        }
         // a plain rua function needs no argument vector at all
         if let Value::Func(func) = callee {
             let func = func.clone();

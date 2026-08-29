@@ -645,3 +645,85 @@ fn compiled_index_bounds_are_checked() {
     assert_eq!(a[1].to_string(), b[1].to_string(), "out of range");
     assert_eq!(a[2].to_string(), b[2].to_string(), "fractional index");
 }
+
+/// Compiled code may append to a table. That is only sound because every read
+/// it makes is provably in range, so it can never trap *after* writing.
+#[test]
+fn compiled_pushes_match_the_interpreter() {
+    let src = r#"
+        fn build(out, n) {
+            let i = 0
+            while i < n { out.push(i * 2); i += 1 }
+            out.len()
+        }
+        fn double(src, dst) {
+            for i in 0..src.len() { dst.push(src[i] * 3) }
+            dst.len()
+        }
+        let a = []
+        for k in 0..5 { build(a, 20) }
+        let b = []
+        for k in 0..5 { double(a, b) }
+        return a.len(), b.len(), a.join(","), b.join(",")
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    let got = jitted.eval(src).unwrap();
+    for i in 0..4 {
+        assert_eq!(want[i].to_string(), got[i].to_string(), "result {i}");
+    }
+    assert!(jitted.jit.compiled >= 2, "both writers should compile");
+}
+
+/// Reading and writing the *same* table would leave compiled code looking at a
+/// stale view, so that call has to stay interpreted.
+#[test]
+fn compiled_writes_bail_on_aliasing() {
+    let src = r#"
+        fn double(src, dst) {
+            for i in 0..src.len() { dst.push(src[i] * 2) }
+            dst.len()
+        }
+        let warm_a = [1, 2, 3]
+        let warm_b = []
+        for k in 0..5 { double(warm_a, warm_b) }      // compiles here
+        let c = [1, 2]
+        double(c, c)                                   // same table both ways
+        c.join(",")
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap()[0].to_string();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    assert_eq!(jitted.eval(src).unwrap()[0].to_string(), want);
+}
+
+/// A push of something that is not a number is outside the numeric subset, so
+/// the function stays interpreted and still works.
+#[test]
+fn compiled_writes_reject_non_numbers() {
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm
+        .eval(
+            r#"
+        fn label(out, n) {
+            let i = 0
+            while i < n { out.push("v{i}"); i += 1 }
+            out.len()
+        }
+        let t = []
+        for k in 0..5 { label(t, 2) }
+        return t.len(), t.join(",")
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out[0], Value::Num(10.0));
+    assert_eq!(out[1].to_string(), "v0,v1,v0,v1,v0,v1,v0,v1,v0,v1");
+}

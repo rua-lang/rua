@@ -36,7 +36,7 @@ fn from_ret(r: CRet) -> Vec<Value> {
 /// Wrap a C function as a rua value that scripts can call.
 pub fn make_callable(sig: Signature, addr: *mut c_void) -> Value {
     let name = sig.name.clone();
-    let f = move |_vm: &mut Vm, args: Vec<Value>| -> Res<Vec<Value>> {
+    let f = move |_vm: &mut Vm, args: &[Value]| -> Res<Vec<Value>> {
         let prepared: Res<Vec<CArg>> = sig
             .params
             .iter()

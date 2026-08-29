@@ -61,6 +61,8 @@ pub struct RtCtx {
     /// `fn(table, len_out, ok) -> *const f64` — a direct view of the array
     /// part, so element reads need no call at all.
     pub span: usize,
+    /// `fn(table, value)` — append a number to a table.
+    pub push: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
 }
@@ -71,13 +73,17 @@ pub struct RtHooks {
     pub len: usize,
     pub get: usize,
     pub span: usize,
+    pub push: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Num,
+    /// A table compiled code reads, through a view of its array part.
     Table,
+    /// A table compiled code only ever appends to.
+    TableOut,
 }
 
 /// A compiled entry point: arguments in, one number out.
@@ -278,17 +284,26 @@ impl Jit {
             self_ref,
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
+            writes: kinds.values().any(|k| *k == Kind::TableOut),
             kinds,
+            in_range: Vec::new(),
             on_trap: quote! { return; },
         };
         // mid-loop entry: the induction variable already holds its current
         // value, so a counted loop lowers to its `while` form without the init
         let body = match st {
-            Stat::ForRange { binding, end, inclusive, body, .. } => {
+            Stat::ForRange { binding, start, end, inclusive, body, .. } => {
                 let b = binding.ok_or("unresolved `for`")?;
                 let id = ident(b.slot);
                 let e = cx.expr(end)?;
+                let fact = cx.range_fact(b, start, end, *inclusive);
+                if let Some(f) = fact {
+                    cx.in_range.push(f);
+                }
                 let inner = cx.block(body, false)?;
+                if fact.is_some() {
+                    cx.in_range.pop();
+                }
                 let test = if *inclusive {
                     quote! { #id <= __end }
                 } else {
@@ -312,6 +327,7 @@ impl Jit {
             let idx = Literal::usize_suffixed(i);
             match kind {
                 Kind::Num => quote! { let mut #id: f64 = (*regs.add(#idx)).num; },
+                Kind::TableOut => quote! { let #id: *mut c_void = (*regs.add(#idx)).table; },
                 Kind::Table => {
                     let (ptr, len) = span_idents(*slot);
                     quote! {
@@ -324,14 +340,15 @@ impl Jit {
             }
         });
         let stores = slots.iter().zip(&kind_list).enumerate().filter_map(|(i, (slot, kind))| {
-            // tables are read only in compiled code, so only numbers travel back
+            // a table is mutated in place through the runtime, so only numbers
+            // have to travel back into the registers
             match kind {
                 Kind::Num => {
                     let id = ident(*slot);
                     let i = Literal::usize_suffixed(i);
                     Some(quote! { (*regs.add(#i)).num = #id; })
                 }
-                Kind::Table => None,
+                Kind::Table | Kind::TableOut => None,
             }
         });
         let preamble = preamble();
@@ -442,7 +459,9 @@ impl Jit {
             self_ref,
             arity: def.params.len(),
             inlined: Vec::new(),
+            writes: kinds.values().any(|k| *k == Kind::TableOut),
             kinds,
+            in_range: Vec::new(),
             on_trap: quote! { return 0.0; },
         };
         let body = cx.block(&def.body, true)?;
@@ -452,6 +471,7 @@ impl Jit {
             let idx = Literal::usize_suffixed(i);
             match cx.kinds.get(&b.slot).copied().unwrap_or(Kind::Num) {
                 Kind::Num => quote! { let mut #id: f64 = (*args.add(#idx)).num; },
+                Kind::TableOut => quote! { let #id: *mut c_void = (*args.add(#idx)).table; },
                 Kind::Table => {
                     let (ptr, len) = span_idents(b.slot);
                     quote! {
@@ -644,7 +664,7 @@ fn infer_kinds(b: &Block) -> Result<HashMap<u16, Kind>, String> {
 fn note(slot: u16, kind: Kind, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
     match kinds.insert(slot, kind) {
         Some(old) if old != kind => {
-            *bad = Some("a local is used as both a number and a table".into())
+            *bad = Some(format!("a local is used as both {old:?} and {kind:?}"))
         }
         _ => {}
     }
@@ -707,10 +727,12 @@ fn kinds_expr(e: &Expr, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>
             kinds_expr(key, kinds, bad);
         }
         Expr::Method(obj, name, args) => {
-            if let (Expr::Local(b, _), "len") = (&**obj, &**name) {
-                note(b.slot, Kind::Table, kinds, bad);
-            } else {
-                kinds_expr(obj, kinds, bad);
+            match (&**obj, &**name) {
+                // `t.len()` works for a table either way, so it says nothing
+                // about which kind this is
+                (Expr::Local(_, _), "len") => {}
+                (Expr::Local(b, _), "push") => note(b.slot, Kind::TableOut, kinds, bad),
+                _ => kinds_expr(obj, kinds, bad),
             }
             args.iter().for_each(|a| kinds_expr(a, kinds, bad));
         }
@@ -964,6 +986,7 @@ fn preamble() -> TokenStream {
             pub len: usize,
             pub get: usize,
             pub span: usize,
+            pub push: usize,
             pub callees: *const Callee,
         }
 
@@ -997,8 +1020,19 @@ fn preamble() -> TokenStream {
         }
 
         /// # Safety
-        /// As `rua_len`. The view stays valid as long as nothing writes to the
-        /// table, and compiled code never does.
+        /// `t` is a live table pointer, and `rt` the context we were called
+        /// with.
+        #[inline(always)]
+        unsafe fn rua_push(rt: *const RtCtx, t: *mut c_void, v: f64) {
+            let f: unsafe extern "C" fn(*mut c_void, f64) = 
+                std::mem::transmute((*rt).push as *const ());
+            f(t, v)
+        }
+
+        /// # Safety
+        /// As `rua_len`. The view a read table hands out stays valid as long as
+        /// nothing writes to *that* table, which the runtime checks before it
+        /// uses this code.
         #[inline(always)]
         unsafe fn rua_span(
             rt: *const RtCtx,
@@ -1022,8 +1056,15 @@ struct Ctx {
     /// Globals compiled in as direct calls.
     inlined: Vec<String>,
     arity: usize,
-    /// What each slot holds: a number, or a table read through the hooks.
+    /// What each slot holds: a number, or a table reached through the hooks.
     kinds: HashMap<u16, Kind>,
+    /// True when this code appends to a table. Once it has written something,
+    /// trapping back to the interpreter would run those writes twice, so every
+    /// read has to be provably in range instead.
+    writes: bool,
+    /// Loop variables known to be a valid index into a given table, from
+    /// `for i in 0..t.len()`.
+    in_range: Vec<(u16, u16)>,
     /// How to leave this entry point when a table read traps. Functions return
     /// a number; loops return nothing.
     on_trap: TokenStream,
@@ -1160,16 +1201,25 @@ impl Ctx {
                 quote! { loop #b }
             }
             Stat::ForRange { binding, start, end, inclusive, body, .. } => {
-                let b = binding.ok_or("unresolved `for` loop")?;
-                if b.cell {
+                let binding = binding.ok_or("unresolved `for` loop")?;
+                if binding.cell {
                     return Err("the loop variable is captured by a closure".into());
                 }
                 let s = self.expr(start)?;
                 let e = self.expr(end)?;
                 let saved = self.known.clone();
-                self.known.insert(b.slot);
-                let id = ident(b.slot);
+                self.known.insert(binding.slot);
+                let id = ident(binding.slot);
+                // `for i in 0..t.len()` makes `t[i]` provably in range, which
+                // is what lets code that also writes read a table at all
+                let fact = self.range_fact(binding, start, end, *inclusive);
+                if let Some(f) = fact {
+                    self.in_range.push(f);
+                }
                 let b = self.block(body, false)?;
+                if fact.is_some() {
+                    self.in_range.pop();
+                }
                 self.known = saved;
                 let test = if *inclusive {
                     quote! { #id <= __end }
@@ -1409,28 +1459,65 @@ impl Ctx {
             // `t[i]`: read straight out of the array view fetched on entry
             Expr::Index(obj, key) if self.is_table(obj) => {
                 let slot = self.table_slot(obj)?;
+                if self.kind_of(slot) != Kind::Table {
+                    return Err("reading a table that is also appended to".into());
+                }
                 let (ptr, len) = span_idents(slot);
-                let i = self.expr(key)?;
-                let trap = self.on_trap.clone();
-                quote! {
-                    {
-                        let __i = #i;
-                        let __u = __i as usize;
-                        if __i < 0.0 || __i.fract() != 0.0 || __u >= #len {
-                            unsafe { *ok = 0; }
-                            #trap
+                // `for i in 0..t.len()` proves `t[i]` is in range, which is
+                // what lets a function that writes read at all
+                if self.proven_in_range(key, slot) {
+                    let i = self.expr(key)?;
+                    quote! { unsafe { *#ptr.add((#i) as usize) } }
+                } else {
+                    if self.writes {
+                        return Err("an unproven index in code that also writes".into());
+                    }
+                    let i = self.expr(key)?;
+                    let trap = self.on_trap.clone();
+                    quote! {
+                        {
+                            let __i = #i;
+                            let __u = __i as usize;
+                            if __i < 0.0 || __i.fract() != 0.0 || __u >= #len {
+                                unsafe { *ok = 0; }
+                                #trap
+                            }
+                            unsafe { *#ptr.add(__u) }
                         }
-                        unsafe { *#ptr.add(__u) }
                     }
                 }
             }
             Expr::Method(obj, name, args) if self.is_table(obj) => {
-                if &**name != "len" || !args.is_empty() {
-                    return Err(format!("`{name}` on a table"));
-                }
                 let slot = self.table_slot(obj)?;
-                let (_, len) = span_idents(slot);
-                quote! { (#len as f64) }
+                match (&**name, args.len()) {
+                    ("len", 0) => match self.kind_of(slot) {
+                        // a read table already knows its length from the view
+                        Kind::Table => {
+                            let (_, len) = span_idents(slot);
+                            quote! { (#len as f64) }
+                        }
+                        _ => {
+                            let id = ident(slot);
+                            let trap = self.on_trap.clone();
+                            quote! {
+                                {
+                                    let __v = unsafe { rua_len(rt, #id, ok) };
+                                    if unsafe { *ok } == 0 { #trap }
+                                    __v
+                                }
+                            }
+                        }
+                    },
+                    ("push", 1) => {
+                        let id = ident(slot);
+                        let v = self.expr(&args[0])?;
+                        // `push` yields no value; as an expression it is nil,
+                        // which the numeric subset cannot hold, so it is only
+                        // ever compiled in statement position
+                        quote! { { unsafe { rua_push(rt, #id, #v) }; 0.0 } }
+                    }
+                    _ => return Err(format!("`{name}` on a table")),
+                }
             }
             Expr::Method(obj, name, args) => {
                 // `x.sqrt()` and friends are f64 methods in the generated code
@@ -1451,7 +1538,42 @@ impl Ctx {
 
     /// Is this expression a local the inference decided holds a table?
     fn is_table(&self, e: &Expr) -> bool {
-        matches!(e, Expr::Local(b, _) if self.kinds.get(&b.slot) == Some(&Kind::Table))
+        matches!(e, Expr::Local(b, _)
+            if matches!(self.kinds.get(&b.slot), Some(Kind::Table) | Some(Kind::TableOut)))
+    }
+
+    fn kind_of(&self, slot: u16) -> Kind {
+        self.kinds.get(&slot).copied().unwrap_or(Kind::Num)
+    }
+
+    /// Is `key` a loop variable we know indexes `table` safely?
+    fn proven_in_range(&self, key: &Expr, table: u16) -> bool {
+        match key {
+            Expr::Local(b, _) => self.in_range.iter().any(|(v, t)| *v == b.slot && *t == table),
+            _ => false,
+        }
+    }
+
+    /// `for i in 0..t.len()` makes `i` a proven index into `t` for the body.
+    fn range_fact(&self, binding: Binding, start: &Expr, end: &Expr, inclusive: bool) -> Option<(u16, u16)> {
+        if inclusive || binding.cell {
+            return None;
+        }
+        match start {
+            Expr::Num(n) if *n == 0.0 => {}
+            _ => return None,
+        }
+        // the end has to be exactly `t.len()` on a table we read
+        if let Expr::Method(obj, name, args) = end {
+            if &**name == "len" && args.is_empty() {
+                if let Expr::Local(b, _) = &**obj {
+                    if self.kind_of(b.slot) == Kind::Table {
+                        return Some((binding.slot, b.slot));
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn table_slot(&self, e: &Expr) -> Lower<u16> {
