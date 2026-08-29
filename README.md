@@ -183,7 +183,7 @@ control to it *while the loop is running*, then picks the locals back up. That
 is on-stack replacement, and it is what makes a script's top level, or a `main`
 that is only ever called once, run at compiled speed.
 
-**Tables, read-only.** A parameter that is only ever indexed or asked for its
+**Tables.** A parameter that is only ever indexed or asked for its
 length is passed as a table. Compiled code gets a contiguous view of its array
 part — built on demand, thrown away by any write to the table, so it can never
 go stale — and reads elements straight out of it with a bounds check:
@@ -197,9 +197,22 @@ fn dot(a, b) {
 ```
 
 If an element turns out not to be a number, compiled code *traps*: it sets a
-flag and returns, and the interpreter runs the call instead. That is sound
-precisely because compiled code never writes anything, so there is nothing to
-undo.
+flag and returns, and the interpreter runs the call instead — sound because
+nothing has been written yet.
+
+Compiled code may also *append* to a table, which is what makes array building
+compile. That needs the trap never to happen after a write, so a function that
+appends may only read through an index the compiler can prove is in range
+(`t[i]` inside `for i in 0..t.len()` over that same table, where the body
+assigns neither), may not call another compiled function (whose trap would
+unwind past the writes), and is skipped entirely when the table it writes is
+the same one it reads.
+
+Everything compiled is an `f64`, and rua is Lua-shaped — every number is true,
+including `0` — so a boolean and the number encoding it are indistinguishable in
+compiled code. A condition therefore has to be *provably* boolean (a comparison,
+or `&&`/`||`/`!` over comparisons); anything else keeps the function
+interpreted.
 
 **Calls between compiled functions.** Compiling a function first compiles the
 helpers it calls, then emits direct calls to their machine code — no interpreter
@@ -230,13 +243,13 @@ one adds about 50ms per compiled function or loop, once.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| `fib(30)` | 0.280s | **0.008s** | 0.053s | 0.009s |
-| 5M iteration loop, top level | 0.224s | **0.031s** | 0.087s | 0.022s |
-| 5M iteration loop in a function called once | 0.230s | **0.032s** | 0.084s | 0.013s |
-| 2M calls through two helper functions | 0.927s | **0.046s** | 0.205s | 0.024s |
-| 2000 calls × 500 iteration loop | 0.045s | **0.008s** | 0.010s | 0.008s |
-| dot product, 4M array reads | 0.487s | **0.028s** | 0.063s | 0.004s |
-| build + sum a 300k array | 0.069s | 0.053s | 0.013s | 0.007s |
+| `fib(30)` | 0.333s | **0.010s** | 0.055s | 0.009s |
+| 5M iteration loop, top level | 0.253s | **0.040s** | 0.089s | 0.016s |
+| 5M iteration loop in a function called once | 0.234s | **0.032s** | 0.083s | 0.013s |
+| 2M calls through two helper functions | 1.036s | **0.040s** | 0.203s | 0.020s |
+| 2000 calls × 500 iteration loop | 0.047s | **0.006s** | 0.010s | 0.004s |
+| dot product, 4M array reads | 0.515s | **0.030s** | 0.062s | 0.004s |
+| build + sum a 300k array, in functions | 0.069s | **0.016s** | 0.011s | 0.003s |
 
 Read that honestly:
 
@@ -247,9 +260,8 @@ Read that honestly:
   bytecode VM over slots the resolver assigned, with calls that pass arguments
   and results through the register stack without allocating, but Lua's VM has
   had twenty years of tuning.
-* **Building a table is the weak spot**: `push` is a method call the JIT does
-  not compile, so filling an array stays interpreted even though reading it
-  afterwards does not.
+* **The interpreter is where the remaining gap is.** Calls cost about 4x what
+  Lua's do; the JIT hides that for numeric code and cannot for the rest.
 
 ## FFI: calling C
 
@@ -349,11 +361,15 @@ alive next to the bytecode, because that is what the JIT reads.
 ## Tests
 
 ```sh
-cargo test --workspace     # 34 tests: language, JIT-equals-interpreter, FFI, modules
+cargo test --workspace     # 48 tests: language, JIT-equals-interpreter, FFI, modules
 ```
 
 The JIT tests run the same program with and without compilation and assert the
-results match. That is the invariant that matters.
+results match. That is the invariant that matters, and it is what an adversarial
+multi-agent review pass was pointed at: it found 39 real bugs, including an
+out-of-bounds read the range proof allowed, a use-after-free in the compiled
+call graph, and three ways compiled and interpreted code could disagree. Every
+one of them has a regression test here now.
 
 ## License
 
