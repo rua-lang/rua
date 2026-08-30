@@ -406,22 +406,29 @@ impl Table {
     }
 
     pub fn set(&mut self, k: Key, v: Value) {
-        self.nums = None;
         if let Some(i) = array_index(&k) {
+            // an in-place numeric write can stay in the view too
+            match (&mut self.nums, &v) {
+                (Some(cache), Value::Num(n)) if i < cache.len() => cache[i] = *n,
+                (slot @ Some(_), _) => *slot = None,
+                (None, _) => {}
+            }
             if i < self.arr.len() {
                 self.arr[i] = v;
                 // a nil at the end shrinks the array part
                 while matches!(self.arr.last(), Some(Value::Nil)) {
                     self.arr.pop();
+                    self.nums = None;
                 }
                 return;
             }
             if i == self.arr.len() && !matches!(v, Value::Nil) {
-                self.arr.push(v);
-                self.absorb_from_map();
+                self.push(v);
                 return;
             }
         }
+        // a write outside the array part cannot touch the view
+
         if let Value::Nil = v {
             if self.map.remove(&k).is_some() {
                 self.order.retain(|x| x != &k);
@@ -440,6 +447,8 @@ impl Table {
         if self.map.is_empty() {
             return;
         }
+        // anything pulled in from the hash part may not be a number
+        self.nums = None;
         loop {
             let next = Key::Num((self.arr.len() as f64).to_bits());
             match self.map.remove(&next) {
@@ -472,7 +481,14 @@ impl Table {
     /// Append, including a nil: `[1, nil, 2]` keeps its three slots, so that
     /// `len()` and iteration agree with what was written.
     pub fn push(&mut self, v: Value) {
-        self.nums = None;
+        // Keep the numeric view in step rather than dropping it. Filling an
+        // array and then reading it is the common shape, and rebuilding the
+        // view on the next read costs more than the whole fill.
+        match (&mut self.nums, &v) {
+            (Some(cache), Value::Num(n)) => cache.push(*n),
+            (slot @ Some(_), _) => *slot = None,
+            (None, _) => {}
+        }
         self.arr.push(v);
         self.absorb_from_map();
     }
