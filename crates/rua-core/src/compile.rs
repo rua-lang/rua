@@ -103,6 +103,15 @@ impl FnCompiler {
         }
     }
 
+    /// The constant slot of a literal index — `t[3]` or `t.field`.
+    fn const_key(&mut self, e: &Expr) -> Option<u16> {
+        match e {
+            Expr::Num(n) => Some(self.constant(Value::Num(*n))),
+            Expr::Str(s) => Some(self.constant(Value::Str(s.clone()))),
+            _ => None,
+        }
+    }
+
     /// The constant index of a literal number, when there is one: the right
     /// hand side of most arithmetic is a literal.
     fn literal(&mut self, e: &Expr) -> Option<u16> {
@@ -243,12 +252,22 @@ impl FnCompiler {
                 // the same place would
                 if let Expr::Index(obj, key) = target {
                     let o = self.operand(obj);
-                    let k = self.operand(key);
                     let cur = self.alloc();
-                    self.emit(Op::GetIndex { dst: cur, obj: o, key: k }, 0);
-                    let rhs = self.operand(e);
-                    self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
-                    self.emit(Op::SetIndex { obj: o, key: k, val: cur }, 0);
+                    match self.const_key(key) {
+                        Some(k) => {
+                            self.emit(Op::GetIndexK { dst: cur, obj: o, k }, 0);
+                            let rhs = self.operand(e);
+                            self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
+                            self.emit(Op::SetIndexK { obj: o, k, val: cur }, 0);
+                        }
+                        None => {
+                            let k = self.operand(key);
+                            self.emit(Op::GetIndex { dst: cur, obj: o, key: k }, 0);
+                            let rhs = self.operand(e);
+                            self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
+                            self.emit(Op::SetIndex { obj: o, key: k, val: cur }, 0);
+                        }
+                    }
                     self.release(mark);
                     return;
                 }
@@ -517,8 +536,13 @@ impl FnCompiler {
             Expr::Index(obj, key) => {
                 let mark = self.mark();
                 let o = self.operand(obj);
-                let k = self.operand(key);
-                self.emit(Op::SetIndex { obj: o, key: k, val: src }, 0);
+                match self.const_key(key) {
+                    Some(k) => self.emit(Op::SetIndexK { obj: o, k, val: src }, 0),
+                    None => {
+                        let k = self.operand(key);
+                        self.emit(Op::SetIndex { obj: o, key: k, val: src }, 0)
+                    }
+                };
                 self.release(mark);
             }
             _ => unreachable!("the parser rejects other assignment targets"),
@@ -578,8 +602,13 @@ impl FnCompiler {
             Expr::Index(obj, key) => {
                 let mark = self.mark();
                 let o = self.operand(obj);
-                let k = self.operand(key);
-                self.emit(Op::GetIndex { dst, obj: o, key: k }, 0);
+                match self.const_key(key) {
+                    Some(k) => self.emit(Op::GetIndexK { dst, obj: o, k }, 0),
+                    None => {
+                        let k = self.operand(key);
+                        self.emit(Op::GetIndex { dst, obj: o, key: k }, 0)
+                    }
+                };
                 self.release(mark);
             }
             Expr::Call(..) | Expr::Method(..) => self.call_expr(e, dst, 1),

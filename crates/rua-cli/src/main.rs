@@ -108,7 +108,8 @@ fn main() {
     let mut vm = Vm::new();
     vm.jit.enabled = !args.no_jit;
     vm.jit.threshold = args.jit.max(1);
-    vm.jit.dump = args.dump_jit;
+    // the flag turns dumping on; RUA_JIT_DUMP may already have
+    vm.jit.dump = vm.jit.dump || args.dump_jit;
 
     // script arguments, as an array
     let arg_table = std::rc::Rc::new(std::cell::RefCell::new(rua::Table::new()));

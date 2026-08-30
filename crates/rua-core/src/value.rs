@@ -126,6 +126,9 @@ pub struct Function {
     pub param_kinds: RefCell<Vec<rua_jit::Kind>>,
     /// The context compiled code runs with: hook addresses and callees.
     pub rt: RefCell<Option<crate::interp::RtCtxHolder>>,
+    /// Whether the compiled entry point's result means nothing, because the
+    /// function is a procedure.
+    pub returns_nil: Cell<bool>,
     /// Captured variables, in the order `FuncDef::upvals` describes.
     pub upvals: Rc<Vec<CellRef>>,
     pub hits: Cell<u32>,
@@ -322,27 +325,35 @@ impl Key {
     }
 }
 
-/// A table is an array part plus a hash part, as in Lua: `t[0..n]` lives in a
-/// `Vec` (O(1) index and push), everything else in a map that remembers its
-/// insertion order so iteration is predictable.
+/// A table is an array part plus a keyed part, as in Lua: `t[0..n]` lives in a
+/// `Vec` (O(1) index and push), everything else in an insertion-ordered list of
+/// pairs. Object-shaped tables — a handful of named fields — are the common
+/// case, and for those a linear scan beats hashing and costs one allocation
+/// instead of three. A hash index appears only once a table outgrows that.
 #[derive(Default, Debug)]
 pub struct Table {
     arr: Vec<Value>,
-    map: FxMap<Key, Value>,
-    order: Vec<Key>,
+    /// Keyed entries, in insertion order.
+    pairs: Vec<(Key, Value)>,
+    /// Key to index into `pairs`, built once `pairs` gets long.
+    index: Option<Box<FxMap<Key, usize>>>,
     /// A plain `f64` copy of the array part, built on demand for compiled code
     /// so that it can read elements without calling back into the runtime.
-    /// Any mutation throws it away.
+    /// Any mutation that could invalidate it throws it away.
     nums: Option<Vec<f64>>,
 }
+
+/// Above this many keyed entries, a table builds a hash index.
+const INDEX_THRESHOLD: usize = 8;
 
 /// The array index a key denotes, if it denotes one.
 fn array_index(k: &Key) -> Option<usize> {
     match k {
         Key::Num(bits) => {
             let n = f64::from_bits(*bits);
-            if n >= 0.0 && n.fract() == 0.0 && n < usize::MAX as f64 {
-                Some(n as usize)
+            let i = n as usize;
+            if i as f64 == n {
+                Some(i)
             } else {
                 None
             }
@@ -362,7 +373,19 @@ impl Table {
                 return self.arr[i].clone();
             }
         }
-        self.map.get(k).cloned().unwrap_or(Value::Nil)
+        match self.find(k) {
+            Some(i) => self.pairs[i].1.clone(),
+            None => Value::Nil,
+        }
+    }
+
+    /// Where `k` lives in `pairs`, by index or by scan.
+    #[inline]
+    fn find(&self, k: &Key) -> Option<usize> {
+        match &self.index {
+            Some(ix) => ix.get(k).copied(),
+            None => self.pairs.iter().position(|(key, _)| key == k),
+        }
     }
 
     pub fn get_str(&self, k: &str) -> Value {
@@ -461,31 +484,58 @@ impl Table {
         // a write outside the array part cannot touch the view
 
         if let Value::Nil = v {
-            if self.map.remove(&k).is_some() {
-                self.order.retain(|x| x != &k);
+            if let Some(i) = self.find(&k) {
+                self.pairs.remove(i);
+                // the indices after it just moved
+                self.index = None;
+                self.reindex();
             }
             return;
         }
-        if self.map.insert(k.clone(), v).is_none() {
-            self.order.push(k);
+        match self.find(&k) {
+            Some(i) => self.pairs[i].1 = v,
+            None => {
+                self.pairs.push((k.clone(), v));
+                match &mut self.index {
+                    Some(ix) => {
+                        ix.insert(k, self.pairs.len() - 1);
+                    }
+                    None if self.pairs.len() > INDEX_THRESHOLD => self.reindex(),
+                    None => {}
+                }
+            }
         }
+    }
+
+    /// Build (or rebuild) the hash index, once a table is big enough to want
+    /// one.
+    fn reindex(&mut self) {
+        if self.pairs.len() <= INDEX_THRESHOLD {
+            return;
+        }
+        let mut ix = FxMap::default();
+        for (i, (k, _)) in self.pairs.iter().enumerate() {
+            ix.insert(k.clone(), i);
+        }
+        self.index = Some(Box::new(ix));
     }
 
     /// After growing the array part, pull in any keys that now sit next to it.
     fn absorb_from_map(&mut self) {
-        // the common case is a pure array, where there is nothing to absorb and
-        // hashing the next index on every push is pure overhead
-        if self.map.is_empty() {
+        // the common case is a pure array, where there is nothing to absorb
+        if self.pairs.is_empty() {
             return;
         }
-        // anything pulled in from the hash part may not be a number
-        self.nums = None;
+        // anything pulled in from the keyed part may not be a number
         loop {
             let next = Key::Num((self.arr.len() as f64).to_bits());
-            match self.map.remove(&next) {
-                Some(v) => {
-                    self.order.retain(|x| x != &next);
+            match self.find(&next) {
+                Some(i) => {
+                    self.nums = None;
+                    let (_, v) = self.pairs.remove(i);
                     self.arr.push(v);
+                    self.index = None;
+                    self.reindex();
                 }
                 None => return,
             }
@@ -506,7 +556,7 @@ impl Table {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.arr.is_empty() && self.map.is_empty()
+        self.arr.is_empty() && self.pairs.is_empty()
     }
 
     /// Append, including a nil: `[1, nil, 2]` keeps its three slots, so that
@@ -529,7 +579,7 @@ impl Table {
         let mut out: Vec<Key> = (0..self.arr.len())
             .map(|i| Key::Num((i as f64).to_bits()))
             .collect();
-        out.extend(self.order.iter().cloned());
+        out.extend(self.pairs.iter().map(|(k, _)| k.clone()));
         out
     }
 }

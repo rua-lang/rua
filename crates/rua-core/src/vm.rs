@@ -292,6 +292,50 @@ impl Vm {
                     };
                     self.set_reg(dst, v);
                 }
+                Op::GetIndexK { dst, obj, k } => {
+                    let key = &proto.consts[k as usize];
+                    let fast = match (&self.stack[self.base + obj as usize], key) {
+                        (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
+                        (Value::Table(t), Value::Str(s)) => {
+                            Some(t.borrow().get(&Key::Str(s.clone())))
+                        }
+                        _ => None,
+                    };
+                    let v = match fast {
+                        Some(v) => v,
+                        None => {
+                            let (o, key) = (self.reg(obj), key.clone());
+                            self.index(&o, &key).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::SetIndexK { obj, k, val } => {
+                    let key = proto.consts[k as usize].clone();
+                    let done = match (
+                        &self.stack[self.base + obj as usize],
+                        &key,
+                        &self.stack[self.base + val as usize],
+                    ) {
+                        (Value::Table(t), Value::Num(n), v) => t.borrow_mut().set_num(*n, v),
+                        _ => false,
+                    };
+                    if done {
+                        continue;
+                    }
+                    let o = self.reg(obj);
+                    let v = self.reg(val);
+                    match o {
+                        Value::Table(t) => {
+                            let key = Key::from_value(&key).map_err(|e| self.at(proto, pc, e))?;
+                            t.borrow_mut().set(key, v);
+                        }
+                        other => {
+                            let e = Error(format!("cannot index a {} value", other.type_name()));
+                            return Err(self.at(proto, pc, e));
+                        }
+                    }
+                }
                 Op::SetIndex { obj, key, val } => {
                     // an in-place write into the array part, likewise
                     let done = match (

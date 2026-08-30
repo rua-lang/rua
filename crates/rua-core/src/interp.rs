@@ -87,6 +87,7 @@ impl RtCtxHolder {
             get: hooks.get,
             span: hooks.span,
             push: hooks.push,
+            set: hooks.set,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -123,6 +124,9 @@ pub struct Vm {
     pool: Vec<Vec<Value>>,
     /// The values of the last call that produced "as many as there are".
     multi: Vec<Value>,
+    /// The function being executed, so that a hot loop can nominate it for
+    /// compilation.
+    pub(crate) current_fn: Option<Rc<Function>>,
     /// The statement being executed, and the call stack above it, so that an
     /// error can say where it happened.
     line: u32,
@@ -180,6 +184,7 @@ impl Vm {
             top: 0,
             pool: Vec::new(),
             multi: Vec::new(),
+            current_fn: None,
             line: 0,
             frames: Vec::new(),
             modules: HashMap::new(),
@@ -325,6 +330,7 @@ impl Vm {
             proto,
             param_kinds: RefCell::new(Vec::new()),
             rt: RefCell::new(None),
+            returns_nil: std::cell::Cell::new(false),
             upvals: Rc::new(Vec::new()),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -386,6 +392,16 @@ impl Vm {
     pub(crate) fn note_loop(&mut self, proto: &Rc<crate::bytecode::Proto>, id: u32) -> bool {
         if !self.jit.enabled {
             return false;
+        }
+        // A function called a handful of times but looping hard inside is
+        // exactly as worth compiling as one called ten thousand times. The call
+        // counter cannot see that; the loop can. This activation stays
+        // interpreted (or is taken over by the loop below), but the next call
+        // gets the compiled function.
+        if let Some(f) = self.current_fn.clone() {
+            if f.jit_state.get() == JitState::Cold {
+                self.try_compile(&f);
+            }
         }
         {
             let entry = self.loops.entry(id).or_default();
@@ -602,8 +618,11 @@ impl Vm {
                     if let Some(ctx) = ctx {
                         // SAFETY: this is the context built for this code.
                         if let Some(n) = unsafe { code.call(&rt_args, ctx) } {
-                            // compiled code always produces exactly one number
-                            let v = Value::Num(n);
+                            let v = if func.returns_nil.get() {
+                                Value::Nil
+                            } else {
+                                Value::Num(n)
+                            };
                             match nres {
                                 0 => {}
                                 crate::bytecode::MULTI => {
@@ -626,7 +645,9 @@ impl Vm {
             }
         }
         self.frames.push((func.proto.name.clone(), self.line));
+        let previous = self.current_fn.replace(func.clone());
         let out = self.run_into(func, arg_start, nargs, ret_to, nres);
+        self.current_fn = previous;
         self.frames.pop();
         out
     }
@@ -688,6 +709,7 @@ impl Vm {
             proto,
             param_kinds: RefCell::new(Vec::new()),
             rt: RefCell::new(None),
+            returns_nil: std::cell::Cell::new(false),
             upvals: Rc::new(cells),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -798,6 +820,7 @@ impl Vm {
                 let ctx = self.build_ctx(&out.inlined);
                 func.jit.set(Some(out.code));
                 *func.param_kinds.borrow_mut() = out.param_kinds;
+                func.returns_nil.set(out.returns_nil);
                 if let Some(old) = func.rt.borrow_mut().replace(ctx) {
                     // someone else's compiled code may still call through it
                     self.retired_ctx.push(old);
@@ -982,12 +1005,33 @@ pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64) {
     (*table.as_ptr()).push(Value::Num(v));
 }
 
+/// Write a number already inside a table's array part, for compiled code. In
+/// place, so a view handed out earlier stays valid.
+///
+/// # Safety
+/// As [`rua_rt_len`].
+#[no_mangle]
+pub unsafe extern "C" fn rua_rt_set(t: *mut std::ffi::c_void, i: f64, v: f64, ok: *mut i32) {
+    debug_assert!(!t.is_null(), "compiled code wrote to a null table");
+    if t.is_null() {
+        *ok = 0;
+        return;
+    }
+    let table = &*(t as *const RefCell<Table>);
+    // Only an in-place write into the array part: anything else would change
+    // the table's shape, which the view compiled code holds cannot survive.
+    if !(*table.as_ptr()).set_num(i, &Value::Num(v)) {
+        *ok = 0;
+    }
+}
+
 fn hooks() -> RtHooks {
     RtHooks {
         len: rua_rt_len as *const () as usize,
         get: rua_rt_get as *const () as usize,
         span: rua_rt_span as *const () as usize,
         push: rua_rt_push as *const () as usize,
+        set: rua_rt_set as *const () as usize,
     }
 }
 

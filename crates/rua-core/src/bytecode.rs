@@ -75,8 +75,14 @@ pub enum Op {
     NewTable { dst: Reg },
     /// `dst = obj[key]`
     GetIndex { dst: Reg, obj: Reg, key: Reg },
+    /// `dst = obj[k]` for a constant index: `t[3]`, `node.left`. Most indexing
+    /// in real code is this shape, and it saves loading the key into a
+    /// register first.
+    GetIndexK { dst: Reg, obj: Reg, k: u16 },
     /// `obj[key] = val`
     SetIndex { obj: Reg, key: Reg, val: Reg },
+    /// `obj[k] = val` for a constant index.
+    SetIndexK { obj: Reg, k: u16, val: Reg },
     /// `t.push(v)`, for array literals.
     Append { obj: Reg, val: Reg },
     /// Append everything the last call produced, for `[a, f()]`.

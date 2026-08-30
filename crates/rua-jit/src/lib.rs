@@ -63,6 +63,9 @@ pub struct RtCtx {
     pub span: usize,
     /// `fn(table, value)` — append a number to a table.
     pub push: usize,
+    /// `fn(table, index, value)` — write a number already inside the array
+    /// part. In place, so the view a caller holds stays valid.
+    pub set: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -78,6 +81,7 @@ pub struct RtHooks {
     pub get: usize,
     pub span: usize,
     pub push: usize,
+    pub set: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -155,6 +159,9 @@ pub struct SelfRef {
 /// What a compilation produced, and what it assumed.
 pub struct Compiled {
     pub code: JitFn,
+    /// The function has no value: its `f64` result is meaningless and the
+    /// runtime should hand back nil, as the interpreter does.
+    pub returns_nil: bool,
     /// Globals whose current value was compiled in as a direct call.
     pub inlined: Vec<String>,
     /// What each parameter has to be for the compiled code to apply.
@@ -230,26 +237,30 @@ impl Jit {
         if def.params.len() > 4 {
             return Err("more than 4 parameters".into());
         }
-        // Compiled functions always return exactly one number, so the body has
-        // to produce one: a tail expression, or a final `return <expr>`.
+        // A compiled function produces one number, or nothing at all — a
+        // procedure like `fn fill(t, n) { ... }` is worth compiling too. What
+        // it may not do is produce a number down one path and nil down another,
+        // since the two are different values to the interpreter.
         let ends_with_return =
             matches!(def.body.stats.last(), Some(Stat::Return(v)) if v.len() == 1);
-        if def.body.tail.is_none() && !ends_with_return {
-            return Err("the body can fall through, so it would return nil".into());
+        let returns_nil = def.body.tail.is_none() && !ends_with_return;
+        if returns_nil && returns_a_value(&def.body) {
+            return Err("some paths return a value and some do not".into());
         }
         let symbol = format!("rua_jit_{}", def.id);
         // The file is named after a hash of its contents (see `build`), which
         // is both the cache key and what keeps dlopen — which caches by path —
         // honest when a function is recompiled into different code.
         let file_stem = symbol.clone();
-        let (src, inlined, param_kinds) = self.lower_function(def, &symbol, self_ref)?;
+        let (src, inlined, param_kinds) =
+            self.lower_function(def, &symbol, self_ref, returns_nil)?;
 
         let addr = self.build(&file_stem, &symbol, &src, &def.name)?;
         // SAFETY: `build` returned the address of the `extern "C"` entry point
         // generated just above, which has exactly the `Entry` signature.
         let entry = unsafe { std::mem::transmute::<*const (), Entry>(addr) };
         let code = JitFn { entry, arity: def.params.len() };
-        Ok(Compiled { code, inlined, param_kinds })
+        Ok(Compiled { code, inlined, param_kinds, returns_nil })
     }
 
     /// Compile one hot loop into a function over its live numeric locals.
@@ -292,7 +303,7 @@ impl Jit {
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
             self_params_numeric: true,
-            writes: kinds.values().any(|k| *k == Kind::TableOut),
+            writes: table_usage(&wrapper).traps_forbidden(),
             kinds,
             in_range: Vec::new(),
             loop_labels: Vec::new(),
@@ -475,6 +486,7 @@ impl Jit {
         def: &FuncDef,
         symbol: &str,
         self_ref: SelfRef,
+        returns_nil: bool,
     ) -> Lower<(String, Vec<String>, Vec<Kind>)> {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
@@ -500,14 +512,19 @@ impl Jit {
             arity: def.params.len(),
             inlined: Vec::new(),
             self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
-            writes: kinds.values().any(|k| *k == Kind::TableOut),
+            writes: table_usage(&def.body).traps_forbidden(),
             kinds,
             in_range: Vec::new(),
             loop_labels: Vec::new(),
             labels: 0,
             on_trap: quote! { return 0.0; },
         };
-        let body = cx.block(&def.body, true)?;
+        let body = if returns_nil {
+            let inner = cx.block(&def.body, false)?;
+            quote! { { #inner 0.0 } }
+        } else {
+            cx.block(&def.body, true)?
+        };
         // unpack the argument array into locals of the right kind
         let prologue = def.param_bindings.iter().enumerate().map(|(i, b)| {
             let id = ident(b.slot);
@@ -765,7 +782,21 @@ fn kinds_stat(
             es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees));
         }
         Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => kinds_expr(e, kinds, bad, callees),
-        Stat::Assign(ts, es) => ts.iter().chain(es).for_each(|e| kinds_expr(e, kinds, bad, callees)),
+        Stat::Assign(ts, es) => {
+            for t in ts {
+                // `t[i] = v` writes in place, which the view survives, so the
+                // table is still read through a span
+                if let Expr::Index(obj, key) = t {
+                    if let Expr::Local(b, _) = &**obj {
+                        note(b.slot, Kind::Table, kinds, bad);
+                        kinds_expr(key, kinds, bad, callees);
+                        continue;
+                    }
+                }
+                kinds_expr(t, kinds, bad, callees);
+            }
+            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees));
+        }
         Stat::OpAssign(t, _, e) => {
             kinds_expr(t, kinds, bad, callees);
             kinds_expr(e, kinds, bad, callees);
@@ -1085,6 +1116,7 @@ fn preamble() -> TokenStream {
             pub get: usize,
             pub span: usize,
             pub push: usize,
+            pub set: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1127,6 +1159,15 @@ fn preamble() -> TokenStream {
             let f: unsafe extern "C" fn(*mut c_void, f64) = 
                 std::mem::transmute((*rt).push as *const ());
             f(t, v)
+        }
+
+        /// # Safety
+        /// `t` is a live table pointer, `i` an index inside its array part.
+        #[inline(always)]
+        unsafe fn rua_set(rt: *const RtCtx, t: *mut c_void, i: f64, v: f64, ok: *mut i32) {
+            let f: unsafe extern "C" fn(*mut c_void, f64, f64, *mut i32) =
+                std::mem::transmute((*rt).set as *const ());
+            f(t, i, v, ok)
         }
 
         /// # Safety
@@ -1176,6 +1217,200 @@ struct Ctx {
     /// How to leave this entry point when a table read traps. Functions return
     /// a number; loops return nothing.
     on_trap: TokenStream,
+}
+
+/// Does any path in this block return a value? A procedure may contain bare
+/// `return`s, but not a mix of the two.
+fn returns_a_value(b: &Block) -> bool {
+    let mut found = false;
+    value_returns_block(b, &mut found);
+    found
+}
+
+fn value_returns_block(b: &Block, found: &mut bool) {
+    for st in &b.stats {
+        match st {
+            Stat::Return(es) => {
+                if !es.is_empty() {
+                    *found = true;
+                }
+            }
+            Stat::While(_, _, b) | Stat::Loop(_, b) => value_returns_block(b, found),
+            Stat::ForRange { body, .. } | Stat::ForIn { body, .. } => {
+                value_returns_block(body, found)
+            }
+            Stat::Expr(e) => value_returns_expr(e, found),
+            _ => {}
+        }
+    }
+    if let Some(t) = &b.tail {
+        value_returns_expr(t, found);
+    }
+}
+
+fn value_returns_expr(e: &Expr, found: &mut bool) {
+    match e {
+        Expr::Do(b) => value_returns_block(b, found),
+        Expr::If(arms, els) => {
+            for (_, b) in arms {
+                value_returns_block(b, found);
+            }
+            if let Some(b) = els {
+                value_returns_block(b, found);
+            }
+        }
+        Expr::Match(_, arms) => arms.iter().for_each(|a| value_returns_block(&a.body, found)),
+        _ => {}
+    }
+}
+
+/// How this code uses tables, which decides whether it may trap.
+///
+/// A trap re-runs the whole call in the interpreter, so it is only safe while
+/// re-running would produce the same result. Writing an element in place is
+/// fine: the re-run recomputes the same value and writes it again — *unless*
+/// the code also reads that table, in which case the partial writes would feed
+/// back into the recomputation. Appending is never fine, because the re-run
+/// would append a second time.
+#[derive(Default)]
+struct TableUse {
+    read: HashSet<u16>,
+    written: HashSet<u16>,
+    pushes: bool,
+}
+
+impl TableUse {
+    /// May compiled code bail out to the interpreter part way through?
+    fn traps_forbidden(&self) -> bool {
+        self.pushes || self.read.intersection(&self.written).next().is_some()
+    }
+}
+
+fn table_usage(b: &Block) -> TableUse {
+    let mut use_ = TableUse::default();
+    usage_block(b, &mut use_);
+    use_
+}
+
+fn usage_block(b: &Block, u: &mut TableUse) {
+    for st in &b.stats {
+        usage_stat(st, u);
+    }
+    if let Some(t) = &b.tail {
+        usage_expr(t, u);
+    }
+}
+
+fn usage_stat(st: &Stat, u: &mut TableUse) {
+    match st {
+        Stat::Assign(ts, es) => {
+            for t in ts {
+                if let Expr::Index(obj, key) = t {
+                    if let Expr::Local(b, _) = &**obj {
+                        u.written.insert(b.slot);
+                    }
+                    usage_expr(key, u);
+                } else {
+                    usage_expr(t, u);
+                }
+            }
+            es.iter().for_each(|e| usage_expr(e, u));
+        }
+        Stat::OpAssign(t, _, e) => {
+            // `t[i] += v` both reads and writes
+            if let Expr::Index(obj, key) = t {
+                if let Expr::Local(b, _) = &**obj {
+                    u.written.insert(b.slot);
+                    u.read.insert(b.slot);
+                }
+                usage_expr(key, u);
+            } else {
+                usage_expr(t, u);
+            }
+            usage_expr(e, u);
+        }
+        Stat::LetSlots(_, es) | Stat::Let(_, es) | Stat::Return(es) => {
+            es.iter().for_each(|e| usage_expr(e, u))
+        }
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => usage_expr(e, u),
+        Stat::While(_, c, b) => {
+            usage_expr(c, u);
+            usage_block(b, u);
+        }
+        Stat::Loop(_, b) => usage_block(b, u),
+        Stat::ForRange { start, end, body, .. } => {
+            usage_expr(start, u);
+            usage_expr(end, u);
+            usage_block(body, u);
+        }
+        Stat::ForIn { iter, body, .. } => {
+            usage_expr(iter, u);
+            usage_block(body, u);
+        }
+        Stat::Break | Stat::Continue => {}
+    }
+}
+
+fn usage_expr(e: &Expr, u: &mut TableUse) {
+    match e {
+        Expr::Index(obj, key) => {
+            if let Expr::Local(b, _) = &**obj {
+                u.read.insert(b.slot);
+            } else {
+                usage_expr(obj, u);
+            }
+            usage_expr(key, u);
+        }
+        Expr::Method(obj, name, args) => {
+            if let Expr::Local(b, _) = &**obj {
+                match &**name {
+                    "push" => {
+                        u.pushes = true;
+                        u.written.insert(b.slot);
+                    }
+                    "len" => {}
+                    _ => {}
+                }
+            } else {
+                usage_expr(obj, u);
+            }
+            args.iter().for_each(|a| usage_expr(a, u));
+        }
+        Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
+            usage_expr(a, u);
+            usage_expr(b, u);
+        }
+        Expr::Un(_, a) => usage_expr(a, u),
+        Expr::Call(f, args) => {
+            usage_expr(f, u);
+            args.iter().for_each(|a| usage_expr(a, u));
+        }
+        Expr::Array(items) => items.iter().for_each(|i| usage_expr(i, u)),
+        Expr::Map(items) => items.iter().for_each(|(k, v)| {
+            usage_expr(k, u);
+            usage_expr(v, u);
+        }),
+        Expr::If(arms, els) => {
+            for (c, b) in arms {
+                usage_expr(c, u);
+                usage_block(b, u);
+            }
+            if let Some(b) = els {
+                usage_block(b, u);
+            }
+        }
+        Expr::Match(subject, arms) => {
+            usage_expr(subject, u);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    usage_expr(g, u);
+                }
+                usage_block(&a.body, u);
+            }
+        }
+        Expr::Do(b) => usage_block(b, u),
+        _ => {}
+    }
 }
 
 /// Does this block assign to a given frame slot anywhere inside it? A proof
@@ -1326,6 +1561,32 @@ impl Ctx {
                 }
                 out
             }
+            // `t[i] = v` on a table whose index is proven in range
+            Stat::Assign(targets, exprs)
+                if targets.len() == 1 && exprs.len() == 1 && self.is_table_write(&targets[0]) =>
+            {
+                let Expr::Index(obj, key) = &targets[0] else { unreachable!("checked") };
+                let slot = self.table_slot(obj)?;
+                let id = ident(slot);
+                let i = self.expr(key)?;
+                let v = self.expr(&exprs[0])?;
+                if self.proven_in_range(key, slot) {
+                    quote! { unsafe { rua_set(rt, #id, #i, #v, ok) }; }
+                } else if self.writes {
+                    // this code may not bail out part way, so an index it
+                    // cannot vouch for is not compilable
+                    return Err("an unproven index in code that cannot trap".into());
+                } else {
+                    // the write may be out of range — growing the table, or
+                    // landing in the keyed part — which the interpreter has to
+                    // do instead
+                    let trap = self.on_trap.clone();
+                    quote! {
+                        unsafe { rua_set(rt, #id, #i, #v, ok) };
+                        if unsafe { *ok } == 0 { #trap }
+                    }
+                }
+            }
             Stat::Assign(targets, exprs) => {
                 if exprs.len() > targets.len() {
                     return Err("extra values in an assignment".into());
@@ -1361,7 +1622,8 @@ impl Ctx {
                 }
             }
             Stat::Return(exprs) => match exprs.len() {
-                0 => return Err("bare `return` (that is nil, not a number)".into()),
+                // fine in a procedure, which the caller turns back into nil
+                0 => quote! { return 0.0; },
                 1 => {
                     let v = self.expr(&exprs[0])?;
                     quote! { return #v; }
@@ -1741,6 +2003,11 @@ impl Ctx {
     fn fresh_label(&mut self) -> syn::Lifetime {
         self.labels += 1;
         syn::Lifetime::new(&format!("'body{}", self.labels), proc_macro2::Span::call_site())
+    }
+
+    /// Is this an assignment into a table this code holds?
+    fn is_table_write(&self, target: &Expr) -> bool {
+        matches!(target, Expr::Index(obj, _) if self.is_table(obj))
     }
 
     /// Is this expression a local the inference decided holds a table?
