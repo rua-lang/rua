@@ -247,13 +247,13 @@ numbers exclude `rustc`.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| spectral norm | 2.16s | **0.12s** | 0.63s | 0.03s |
-| n-queens | 0.22s | 0.22s | 0.08s | 0.02s |
-| matrix multiply | 0.53s | 0.56s | 0.17s | 0.02s |
-| fannkuch | 0.77s | 0.76s | 0.28s | 0.06s |
-| word frequency | 0.23s | 0.22s | 0.08s | 0.04s |
-| n-body | 1.67s | 1.66s | 0.48s | 0.05s |
-| binary trees | 6.86s | 6.95s | 3.32s | 1.42s |
+| spectral norm | 1.85s | **0.12s** | 0.62s | 0.03s |
+| n-queens | 0.17s | 0.17s | 0.06s | 0.02s |
+| matrix multiply | 0.44s | 0.45s | 0.18s | 0.02s |
+| fannkuch | 0.67s | 0.66s | 0.27s | 0.04s |
+| word frequency | 0.21s | 0.22s | 0.07s | 0.04s |
+| n-body | 1.51s | 1.54s | 0.49s | 0.04s |
+| binary trees | 5.30s | 5.30s | 3.29s | 1.42s |
 
 Read that honestly. **Where the JIT applies it is decisive** — spectral norm is
 5x faster than Lua 5.4 and 20x faster than rua's own interpreter, because its
@@ -272,21 +272,25 @@ What keeps the other six out of the compiler is worth being precise about:
 * **Strings, maps and allocation** — word frequency and binary trees are made of
   exactly the things an f64-only compiler has nothing to say about.
 
-The interpreter's own gap is a steady 2–3x, and it is structural rather than
-anywhere in particular. What is left, in the order a profile shows it:
+The interpreter is 1.6–3.1x slower than Lua 5.4. An audit that prototyped and
+measured each candidate cause — rather than reasoning about them — found that
+most of the obvious suspects are not the problem:
 
-* **Values are 16 bytes and reference counted.** Every register write drops what
-  was there and every read of a heap value bumps a count. Lua's values are the
-  same size but garbage collected, so copying one is a plain move.
-* **Dispatch is a `match`.** That compiles to a jump table with a bounds check
-  per instruction; Lua uses computed goto, which threads one instruction
-  straight into the next.
-* **Calls.** Even after trimming, a call sets up a frame, saves and restores two
-  fields, and pushes a traceback entry — 28% of the binary-trees profile.
+* **Dispatch is not the problem.** The `match` costs 5.3% of cycles at a 0.010%
+  branch-miss rate (Lua's own is 0.024%). Threaded dispatch with computed goto
+  is not worth doing here, and an earlier version of this file said otherwise.
+* **String interning and cached hashes buy nothing** — both were implemented and
+  measured at zero. What string keys actually cost was the owned `Key`
+  temporary and its refcount round trip, which is now gone.
+* **Instruction count is not the problem either.** rua runs about 1.3x Lua's
+  bytecode operations, but 2.4x the machine instructions per operation.
 
-Closing that gap means NaN-boxing the value representation and threading the
-dispatch loop, which is a different interpreter, not a patch to this one. What
-this one does instead is hand the hot numeric parts to `rustc`.
+What is left is the value representation. Every register write drops what was
+there and every read of a heap value bumps a reference count; Lua's values are
+the same 16 bytes but garbage collected, so a copy is a plain move. Removing
+that — a POD value with a tracing GC — measured as a further 1.3x. It is a
+different interpreter, not a patch to this one. What this one does instead is
+hand the hot numeric parts to `rustc`.
 
 ## FFI: calling C
 
