@@ -7,9 +7,10 @@
 set -e
 cd "$(dirname "$0")/.."
 RUA=./target/release/rua
-BENCHES="nbody binarytrees spectralnorm fannkuch queens matmul wordfreq"
+BENCHES="nbody binarytrees spectralnorm fannkuch queens matmul wordfreq lisp"
 SIZE_nbody=200000 SIZE_binarytrees=16 SIZE_spectralnorm=500
 SIZE_fannkuch=9 SIZE_queens=11 SIZE_matmul=200 SIZE_wordfreq=20000
+SIZE_lisp=3
 
 printf '%-14s %10s %10s %10s %10s\n' benchmark rua-interp rua-jit lua5.4 luajit
 for b in $BENCHES; do
@@ -29,9 +30,9 @@ for b in $BENCHES; do
         [ "$body" = "MISSING" ] && continue
         if [ "$(echo "$body" | grep -v '^#')" != "$(echo "$out_i" | grep -v '^#')" ]; then
             echo "MISMATCH in $b: $name disagrees with rua-interp" >&2
-            echo "$out_i" | grep -v '^#' > /tmp/rua-bench-expected.txt
-            echo "$body" | grep -v '^#' > /tmp/rua-bench-got.txt
-            diff /tmp/rua-bench-expected.txt /tmp/rua-bench-got.txt >&2 || true
+            echo "$out_i" | grep -v '^#' > target/bench-expected.txt
+            echo "$body" | grep -v '^#' > target/bench-got.txt
+            diff target/bench-expected.txt target/bench-got.txt >&2 || true
             exit 1
         fi
     done

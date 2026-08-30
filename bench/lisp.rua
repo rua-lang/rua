@@ -1,0 +1,534 @@
+// A Scheme, written in rua: reader, evaluator with proper tail calls, closures
+// and set!, and a workload written in the Scheme it implements. bench/lisp.lua
+// is a line-for-line translation, so both engines run the same program and must
+// print the same bytes.
+//
+// This is the benchmark the numeric ones do not cover: symbol lookup through
+// chained environments, cons-cell allocation, string dispatch on special forms,
+// deep recursion, and closures that outlive their frame.
+
+// ---------------------------------------------------------------- values
+// Tag 0 is a pair, 1 a closure, 2 a primitive, 3 the empty list. Symbols are
+// strings, numbers are numbers, booleans are booleans. Nothing else exists.
+let NIL = #{ t: 3 }
+
+fn cons(a, d) { #{ t: 0, a: a, d: d } }
+
+fn is_pair(x) { type(x) == "table" && x.t == 0 }
+
+// An array of values becomes a list, right to left.
+fn list_from(items, from) {
+    let out = NIL
+    let k = items.len() - 1
+    while k >= from {
+        out = cons(items[k], out)
+        k -= 1
+    }
+    out
+}
+
+// A list becomes an array, which is how closures keep their parameters and
+// bodies: the walk happens once, at closure creation, not at every call.
+fn array_from(list) {
+    let out = []
+    let p = list
+    while is_pair(p) {
+        out.push(p.a)
+        p = p.d
+    }
+    out
+}
+
+fn list_len(list) {
+    let n = 0
+    let p = list
+    while is_pair(p) {
+        n += 1
+        p = p.d
+    }
+    n
+}
+
+// ----------------------------------------------------------- environments
+// A frame is a map from symbol to value plus a link to the enclosing frame.
+// Lookup walks the chain, which is where an interpreter of this shape spends
+// most of its time.
+fn env_new(up) { #{ v: #{}, up: up } }
+
+fn env_get(env, name) {
+    let e = env
+    while e != nil {
+        let hit = e.v[name]
+        if hit != nil { return hit }
+        e = e.up
+    }
+    error("unbound symbol: " + name)
+}
+
+fn env_set(env, name, val) {
+    let e = env
+    while e != nil {
+        if e.v[name] != nil {
+            e.v[name] = val
+            return name
+        }
+        e = e.up
+    }
+    error("set! on unbound symbol: " + name)
+}
+
+// ---------------------------------------------------------------- reader
+fn is_space(c) { c == 32 || c == 9 || c == 10 || c == 13 }
+
+fn tokenize(src) {
+    let toks = []
+    let i = 0
+    let n = src.len()
+    while i < n {
+        let c = src.byte(i)
+        if c == 59 {                                   // ; comment to line end
+            while i < n && src.byte(i) != 10 { i += 1 }
+        } else if is_space(c) {
+            i += 1
+        } else if c == 40 || c == 41 || c == 39 {      // ( ) '
+            toks.push(src.slice(i, i + 1))
+            i += 1
+        } else {
+            let start = i
+            while i < n {
+                let d = src.byte(i)
+                if is_space(d) || d == 40 || d == 41 || d == 59 { break }
+                i += 1
+            }
+            toks.push(src.slice(start, i))
+        }
+    }
+    toks
+}
+
+fn atom(tok) {
+    if tok == "#t" { return true }
+    if tok == "#f" { return false }
+    let c = tok.byte(0)
+    if (c >= 48 && c <= 57) || (c == 45 && tok.len() > 1) {
+        let v = num(tok)
+        if v != nil { return v }
+    }
+    tok
+}
+
+// Returns the datum and the index just past it.
+fn parse_at(toks, i) {
+    if i >= toks.len() { error("unexpected end of input") }
+    let tok = toks[i]
+    if tok == "(" {
+        i += 1
+        let items = []
+        while true {
+            if i >= toks.len() { error("missing )") }
+            if toks[i] == ")" { break }
+            let (v, j) = parse_at(toks, i)
+            items.push(v)
+            i = j
+        }
+        return list_from(items, 0), i + 1
+    }
+    if tok == "'" {
+        let (v, j) = parse_at(toks, i + 1)
+        return cons("quote", cons(v, NIL)), j
+    }
+    if tok == ")" { error("unexpected )") }
+    return atom(tok), i + 1
+}
+
+fn parse_all(src) {
+    let toks = tokenize(src)
+    let forms = []
+    let i = 0
+    while i < toks.len() {
+        let (v, j) = parse_at(toks, i)
+        forms.push(v)
+        i = j
+    }
+    forms
+}
+
+// -------------------------------------------------------------- printing
+fn write_str(x) {
+    let ty = type(x)
+    if ty == "number" { return str(x) }
+    if ty == "string" { return x }
+    if ty == "boolean" { return if x { "#t" } else { "#f" } }
+    if x.t == 3 { return "()" }
+    if x.t == 1 { return "#<procedure " + x.n + ">" }
+    if x.t == 2 { return "#<primitive " + x.n + ">" }
+    let out = "("
+    let p = x
+    let first = true
+    while is_pair(p) {
+        if !first { out += " " }
+        out += write_str(p.a)
+        first = false
+        p = p.d
+    }
+    if p != NIL { out += " . " + write_str(p) }
+    out + ")"
+}
+
+// ------------------------------------------------------------ evaluation
+fn closure(params, body, env, name) {
+    #{ t: 1, p: array_from(params), b: array_from(body), e: env, n: name }
+}
+
+// Scheme truthiness: #f alone is false, and zero is not.
+fn truthy(v) { v != false }
+
+fn eval(x, env) {
+    while true {
+        let tx = type(x)
+        if tx == "string" { return env_get(env, x) }
+        if tx != "table" { return x }                  // numbers, booleans
+        if x.t != 0 { return x }                       // (), closures, prims
+        let op = x.a
+
+        if type(op) == "string" {
+            if op == "quote" { return x.d.a }
+
+            if op == "if" {
+                if truthy(eval(x.d.a, env)) {
+                    x = x.d.d.a
+                } else {
+                    let alt = x.d.d.d
+                    if alt == NIL { return NIL }
+                    x = alt.a
+                }
+                continue
+            }
+
+            if op == "define" {
+                let target = x.d.a
+                if is_pair(target) {                   // (define (f a) body...)
+                    let name = target.a
+                    env.v[name] = closure(target.d, x.d.d, env, name)
+                    return name
+                }
+                env.v[target] = eval(x.d.d.a, env)
+                return target
+            }
+
+            if op == "set!" { return env_set(env, x.d.a, eval(x.d.d.a, env)) }
+
+            if op == "lambda" { return closure(x.d.a, x.d.d, env, "lambda") }
+
+            if op == "begin" {
+                let body = x.d
+                if body == NIL { return NIL }
+                while body.d != NIL {
+                    eval(body.a, env)
+                    body = body.d
+                }
+                x = body.a
+                continue
+            }
+
+            if op == "let" {                           // (let ((a 1)) body...)
+                let inner = env_new(env)
+                let b = x.d.a
+                while is_pair(b) {
+                    inner.v[b.a.a] = eval(b.a.d.a, env)
+                    b = b.d
+                }
+                env = inner
+                x = cons("begin", x.d.d)
+                continue
+            }
+
+            if op == "cond" {
+                let clause = x.d
+                let taken = nil
+                while is_pair(clause) {
+                    let test = clause.a.a
+                    if test == "else" || truthy(eval(test, env)) {
+                        taken = clause.a.d
+                        break
+                    }
+                    clause = clause.d
+                }
+                if taken == nil { return NIL }
+                x = cons("begin", taken)
+                continue
+            }
+
+            if op == "and" {
+                let p = x.d
+                if p == NIL { return true }
+                while p.d != NIL {
+                    if !truthy(eval(p.a, env)) { return false }
+                    p = p.d
+                }
+                x = p.a
+                continue
+            }
+
+            if op == "or" {
+                let p = x.d
+                if p == NIL { return false }
+                while p.d != NIL {
+                    let v = eval(p.a, env)
+                    if truthy(v) { return v }
+                    p = p.d
+                }
+                x = p.a
+                continue
+            }
+        }
+
+        // application
+        let f = eval(op, env)
+        let args = []
+        let p = x.d
+        while p != NIL {
+            args.push(eval(p.a, env))
+            p = p.d
+        }
+
+        if type(f) != "table" { error("not a procedure: " + write_str(f)) }
+        if f.t == 2 {
+            let prim = f.f
+            return prim(args)
+        }
+        if f.t != 1 { error("not a procedure: " + write_str(f)) }
+
+        // a call in tail position reuses this loop rather than the host stack
+        let inner = env_new(f.e)
+        let names = f.p
+        let k = 0
+        while k < names.len() {
+            inner.v[names[k]] = args[k]
+            k += 1
+        }
+        let body = f.b
+        let last = body.len() - 1
+        let j = 0
+        while j < last {
+            eval(body[j], inner)
+            j += 1
+        }
+        env = inner
+        x = body[last]
+    }
+}
+
+// ------------------------------------------------------------ primitives
+fn prim(env, name, f) { env.v[name] = #{ t: 2, n: name, f: f } }
+
+fn install(env) {
+    prim(env, "+", |a| {
+        let s = 0
+        for k in 0..a.len() { s += a[k] }
+        s
+    })
+    prim(env, "-", |a| {
+        if a.len() == 1 { return 0 - a[0] }
+        let s = a[0]
+        for k in 1..a.len() { s -= a[k] }
+        s
+    })
+    prim(env, "*", |a| {
+        let s = 1
+        for k in 0..a.len() { s *= a[k] }
+        s
+    })
+    prim(env, "quotient", |a| { let q = a[0] / a[1]; if q < 0 { 0 - math::floor(0 - q) } else { math::floor(q) } })
+    prim(env, "remainder", |a| { a[0] - a[1] * (if a[0] / a[1] < 0 { 0 - math::floor(0 - a[0] / a[1]) } else { math::floor(a[0] / a[1]) }) })
+    prim(env, "modulo", |a| { a[0] % a[1] })
+    prim(env, "=", |a| { a[0] == a[1] })
+    prim(env, "<", |a| { a[0] < a[1] })
+    prim(env, ">", |a| { a[0] > a[1] })
+    prim(env, "<=", |a| { a[0] <= a[1] })
+    prim(env, ">=", |a| { a[0] >= a[1] })
+    prim(env, "abs", |a| { if a[0] < 0 { 0 - a[0] } else { a[0] } })
+    prim(env, "min", |a| { if a[0] < a[1] { a[0] } else { a[1] } })
+    prim(env, "max", |a| { if a[0] > a[1] { a[0] } else { a[1] } })
+    prim(env, "cons", |a| { cons(a[0], a[1]) })
+    prim(env, "car", |a| { a[0].a })
+    prim(env, "cdr", |a| { a[0].d })
+    prim(env, "list", |a| { list_from(a, 0) })
+    prim(env, "length", |a| { list_len(a[0]) })
+    prim(env, "null?", |a| { a[0] == NIL })
+    prim(env, "pair?", |a| { is_pair(a[0]) })
+    prim(env, "number?", |a| { type(a[0]) == "number" })
+    prim(env, "symbol?", |a| { type(a[0]) == "string" })
+    prim(env, "procedure?", |a| { type(a[0]) == "table" && (a[0].t == 1 || a[0].t == 2) })
+    prim(env, "not", |a| { a[0] == false })
+    prim(env, "eq?", |a| { a[0] == a[1] })
+    prim(env, "reverse", |a| {
+        let out = NIL
+        let p = a[0]
+        while is_pair(p) {
+            out = cons(p.a, out)
+            p = p.d
+        }
+        out
+    })
+    prim(env, "append", |a| {
+        let items = []
+        let p = a[0]
+        while is_pair(p) {
+            items.push(p.a)
+            p = p.d
+        }
+        let out = a[1]
+        let k = items.len() - 1
+        while k >= 0 {
+            out = cons(items[k], out)
+            k -= 1
+        }
+        out
+    })
+    prim(env, "list-ref", |a| {
+        let p = a[0]
+        let k = a[1]
+        while k > 0 {
+            p = p.d
+            k -= 1
+        }
+        p.a
+    })
+    prim(env, "write", |a| { print(write_str(a[0])); a[0] })
+}
+
+// ---------------------------------------------------------- the workload
+// Scheme source, held as lines so that both files can carry it verbatim.
+fn program() {
+    let lines = [
+        "(define (tak x y z)",
+        "  (if (not (< y x)) z",
+        "      (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y))))",
+        "",
+        "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))",
+        "",
+        "; tail recursive, so the evaluator must not grow the host stack",
+        "(define (sum-to i n acc) (if (> i n) acc (sum-to (+ i 1) n (+ acc i))))",
+        "",
+        "(define (iota-loop i n acc) (if (= i n) (reverse acc) (iota-loop (+ i 1) n (cons i acc))))",
+        "(define (iota n) (iota-loop 0 n '()))",
+        "",
+        "(define (map1 f xs) (if (null? xs) '() (cons (f (car xs)) (map1 f (cdr xs)))))",
+        "(define (filter1 p xs)",
+        "  (cond ((null? xs) '())",
+        "        ((p (car xs)) (cons (car xs) (filter1 p (cdr xs))))",
+        "        (else (filter1 p (cdr xs)))))",
+        "(define (fold f init xs) (if (null? xs) init (fold f (f init (car xs)) (cdr xs))))",
+        "",
+        "; a small congruential generator: every product stays exact in a double",
+        "(define (next-rand s) (remainder (+ (* s 75) 74) 65537))",
+        "(define (rand-loop s n acc)",
+        "  (if (= n 0) acc (rand-loop (next-rand s) (- n 1) (cons (remainder s 1000) acc))))",
+        "(define (rand-list n seed) (rand-loop seed n '()))",
+        "",
+        "; merge sort, both halves built with an accumulator so recursion stays shallow",
+        "(define (split-loop xs n left)",
+        "  (if (= n 0) (cons (reverse left) xs)",
+        "      (split-loop (cdr xs) (- n 1) (cons (car xs) left))))",
+        "(define (merge-loop a b acc)",
+        "  (cond ((null? a) (append (reverse acc) b))",
+        "        ((null? b) (append (reverse acc) a))",
+        "        ((< (car a) (car b)) (merge-loop (cdr a) b (cons (car a) acc)))",
+        "        (else (merge-loop a (cdr b) (cons (car b) acc)))))",
+        "(define (msort xs)",
+        "  (let ((n (length xs)))",
+        "    (if (< n 2) xs",
+        "        (let ((halves (split-loop xs (quotient n 2) '())))",
+        "          (merge-loop (msort (car halves)) (msort (cdr halves)) '())))))",
+        "",
+        "(define (sorted? xs)",
+        "  (cond ((null? xs) #t)",
+        "        ((null? (cdr xs)) #t)",
+        "        ((> (car xs) (car (cdr xs))) #f)",
+        "        (else (sorted? (cdr xs)))))",
+        "",
+        "; closures over a mutable cell",
+        "(define (make-counter start)",
+        "  (lambda (by) (set! start (+ start by)) start))",
+        "(define (drive-counter c n acc)",
+        "  (if (= n 0) acc (drive-counter c (- n 1) (c n))))",
+        "",
+        "; association lists, keyed by symbol",
+        "(define (make-alist n acc)",
+        "  (if (= n 0) acc (make-alist (- n 1) (cons (cons (list n) n) acc))))",
+        "(define (assoc-num k al)",
+        "  (cond ((null? al) -1)",
+        "        ((= (car (car (car al))) k) (cdr (car al)))",
+        "        (else (assoc-num k (cdr al)))))",
+        "(define (probe-loop al i n acc)",
+        "  (if (> i n) acc (probe-loop al (+ i 1) n (+ acc (assoc-num (remainder i 40) al)))))",
+        "",
+        "; eight queens, over lists",
+        "(define (safe? col dist placed)",
+        "  (cond ((null? placed) #t)",
+        "        ((= (car placed) col) #f)",
+        "        ((= (abs (- (car placed) col)) dist) #f)",
+        "        (else (safe? col (+ dist 1) (cdr placed)))))",
+        "(define (try-col col n placed count)",
+        "  (if (> col n) count",
+        "      (try-col (+ col 1) n placed",
+        "               (if (safe? col 1 placed)",
+        "                   (+ count (queens-from (cons col placed) n))",
+        "                   count))))",
+        "(define (queens-from placed n)",
+        "  (if (= (length placed) n) 1 (try-col 1 n placed 0)))",
+        "(define (queens n) (queens-from '() n))",
+        "",
+        "; the Y combinator, because a closure test should include the hard one",
+        "(define Y",
+        "  (lambda (f)",
+        "    ((lambda (x) (f (lambda (v) ((x x) v))))",
+        "     (lambda (x) (f (lambda (v) ((x x) v)))))))",
+        "(define fact",
+        "  (Y (lambda (self) (lambda (n) (if (= n 0) 1 (* n (self (- n 1))))))))",
+        "",
+        "(define (main)",
+        "  (let ((nums (rand-list 240 7)))",
+        "    (let ((sorted (msort nums)))",
+        "      (list",
+        "        (tak 18 12 6)",
+        "        (fib 19)",
+        "        (sum-to 1 20000 0)",
+        "        (fold (lambda (a b) (+ a b)) 0 (map1 (lambda (x) (* x x)) (iota 120)))",
+        "        (length (filter1 (lambda (x) (= (remainder x 3) 0)) (iota 120)))",
+        "        (sorted? sorted)",
+        "        (list-ref sorted 0)",
+        "        (list-ref sorted 239)",
+        "        (fold (lambda (a b) (+ a b)) 0 sorted)",
+        "        (drive-counter (make-counter 0) 400 0)",
+        "        (probe-loop (make-alist 40 '()) 1 300 0)",
+        "        (queens 6)",
+        "        (fact 12)",
+        "        (length (append (iota 100) (reverse (iota 100))))))))",
+        "",
+    ]
+    lines.join("\n")
+}
+
+// ------------------------------------------------------------------ main
+let reps = if arg.len() > 0 { num(arg[0]) } else { 8 }
+let t = os::clock()
+
+let genv = env_new(nil)
+install(genv)
+let forms = parse_all(program())
+for k in 0..forms.len() { eval(forms[k], genv) }
+
+let call = parse_at(tokenize("(main)"), 0)
+let result = NIL
+for r in 0..reps { result = eval(call, genv) }
+
+let p = result
+let i = 0
+while is_pair(p) {
+    print("{i}: {write_str(p.a)}")
+    p = p.d
+    i += 1
+}
+print("# lisp reps={reps} in {os::clock() - t:.3}s")
