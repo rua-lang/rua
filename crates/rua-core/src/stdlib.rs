@@ -50,7 +50,7 @@ fn table_arg(args: &[Value], i: usize) -> Res<Rc<RefCell<Table>>> {
 }
 
 fn one(v: Value) -> Res<Vec<Value>> {
-    Ok(vec![v])
+    crate::interp::one_value(v)
 }
 
 fn module(vm: &mut Vm, name: &str, entries: Vec<(&str, Value)>) -> Rc<RefCell<Table>> {

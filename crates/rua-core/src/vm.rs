@@ -685,14 +685,17 @@ impl Vm {
         if let Value::Native(n) = callee {
             let n = n.clone();
             let start = self.base + base as usize + 1;
-            let vals = {
-                // SAFETY-free borrow dance: the native gets a snapshot of the
-                // argument window, and natives never resize the register stack
-                // out from under themselves (they call back through `call`,
-                // which pushes a new frame above `top`).
-                let args = self.stack[start..start + nargs as usize].to_vec();
-                (n.f)(self, &args)?
-            };
+            // The native gets the argument window as a slice. The vector
+            // comes from the pool and goes back to it, so an ordinary builtin
+            // call allocates nothing at all: the values are moved out of the
+            // registers, which the compiler has finished with.
+            let mut args = self.take_vec(nargs as usize);
+            for i in 0..nargs as usize {
+                args.push(std::mem::take(&mut self.stack[start + i]));
+            }
+            let out = (n.f)(self, &args);
+            self.recycle_vec(args);
+            let vals = out?;
             self.place(base, nres, vals);
             return Ok(());
         }

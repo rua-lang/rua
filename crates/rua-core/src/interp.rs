@@ -121,7 +121,6 @@ pub struct Vm {
     /// starts. `stack.len()` is the high-water mark, not the top.
     pub(crate) top: usize,
     /// Argument vectors, recycled: a call per node adds up fast.
-    pool: Vec<Vec<Value>>,
     /// The values of the last call that produced "as many as there are".
     multi: Vec<Value>,
     /// Where the last multi-value call left its results, when they are still
@@ -195,7 +194,6 @@ impl Vm {
             stack: Vec::with_capacity(256),
             base: 0,
             top: 0,
-            pool: Vec::new(),
             multi: Vec::new(),
             multi_at: None,
             line: 0,
@@ -725,11 +723,8 @@ impl Vm {
     }
 
     /// Hand a finished vector back for reuse.
-    pub(crate) fn recycle_vec(&mut self, mut v: Vec<Value>) {
-        if self.pool.len() < 32 {
-            v.clear();
-            self.pool.push(v);
-        }
+    pub(crate) fn recycle_vec(&mut self, v: Vec<Value>) {
+        recycle_vec(v)
     }
 
     /// Take the values of the last multi-value call, as a vector. Results
@@ -818,13 +813,7 @@ impl Vm {
     }
 
     pub(crate) fn take_vec(&mut self, cap: usize) -> Vec<Value> {
-        match self.pool.pop() {
-            Some(mut v) => {
-                v.reserve(cap);
-                v
-            }
-            None => Vec::with_capacity(cap),
-        }
+        take_vec(cap)
     }
 
     /// `a[k]` and `a::k`: a plain lookup, no method fallback.
@@ -1271,4 +1260,44 @@ fn write_proto(out: &mut String, proto: &crate::bytecode::Proto) {
     for p in &proto.protos {
         write_proto(out, p);
     }
+}
+
+thread_local! {
+    /// Argument and result vectors, kept rather than freed.
+    ///
+    /// Calling a builtin used to allocate twice — once for a copy of the
+    /// argument registers, once for the results — and free both again, at
+    /// every call. The standard library builds its results with `one`, which
+    /// has no VM to hand, so the pool lives beside the interpreter rather than
+    /// inside it and both sides can reach it.
+    static VEC_POOL: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn take_vec(cap: usize) -> Vec<Value> {
+    VEC_POOL
+        .try_with(|p| match p.borrow_mut().pop() {
+            Some(mut v) => {
+                v.reserve(cap);
+                v
+            }
+            None => Vec::with_capacity(cap),
+        })
+        .unwrap_or_else(|_| Vec::with_capacity(cap))
+}
+
+pub fn recycle_vec(mut v: Vec<Value>) {
+    let _ = VEC_POOL.try_with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < 32 {
+            v.clear();
+            pool.push(v);
+        }
+    });
+}
+
+/// One value, in a vector from the pool: what most builtins return.
+pub fn one_value(v: Value) -> Res<Vec<Value>> {
+    let mut out = take_vec(1);
+    out.push(v);
+    Ok(out)
 }
