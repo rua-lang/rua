@@ -728,11 +728,22 @@ impl FnCompiler {
                 self.emit(Op::NewTable { dst }, 0);
                 let mark = self.mark();
                 for (k, v) in items {
-                    let kr = self.alloc();
-                    self.expr(k, kr);
-                    let vr = self.alloc();
-                    self.expr(v, vr);
-                    self.emit(Op::SetIndex { obj: dst, key: kr, val: vr }, 0);
+                    // `#{ a: 1 }` has a literal key, which the store takes
+                    // directly rather than through a register
+                    match self.const_key(k) {
+                        Some(key) => {
+                            let vr = self.alloc();
+                            self.expr(v, vr);
+                            self.emit(Op::SetIndexK { obj: dst, k: key, val: vr }, 0);
+                        }
+                        None => {
+                            let kr = self.alloc();
+                            self.expr(k, kr);
+                            let vr = self.alloc();
+                            self.expr(v, vr);
+                            self.emit(Op::SetIndex { obj: dst, key: kr, val: vr }, 0);
+                        }
+                    }
                     self.release(mark);
                 }
             }

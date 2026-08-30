@@ -307,9 +307,7 @@ impl Vm {
                     let key = &proto.consts[k as usize];
                     let fast = match (self.at_reg(obj), key) {
                         (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
-                        (Value::Table(t), Value::Str(s)) => {
-                            Some(t.borrow().get(&Key::Str(s.clone())))
-                        }
+                        (Value::Table(t), Value::Str(s)) => t.borrow().get_field(s),
                         _ => None,
                     };
                     let v = match fast {

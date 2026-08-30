@@ -757,10 +757,12 @@ impl Vm {
     /// `a.m(..)`: the receiver's own field first, then its type's library —
     /// this is what makes `[3,1,2].sort()` and `"ab".upper()` work.
     pub(crate) fn method(&mut self, o: &Value, name: &RStr) -> Res<Value> {
-        let key = Key::Str(name.clone());
         let kind = match o {
             Value::Table(t) => {
-                let own = t.borrow().get(&key);
+                let own = match t.borrow().get_field(name) {
+                    Some(v) => v,
+                    None => t.borrow().get(&Key::Str(name.clone())),
+                };
                 if !matches!(own, Value::Nil) {
                     return Ok(own);
                 }
@@ -772,6 +774,7 @@ impl Vm {
                 return err(format!("a {} value has no method `{name}`", other.type_name()))
             }
         };
+        let key = Key::Str(name.clone());
         match self.lib_member(kind, &key) {
             Value::Nil => err(format!("no method `{name}` on a {} value", o.type_name())),
             v => Ok(v),

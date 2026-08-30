@@ -452,6 +452,49 @@ impl Table {
         }
     }
 
+    /// Read `t.field` without building an owned `Key` first.
+    ///
+    /// The obvious `get(&Key::Str(name.clone()))` costs a refcount round trip
+    /// and a 32-byte temporary with a destructor, on an operation that is
+    /// otherwise a pointer comparison. Object-shaped tables are small, so the
+    /// scan is short; a table big enough to have built an index falls back.
+    #[inline]
+    pub fn get_field(&self, name: &RStr) -> Option<Value> {
+        if self.index.is_some() {
+            return None;
+        }
+        for (k, v) in &self.pairs {
+            if let Key::Str(ks) = k {
+                if ks.same(name) || **ks == **name {
+                    return Some(v.clone());
+                }
+            }
+        }
+        Some(Value::Nil)
+    }
+
+    /// Write `t.field = v` in the same way. Returns whether it happened; a nil
+    /// value goes the long way round, since removing an entry moves the rest.
+    #[inline]
+    pub fn set_field(&mut self, name: &RStr, v: &Value) -> bool {
+        if self.index.is_some() || matches!(v, Value::Nil) {
+            return false;
+        }
+        for (k, slot) in &mut self.pairs {
+            if let Key::Str(ks) = k {
+                if ks.same(name) || **ks == **name {
+                    *slot = v.clone();
+                    return true;
+                }
+            }
+        }
+        self.pairs.push((Key::Str(name.clone()), v.clone()));
+        if self.pairs.len() > INDEX_THRESHOLD {
+            self.reindex();
+        }
+        true
+    }
+
     /// Where `k` lives in `pairs`, by index or by scan.
     #[inline]
     fn find(&self, k: &Key) -> Option<usize> {
