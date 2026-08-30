@@ -96,7 +96,7 @@ impl Vm {
         self.base = self.open_frame(proto.n_regs);
         for (i, p) in proto.params.iter().enumerate() {
             let v = if (i as u16) < nargs {
-                self.stack[arg_start + i].clone()
+                std::mem::take(&mut self.stack[arg_start + i])
             } else {
                 Value::Nil
             };
@@ -455,11 +455,9 @@ impl Vm {
                 }
                 Op::CallSpread { base, nargs, nres, method } => {
                     self.set_line(proto.lines[pc - 1]);
-                    // fixed arguments, then everything the last call produced
-                    let mut args = self.take_args(base + 1, nargs);
-                    let extra = self.take_multi();
-                    args.extend(extra.iter().cloned());
-                    self.recycle_vec(extra);
+                    // The callee is found first: for a method call the
+                    // receiver is also the first argument, and collecting the
+                    // arguments moves it out of its register.
                     let callee = if method == u16::MAX {
                         get!(base)
                     } else {
@@ -470,6 +468,11 @@ impl Vm {
                         };
                         self.method(&recv, &name).map_err(|e| self.at(proto, pc, e))?
                     };
+                    // fixed arguments, then everything the last call produced
+                    let mut args = self.take_args(base + 1, nargs);
+                    let extra = self.take_multi();
+                    args.extend(extra.iter().cloned());
+                    self.recycle_vec(extra);
                     let vals =
                         self.call_value(&callee, args).map_err(|e| self.here(proto, pc, e))?;
                     self.place(base, nres, vals);
@@ -750,7 +753,7 @@ impl Vm {
         let base = self.open_frame(callee_regs);
         for (i, p) in f.proto.params.iter().enumerate() {
             let v = if (i as u16) < nargs {
-                self.stack[arg_start + i].clone()
+                std::mem::take(&mut self.stack[arg_start + i])
             } else {
                 Value::Nil
             };
@@ -820,12 +823,17 @@ impl Vm {
         (fr.caller, fr.pc)
     }
 
-    /// Copy `n` registers out into a fresh (pooled) vector.
+    /// Move `n` registers out into a fresh (pooled) vector.
+    ///
+    /// The compiler always builds an argument list in fresh temporaries above
+    /// every live local, and never reads them again, so the values can be moved
+    /// rather than cloned: no reference count goes up here and none comes back
+    /// down when the frame closes.
     fn take_args(&mut self, base: Reg, n: u16) -> Vec<Value> {
         let mut out = self.take_vec(n as usize);
         let start = self.base + base as usize;
         for i in 0..n as usize {
-            out.push(self.stack[start + i].clone());
+            out.push(std::mem::take(&mut self.stack[start + i]));
         }
         out
     }

@@ -1040,3 +1040,33 @@ fn an_error_unwinds_every_suspended_call() {
     }
     assert_eq!(vm.eval("sum(10)").unwrap()[0], Value::Num(45.0));
 }
+
+/// A method call whose argument spreads another call's results reads its
+/// receiver from the same register the argument list is collected from. When
+/// arguments started being moved rather than cloned, that emptied the receiver
+/// before it was read — and every test here still passed, because none of them
+/// wrote `t.push(f())` where `f` returns more than one value.
+#[test]
+fn method_call_spreading_a_call_keeps_its_receiver() {
+    assert_eq!(
+        s(r#"
+        fn two() { return "a", "b" }
+        let t = []
+        t.push(two())
+        t.push(two())
+        t.join(",")
+        "#),
+        "a,b,a,b"
+    );
+    // the receiver as a local, with the spread argument built from it
+    assert_eq!(
+        n(r#"
+        fn parts(s) { return s, s }
+        let t = []
+        let word = "x"
+        t.push(parts(word))
+        t.len()
+        "#),
+        2.0
+    );
+}
