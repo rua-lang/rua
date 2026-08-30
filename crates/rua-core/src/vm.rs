@@ -33,7 +33,6 @@ pub(crate) struct CallFrame {
     line: u32,
     /// How many results the caller wants.
     nres: u16,
-    upvals: Rc<Vec<CellRef>>,
 }
 
 impl Vm {
@@ -43,7 +42,6 @@ impl Vm {
         // refcount round trip per call is visible in a profile
         let proto = &func.proto;
         let saved_base = self.base;
-        let saved_upvals = std::mem::replace(&mut self.upvals, func.upvals.clone());
         self.base = self.open_frame(proto.n_regs);
 
         let mut args = args;
@@ -76,7 +74,6 @@ impl Vm {
 
         self.close_frame(self.base);
         self.base = saved_base;
-        self.upvals = saved_upvals;
         result
     }
 
@@ -93,7 +90,6 @@ impl Vm {
     ) -> Eval<()> {
         let proto = &func.proto;
         let saved_base = self.base;
-        let saved_upvals = std::mem::replace(&mut self.upvals, func.upvals.clone());
         self.base = self.open_frame(proto.n_regs);
         for (i, p) in proto.params.iter().enumerate() {
             let v = if (i as u16) < nargs {
@@ -164,7 +160,6 @@ impl Vm {
 
         self.close_frame(self.base);
         self.base = saved_base;
-        self.upvals = saved_upvals;
         copied.map(|_| ())
     }
 
@@ -187,7 +182,6 @@ impl Vm {
             while let Some(fr) = frames.pop() {
                 self.close_frame(self.base);
                 self.base = fr.base as usize;
-                self.upvals = fr.upvals;
                 self.leave_depth();
                 self.pop_frame();
             }
@@ -277,12 +271,12 @@ impl Vm {
                     self.store_global(slot, v);
                 }
                 Op::GetUpval { dst, idx } => {
-                    let v = self.upvals[idx as usize].borrow().clone();
+                    let v = current.upvals[idx as usize].borrow().clone();
                     set!(dst, v);
                 }
                 Op::SetUpval { idx, src } => {
                     let v = get!(src);
-                    *self.upvals[idx as usize].borrow_mut() = v;
+                    *current.upvals[idx as usize].borrow_mut() = v;
                 }
                 Op::GetCell { dst, slot } => {
                     let v = match at!(slot) {
@@ -600,7 +594,7 @@ impl Vm {
                 }
                 Op::Closure { dst, proto: idx } => {
                     let child = proto.protos[idx as usize].clone();
-                    let v = self.make_closure(child);
+                    let v = self.make_closure(child, &current.upvals);
                     set!(dst, v);
                 }
                 Op::Range { dst, a, b, inclusive } => {
@@ -738,7 +732,12 @@ impl Vm {
         let arg_start = self.base + base as usize + 1;
         let ret_to = self.base + base as usize;
         self.enter_depth()?;
-        if self.try_compiled_call(f, arg_start, nargs, ret_to, nres) {
+        // A function the JIT has refused is the common case — every function
+        // that is not numeric, and every function at all when the JIT is off —
+        // and asking about it is a flag read, not a call.
+        if f.jit_state.get() != JitState::Blocked
+            && self.try_compiled_call(f, arg_start, nargs, ret_to, nres)
+        {
             self.leave_depth();
             return Ok(false);
         }
@@ -749,7 +748,6 @@ impl Vm {
             ret_to: ret_to as u32,
             line: self.line,
             nres,
-            upvals: std::mem::replace(&mut self.upvals, f.upvals.clone()),
         });
         self.push_frame(Rc::as_ptr(&f.proto), self.line);
         let base = self.open_frame(f.proto.n_regs);
@@ -858,7 +856,6 @@ impl Vm {
         self.return_values(base, n, fr.ret_to as usize, fr.nres);
         self.close_frame(self.base);
         self.base = fr.base as usize;
-        self.upvals = fr.upvals;
         self.leave_depth();
         self.pop_frame();
         self.line = fr.line;
@@ -938,5 +935,14 @@ fn num_op(kind: BinKind, x: f64, y: f64) -> Value {
         BinKind::Le => Value::Bool(x <= y),
         BinKind::Gt => Value::Bool(x > y),
         BinKind::Ge => Value::Bool(x >= y),
+    }
+}
+
+#[cfg(test)]
+mod frame_size {
+    #[test]
+    fn call_frame_is_small() {
+        // The record is built and copied on every call; keep an eye on it.
+        assert_eq!(std::mem::size_of::<super::CallFrame>(), 32);
     }
 }

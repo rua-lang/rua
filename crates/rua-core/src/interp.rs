@@ -158,7 +158,6 @@ pub struct Vm {
     loops: HashMap<u32, LoopEntry>,
     /// `string`, `math` and `table`, kept to hand for method dispatch.
     libs: [Option<Rc<RefCell<Table>>>; 3],
-    pub(crate) upvals: Rc<Vec<CellRef>>,
     /// Call depth, shared with compiled code through [`RtCtx`] so that native
     /// recursion is bounded by the same limit. Boxed because compiled code
     /// holds its address and the VM itself may move.
@@ -208,7 +207,6 @@ impl Vm {
             retired_ctx: Vec::new(),
             loops: HashMap::new(),
             libs: [None, None, None],
-            upvals: Rc::new(Vec::new()),
             depth: Rc::new(std::cell::Cell::new(0)),
         }
     }
@@ -639,6 +637,7 @@ impl Vm {
         self.frames.pop();
     }
 
+    #[inline]
     pub(crate) fn enter_depth(&mut self) -> Eval<bool> {
         let d = self.depth.get() + 1;
         self.depth.set(d);
@@ -649,6 +648,7 @@ impl Vm {
         Ok(true)
     }
 
+    #[inline]
     pub(crate) fn leave_depth(&mut self) {
         self.depth.set(self.depth.get() - 1);
     }
@@ -790,7 +790,11 @@ impl Vm {
 
     /// Build a closure over the current frame: captured locals are shared
     /// through their cells, and upvalues are passed straight down.
-    pub(crate) fn make_closure(&mut self, proto: Rc<crate::bytecode::Proto>) -> Value {
+    pub(crate) fn make_closure(
+        &mut self,
+        proto: Rc<crate::bytecode::Proto>,
+        upvals: &[CellRef],
+    ) -> Value {
         let mut cells = Vec::with_capacity(proto.def.upvals.len());
         for src in &proto.def.upvals {
             cells.push(match src {
@@ -798,7 +802,7 @@ impl Vm {
                     Value::Cell(c) => c.clone(),
                     other => Rc::new(RefCell::new(other.clone())),
                 },
-                UpvalSrc::ParentUpval(i) => self.upvals[*i as usize].clone(),
+                UpvalSrc::ParentUpval(i) => upvals[*i as usize].clone(),
             });
         }
         Value::Func(Rc::new(Function {
