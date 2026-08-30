@@ -65,7 +65,7 @@ impl Vm {
                 let mut vals = self.take_vec(n as usize);
                 let start = self.base + rbase as usize;
                 for i in 0..n as usize {
-                    vals.push(self.stack[start + i].clone());
+                    vals.push(std::mem::take(&mut self.stack[start + i]));
                 }
                 Ok(vals)
             }
@@ -853,7 +853,7 @@ impl Vm {
             }
             want => {
                 for i in 0..want as usize {
-                    let v = vals.get(i).cloned().unwrap_or(Value::Nil);
+                    let v = vals.get_mut(i).map(std::mem::take).unwrap_or(Value::Nil);
                     Value::put(&mut self.stack[ret_to + i], v);
                 }
                 vals.clear();
@@ -900,9 +900,14 @@ impl Vm {
                 self.set_multi(vals);
             }
             n => {
-                for i in 0..n {
-                    let v = vals.get(i as usize).cloned().unwrap_or(Value::Nil);
-                    self.set_reg(base + i, v);
+                // the results are on their way to the pool, so they are moved
+                // out rather than copied: a builtin returning a string or a
+                // table should not touch its reference count twice on the way
+                // to the register it was asked for
+                let mut vals = vals;
+                for i in 0..n as usize {
+                    let v = vals.get_mut(i).map(std::mem::take).unwrap_or(Value::Nil);
+                    self.set_reg(base + i as u16, v);
                 }
                 self.recycle_vec(vals);
             }
