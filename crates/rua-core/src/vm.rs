@@ -167,23 +167,6 @@ impl Vm {
         copied.map(|_| ())
     }
 
-    /// Read a register.
-    ///
-    /// The compiler sizes every frame to `Proto::n_regs` and never emits a
-    /// register outside it, so the index is in bounds by construction — and
-    /// checking it again on every operand costs about 8% of the interpreter.
-    #[inline]
-    fn reg(&self, r: Reg) -> Value {
-        self.at_reg(r).clone()
-    }
-
-    #[inline]
-    fn at_reg(&self, r: Reg) -> &Value {
-        debug_assert!((self.base + r as usize) < self.stack.len());
-        // SAFETY: see above — the compiler guarantees the index.
-        unsafe { self.stack.get_unchecked(self.base + r as usize) }
-    }
-
     #[inline]
     fn set_reg(&mut self, r: Reg, v: Value) {
         debug_assert!((self.base + r as usize) < self.stack.len());
@@ -221,57 +204,105 @@ impl Vm {
         // reference; it is refreshed whenever `current` changes.
         let mut proto: &Proto = unsafe { &*Rc::as_ptr(&current.proto) };
         let mut pc = 0usize;
+
+        // The registers of the running frame, and the running function's code,
+        // as raw pointers.
+        //
+        // Reading a register through `self.stack[self.base + r]` looks free and
+        // is not: `self` is behind a mutable reference that every handler may
+        // write through, so the compiler must reload the vector's pointer and
+        // the frame's base from memory at every single operand -- three loads
+        // and a bounds check to reach two words that did not move. Holding them
+        // here costs one refresh per call and return, which is where they
+        // actually change.
+        //
+        // The invariant is checked on every instruction in a debug build, so a
+        // handler that grows the stack or switches frames without saying so
+        // fails the test suite rather than reading freed memory.
+        let mut regs: *mut Value = unsafe { self.stack.as_mut_ptr().add(self.base) };
+        let mut code: *const Op = proto.code.as_ptr();
+        macro_rules! resync {
+            () => {{
+                regs = unsafe { self.stack.as_mut_ptr().add(self.base) };
+                code = proto.code.as_ptr();
+            }};
+        }
+        macro_rules! at {
+            ($r:expr) => {
+                // SAFETY: the compiler sizes every frame to `n_regs` and never
+                // emits a register outside it
+                unsafe { &*regs.add($r as usize) }
+            };
+        }
+        macro_rules! get {
+            ($r:expr) => {
+                at!($r).clone()
+            };
+        }
+        macro_rules! set {
+            ($r:expr, $v:expr) => {{
+                let v = $v;
+                unsafe { Value::put(&mut *regs.add($r as usize), v) }
+            }};
+        }
         loop {
-            let op = proto.code[pc];
+            debug_assert_eq!(regs, unsafe {
+                self.stack.as_mut_ptr().add(self.base)
+            });
+            debug_assert_eq!(code, proto.code.as_ptr());
+            debug_assert!(pc < proto.code.len());
+            // SAFETY: `pc` only ever moves to a jump target the compiler
+            // emitted, and every path out of the code ends in `Ret`
+            let op = unsafe { *code.add(pc) };
             pc += 1;
             match op {
                 Op::Const { dst, k } => {
                     let v = proto.consts[k as usize].clone();
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
-                Op::Nil { dst } => self.set_reg(dst, Value::Nil),
+                Op::Nil { dst } => set!(dst, Value::Nil),
                 Op::Move { dst, src } => {
-                    let v = self.reg(src);
-                    self.set_reg(dst, v);
+                    let v = get!(src);
+                    set!(dst, v);
                 }
                 Op::GetGlobal { dst, g } => {
                     let slot = self.global_ref(proto, g);
                     let v = self.global_at(slot);
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::SetGlobal { g, src } => {
                     let slot = self.global_ref(proto, g);
-                    let v = self.reg(src);
+                    let v = get!(src);
                     self.store_global(slot, v);
                 }
                 Op::GetUpval { dst, idx } => {
                     let v = self.upvals[idx as usize].borrow().clone();
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::SetUpval { idx, src } => {
-                    let v = self.reg(src);
+                    let v = get!(src);
                     *self.upvals[idx as usize].borrow_mut() = v;
                 }
                 Op::GetCell { dst, slot } => {
-                    let v = match &self.stack[self.base + slot as usize] {
+                    let v = match at!(slot) {
                         Value::Cell(c) => c.borrow().clone(),
                         other => other.clone(),
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::SetCell { slot, src } => {
-                    let v = self.reg(src);
-                    match &self.stack[self.base + slot as usize] {
+                    let v = get!(src);
+                    match at!(slot) {
                         Value::Cell(c) => *c.borrow_mut() = v,
-                        _ => self.set_reg(slot, Value::Cell(Rc::new(RefCell::new(v)))),
+                        _ => set!(slot, Value::Cell(Rc::new(RefCell::new(v)))),
                     }
                 }
                 Op::NewCell { slot, src } => {
-                    let v = self.reg(src);
-                    self.set_reg(slot, Value::Cell(Rc::new(RefCell::new(v))));
+                    let v = get!(src);
+                    set!(slot, Value::Cell(Rc::new(RefCell::new(v))));
                 }
                 Op::Bin { kind, dst, a, b } => {
-                    let (x, y) = (self.at_reg(a), self.at_reg(b));
+                    let (x, y) = (at!(a), at!(b));
                     // the overwhelmingly common case, kept off the generic path
                     let v = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_op(kind, *x, *y)
@@ -279,10 +310,10 @@ impl Vm {
                         let (x, y) = (x.clone(), y.clone());
                         arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::BinK { kind, dst, a, k } => {
-                    let x = self.at_reg(a);
+                    let x = at!(a);
                     let v = match (x, &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => num_op(kind, *x, *y),
                         (x, y) => {
@@ -290,96 +321,96 @@ impl Vm {
                             arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 // the specialised arithmetic: one branch, not two
                 Op::Add { dst, a, b } => {
-                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                    let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::Sub { dst, a, b } => {
-                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                    let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::Mul { dst, a, b } => {
-                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                    let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::Div { dst, a, b } => {
-                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                    let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x / y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Div, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::AddK { dst, a, k } => {
-                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::SubK { dst, a, k } => {
-                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::MulK { dst, a, k } => {
-                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::Neg { dst, a } => {
-                    let v = self.reg(a);
+                    let v = get!(a);
                     let n = v.as_num().map_err(|e| self.at(proto, pc, e))?;
-                    self.set_reg(dst, Value::Num(-n));
+                    set!(dst, Value::Num(-n));
                 }
                 Op::Not { dst, a } => {
-                    let v = Value::Bool(!self.reg(a).truthy());
-                    self.set_reg(dst, v);
+                    let v = Value::Bool(!get!(a).truthy());
+                    set!(dst, v);
                 }
                 Op::Jump { to } => pc = to as usize,
                 Op::JumpIfFalse { cond, to } => {
-                    if !self.at_reg(cond).truthy() {
+                    if !at!(cond).truthy() {
                         pc = to as usize;
                     }
                 }
                 Op::JumpIfTrue { cond, to } => {
-                    if self.at_reg(cond).truthy() {
+                    if at!(cond).truthy() {
                         pc = to as usize;
                     }
                 }
@@ -387,7 +418,7 @@ impl Vm {
                     self.set_line(proto.lines[pc - 1]);
                     // taking the callee by value avoids a second refcount:
                     // switching to it moves the handle into `current`
-                    match self.reg(base) {
+                    match get!(base) {
                         Value::Func(f) => {
                             match self.enter_frame(&f, base, nargs, nres, &current, pc, frames) {
                                 Err(e) => return Err(self.here(proto, pc, e)),
@@ -395,18 +426,23 @@ impl Vm {
                                     current = f;
                                     proto = unsafe { &*Rc::as_ptr(&current.proto) };
                                     pc = 0;
+                                    resync!();
                                 }
-                                Ok(false) => {}
+                                // a native or compiled callee: it ran to
+                                // completion, and may have grown the stack
+                                Ok(false) => resync!(),
                             }
                         }
-                        callee => self
-                            .dispatch(&callee, base, nargs, nres)
-                            .map_err(|e| self.here(proto, pc, e))?,
+                        callee => {
+                            self.dispatch(&callee, base, nargs, nres)
+                                .map_err(|e| self.here(proto, pc, e))?;
+                            resync!();
+                        }
                     }
                 }
                 Op::Method { base, name, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
-                    let recv = self.reg(base + 1);
+                    let recv = get!(base + 1);
                     let name = match &proto.consts[name as usize] {
                         Value::Str(s) => s.clone(),
                         other => RStr::from(other.to_string()),
@@ -415,6 +451,7 @@ impl Vm {
                     // the receiver is the first argument, as in Rust
                     self.dispatch(&m, base, nargs + 1, nres)
                         .map_err(|e| self.here(proto, pc, e))?;
+                    resync!();
                 }
                 Op::CallSpread { base, nargs, nres, method } => {
                     self.set_line(proto.lines[pc - 1]);
@@ -424,9 +461,9 @@ impl Vm {
                     args.extend(extra.iter().cloned());
                     self.recycle_vec(extra);
                     let callee = if method == u16::MAX {
-                        self.reg(base)
+                        get!(base)
                     } else {
-                        let recv = self.reg(base + 1);
+                        let recv = get!(base + 1);
                         let name = match &proto.consts[method as usize] {
                             Value::Str(s) => s.clone(),
                             other => RStr::from(other.to_string()),
@@ -436,6 +473,7 @@ impl Vm {
                     let vals =
                         self.call_value(&callee, args).map_err(|e| self.here(proto, pc, e))?;
                     self.place(base, nres, vals);
+                    resync!();
                 }
                 Op::Ret { base, n } => match frames.pop() {
                     // the outermost function of this activation
@@ -445,12 +483,13 @@ impl Vm {
                         current = caller;
                         proto = unsafe { &*Rc::as_ptr(&current.proto) };
                         pc = next_pc;
+                        resync!();
                     }
                 },
-                Op::NewTable { dst } => self.set_reg(dst, Value::table(Table::new())),
+                Op::NewTable { dst } => set!(dst, Value::table(Table::new())),
                 Op::GetIndex { dst, obj, key } => {
                     // `t[i]` on an array is the hot path of most real programs
-                    let fast = match (self.at_reg(obj), self.at_reg(key)) {
+                    let fast = match (at!(obj), at!(key)) {
                         (Value::Table(t), Value::Num(n)) => {
                             t.borrow().get_num(*n).cloned()
                         }
@@ -459,15 +498,15 @@ impl Vm {
                     let v = match fast {
                         Some(v) => v,
                         None => {
-                            let (o, k) = (self.reg(obj), self.reg(key));
+                            let (o, k) = (get!(obj), get!(key));
                             self.index(&o, &k).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::GetIndexK { dst, obj, k } => {
                     let key = &proto.consts[k as usize];
-                    let fast = match (self.at_reg(obj), key) {
+                    let fast = match (at!(obj), key) {
                         (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
                         (Value::Table(t), Value::Str(s)) => t.borrow().get_field(s),
                         _ => None,
@@ -475,18 +514,18 @@ impl Vm {
                     let v = match fast {
                         Some(v) => v,
                         None => {
-                            let (o, key) = (self.reg(obj), key.clone());
+                            let (o, key) = (get!(obj), key.clone());
                             self.index(&o, &key).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::SetIndexK { obj, k, val } => {
                     let key = proto.consts[k as usize].clone();
                     let done = match (
-                        &self.stack[self.base + obj as usize],
+                        at!(obj),
                         &key,
-                        &self.stack[self.base + val as usize],
+                        at!(val),
                     ) {
                         (Value::Table(t), Value::Num(n), v) => t.borrow_mut().set_num(*n, v),
                         _ => false,
@@ -494,8 +533,8 @@ impl Vm {
                     if done {
                         continue;
                     }
-                    let o = self.reg(obj);
-                    let v = self.reg(val);
+                    let o = get!(obj);
+                    let v = get!(val);
                     match o {
                         Value::Table(t) => {
                             let key = Key::from_value(&key).map_err(|e| self.at(proto, pc, e))?;
@@ -510,9 +549,9 @@ impl Vm {
                 Op::SetIndex { obj, key, val } => {
                     // an in-place write into the array part, likewise
                     let done = match (
-                        &self.stack[self.base + obj as usize],
-                        &self.stack[self.base + key as usize],
-                        &self.stack[self.base + val as usize],
+                        at!(obj),
+                        at!(key),
+                        at!(val),
                     ) {
                         (Value::Table(t), Value::Num(n), v) => {
                             t.borrow_mut().set_num(*n, v)
@@ -522,9 +561,9 @@ impl Vm {
                     if done {
                         continue;
                     }
-                    let o = self.reg(obj);
-                    let k = self.reg(key);
-                    let v = self.reg(val);
+                    let o = get!(obj);
+                    let k = get!(key);
+                    let v = get!(val);
                     match o {
                         Value::Table(t) => {
                             let key = Key::from_value(&k).map_err(|e| self.at(proto, pc, e))?;
@@ -537,14 +576,14 @@ impl Vm {
                     }
                 }
                 Op::Append { obj, val } => {
-                    let v = self.reg(val);
-                    if let Value::Table(t) = self.reg(obj) {
+                    let v = get!(val);
+                    if let Value::Table(t) = get!(obj) {
                         t.borrow_mut().push(v);
                     }
                 }
                 Op::AppendMulti { obj } => {
                     let vals = self.take_multi();
-                    if let Value::Table(t) = self.reg(obj) {
+                    if let Value::Table(t) = get!(obj) {
                         let mut b = t.borrow_mut();
                         for v in &vals {
                             b.push(v.clone());
@@ -555,39 +594,40 @@ impl Vm {
                 Op::Closure { dst, proto: idx } => {
                     let child = proto.protos[idx as usize].clone();
                     let v = self.make_closure(child);
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::Range { dst, a, b, inclusive } => {
-                    let start = self.reg(a).as_num().map_err(|e| self.at(proto, pc, e))?;
-                    let end = self.reg(b).as_num().map_err(|e| self.at(proto, pc, e))?;
-                    self.set_reg(dst, crate::stdlib::range_iterator(start, end, inclusive));
+                    let start = get!(a).as_num().map_err(|e| self.at(proto, pc, e))?;
+                    let end = get!(b).as_num().map_err(|e| self.at(proto, pc, e))?;
+                    set!(dst, crate::stdlib::range_iterator(start, end, inclusive));
                 }
                 Op::IterInit { dst, src } => {
-                    let v = match self.reg(src) {
+                    let v = match get!(src) {
                         // a table iterates its values, as a Rust `for` over a Vec
                         Value::Table(t) => crate::stdlib::value_iterator(t),
                         other => other,
                     };
-                    self.set_reg(dst, v);
+                    set!(dst, v);
                 }
                 Op::IterNext { iter, base, count, exit } => {
-                    let it = self.reg(iter);
+                    let it = get!(iter);
                     let empty = self.take_vec(0);
                     let vals =
                         self.call_value(&it, empty).map_err(|e| self.here(proto, pc, e))?;
+                    resync!();
                     if matches!(vals.first(), None | Some(Value::Nil)) {
                         self.recycle_vec(vals);
                         pc = exit as usize;
                     } else {
                         for i in 0..count {
                             let v = vals.get(i as usize).cloned().unwrap_or(Value::Nil);
-                            self.set_reg(base + i, v);
+                            set!(base + i, v);
                         }
                         self.recycle_vec(vals);
                     }
                 }
                 Op::JumpIfNot { kind, a, b, to } => {
-                    let (x, y) = (self.at_reg(a), self.at_reg(b));
+                    let (x, y) = (at!(a), at!(b));
                     let taken = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_cmp(kind, *x, *y)
                     } else {
@@ -599,7 +639,7 @@ impl Vm {
                     }
                 }
                 Op::JumpIfNotK { kind, a, k, to } => {
-                    let (x, y) = (self.at_reg(a), &proto.consts[k as usize]);
+                    let (x, y) = (at!(a), &proto.consts[k as usize]);
                     let taken = match (x, y) {
                         (Value::Num(x), Value::Num(y)) => num_cmp(kind, *x, *y),
                         (x, y) => {
@@ -620,6 +660,7 @@ impl Vm {
                     } else {
                         to as usize
                     };
+                    resync!();
                 }
                 Op::LoopHint { id, hint, exit } => {
                     // counting is a `Cell` bump; only every so often is it
@@ -630,6 +671,7 @@ impl Vm {
                     if n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id) {
                         pc = exit as usize;
                     }
+                    resync!();
                 }
             }
         }

@@ -312,6 +312,35 @@ impl Vm {
     }
 
     /// Run source text; the value of the final expression is returned.
+    /// Compile `src` and describe the bytecode, for `rua --dump-bytecode`.
+    ///
+    /// Reading the op mix of a real program is how the compiler's output gets
+    /// better: a benchmark that turns out to spend a fifth of its ops moving
+    /// registers around is telling you where to look.
+    pub fn dump_bytecode(&mut self, src: &str) -> Res<String> {
+        let (block, n_slots) = rua_syntax::compile(src).map_err(|e| Error {
+            message: e.message,
+            line: e.line,
+            located: e.line > 0,
+            where_: None,
+            trace: Vec::new(),
+        })?;
+        let def = Rc::new(rua_syntax::ast::FuncDef {
+            id: usize::MAX,
+            name: String::from("<chunk>"),
+            params: Vec::new(),
+            body: block,
+            line: 0,
+            n_slots,
+            param_bindings: Vec::new(),
+            upvals: Vec::new(),
+        });
+        let proto = crate::compile::compile_chunk(&def.body, n_slots, def.clone());
+        let mut out = String::new();
+        write_proto(&mut out, &proto);
+        Ok(out)
+    }
+
     pub fn eval(&mut self, src: &str) -> Res<Vec<Value>> {
         let (block, n_slots) = rua_syntax::compile(src).map_err(|e| Error {
             message: e.message,
@@ -1182,5 +1211,24 @@ fn find_loop_expr(e: &Expr, id: u32) -> Option<&Stat> {
             .iter()
             .find_map(|(k, v)| find_loop_expr(k, id).or_else(|| find_loop_expr(v, id))),
         _ => None,
+    }
+}
+
+/// One function's code, then the functions defined inside it.
+fn write_proto(out: &mut String, proto: &crate::bytecode::Proto) {
+    use std::fmt::Write;
+    let name = if proto.name.is_empty() { "<closure>" } else { &proto.name };
+    let _ = writeln!(
+        out,
+        "\nfunction {name}  ({} registers, {} ops, {} constants)",
+        proto.n_regs,
+        proto.code.len(),
+        proto.consts.len()
+    );
+    for (i, op) in proto.code.iter().enumerate() {
+        let _ = writeln!(out, "  {i:>4}  {op:?}");
+    }
+    for p in &proto.protos {
+        write_proto(out, p);
     }
 }

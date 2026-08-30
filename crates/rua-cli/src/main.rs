@@ -39,6 +39,10 @@ struct Args {
     /// Print the Rust the JIT generates
     #[arg(long)]
     dump_jit: bool,
+
+    /// Print the bytecode the compiler generates, and run nothing
+    #[arg(long)]
+    dump_bytecode: bool,
 }
 
 /// A rua error, dressed up for miette: the message, the line it happened on,
@@ -117,6 +121,24 @@ fn main() {
         arg_table.borrow_mut().push(Value::str(a));
     }
     vm.set_global("arg", Value::Table(arg_table));
+
+    if args.dump_bytecode {
+        let sources = args.eval.iter().cloned().chain(
+            args.script
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok()),
+        );
+        for src in sources {
+            match vm.dump_bytecode(&src) {
+                Ok(text) => print!("{text}"),
+                Err(e) => {
+                    eprintln!("rua: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
 
     for chunk in &args.eval {
         run(&mut vm, chunk, "<argument>");
