@@ -60,6 +60,12 @@ pub enum Op {
     Jump { to: u32 },
     JumpIfFalse { cond: Reg, to: u32 },
     JumpIfTrue { cond: Reg, to: u32 },
+    /// Compare and branch in one: jump when `a <kind> b` is false. Loop
+    /// conditions are the whole reason this exists.
+    JumpIfNot { kind: BinKind, a: Reg, b: Reg, to: u32 },
+    /// A loop's back edge: count the iteration for the JIT and jump. `exit` is
+    /// where to continue if the JIT takes the loop over.
+    JumpBack { to: u32, id: u32, hint: u16, exit: u32 },
 
     /// Callee at `base`, arguments at `base+1..base+1+nargs`. Results land at
     /// `base`; `nres` of them, or all of them when it is [`MULTI`].

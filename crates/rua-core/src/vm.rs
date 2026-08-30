@@ -415,6 +415,31 @@ impl Vm {
                         self.recycle_vec(vals);
                     }
                 }
+                Op::JumpIfNot { kind, a, b, to } => {
+                    let (x, y) = (
+                        &self.stack[self.base + a as usize],
+                        &self.stack[self.base + b as usize],
+                    );
+                    let taken = if let (Value::Num(x), Value::Num(y)) = (x, y) {
+                        num_cmp(kind, *x, *y)
+                    } else {
+                        let (x, y) = (x.clone(), y.clone());
+                        arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
+                    };
+                    if !taken {
+                        pc = to as usize;
+                    }
+                }
+                Op::JumpBack { to, id, hint, exit } => {
+                    let counter = &proto.hints[hint as usize];
+                    let n = counter.get().wrapping_add(1);
+                    counter.set(n);
+                    pc = if n % LOOP_BATCH == 0 && self.note_loop(proto, id) {
+                        exit as usize
+                    } else {
+                        to as usize
+                    };
+                }
                 Op::LoopHint { id, hint, exit } => {
                     // counting is a `Cell` bump; only every so often is it
                     // worth asking whether this loop deserves compiling
@@ -502,6 +527,19 @@ impl Vm {
     fn here(&self, proto: &Rc<Proto>, pc: usize, e: Signal) -> Signal {
         let line = proto.lines.get(pc.saturating_sub(1)).copied().unwrap_or(0);
         self.locate_signal(line, e)
+    }
+}
+
+#[inline]
+fn num_cmp(kind: BinKind, x: f64, y: f64) -> bool {
+    match kind {
+        BinKind::Lt => x < y,
+        BinKind::Le => x <= y,
+        BinKind::Gt => x > y,
+        BinKind::Ge => x >= y,
+        BinKind::Eq => x == y,
+        BinKind::Ne => x != y,
+        _ => unreachable!("only comparisons reach a fused branch"),
     }
 }
 

@@ -151,9 +151,11 @@ impl FnCompiler {
     fn patch(&mut self, at: usize) {
         let target = self.here();
         match &mut self.code[at] {
-            Op::Jump { to } | Op::JumpIfFalse { to, .. } | Op::JumpIfTrue { to, .. } => {
-                *to = target
-            }
+            Op::Jump { to }
+            | Op::JumpIfFalse { to, .. }
+            | Op::JumpIfTrue { to, .. }
+            | Op::JumpIfNot { to, .. }
+            | Op::JumpBack { to, .. } => *to = target,
             Op::IterNext { exit, .. } => *exit = target,
             other => panic!("cannot patch {other:?}"),
         }
@@ -287,9 +289,7 @@ impl FnCompiler {
             Stat::While(id, cond, body) => {
                 let top = self.here();
                 let mark = self.mark();
-                let c = self.alloc();
-                self.expr(cond, c);
-                let exit = self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0);
+                let exit = self.branch_unless(cond);
                 self.release(mark);
                 self.loops.push(LoopCtx { breaks: vec![exit], continues: Vec::new() });
                 self.block(body, None);
@@ -297,12 +297,12 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, top);
                 }
-                let hint = self.loop_hint(*id);
-                self.emit(Op::Jump { to: top }, 0);
+                let hint = self.next_hint();
+                let back = self.emit(Op::JumpBack { to: top, id: *id, hint, exit: 0 }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
                 }
-                self.patch_hint(hint);
+                self.patch_hint(back);
             }
             Stat::Loop(id, body) => {
                 let top = self.here();
@@ -312,12 +312,12 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, top);
                 }
-                let hint = self.loop_hint(*id);
-                self.emit(Op::Jump { to: top }, 0);
+                let hint = self.next_hint();
+                let back = self.emit(Op::JumpBack { to: top, id: *id, hint, exit: 0 }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
                 }
-                self.patch_hint(hint);
+                self.patch_hint(back);
             }
             Stat::ForRange { id, binding, start, end, inclusive, body, .. } => {
                 let b = binding.expect("resolved");
@@ -333,11 +333,8 @@ impl FnCompiler {
                 self.emit(Op::Const { dst: step, k: one }, 0);
 
                 let top = self.here();
-                let test = self.alloc();
                 let kind = if *inclusive { BinKind::Le } else { BinKind::Lt };
-                self.emit(Op::Bin { kind, dst: test, a: counter, b: limit }, 0);
-                let exit = self.emit(Op::JumpIfFalse { cond: test, to: 0 }, 0);
-                self.release(test);
+                let exit = self.emit(Op::JumpIfNot { kind, a: counter, b: limit, to: 0 }, 0);
                 if b.cell {
                     // a captured loop variable is fresh each turn, so a closure
                     // made in the body captures this iteration's value
@@ -352,12 +349,12 @@ impl FnCompiler {
                     self.patch_to(at, cont);
                 }
                 self.emit(Op::Bin { kind: BinKind::Add, dst: counter, a: counter, b: step }, 0);
-                let hint = self.loop_hint(*id);
-                self.emit(Op::Jump { to: top }, 0);
+                let hint = self.next_hint();
+                let back = self.emit(Op::JumpBack { to: top, id: *id, hint, exit: 0 }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
                 }
-                self.patch_hint(hint);
+                self.patch_hint(back);
                 self.release(mark);
             }
             Stat::ForIn { id, bindings, iter, body, .. } => {
@@ -390,12 +387,12 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, cont);
                 }
-                let hint = self.loop_hint(*id);
-                self.emit(Op::Jump { to: top }, 0);
+                let hint = self.next_hint();
+                let back = self.emit(Op::JumpBack { to: top, id: *id, hint, exit: 0 }, 0);
                 for at in ctx.breaks {
                     self.patch(at);
                 }
-                self.patch_hint(hint);
+                self.patch_hint(back);
                 self.release(mark);
             }
             Stat::Return(exprs) => {
@@ -442,26 +439,52 @@ impl FnCompiler {
         }
     }
 
-    /// Emit a loop's back-edge hint, with a fresh counter slot.
-    fn loop_hint(&mut self, id: u32) -> usize {
+    /// A fresh iteration counter slot for a loop.
+    fn next_hint(&mut self) -> u16 {
         let hint = self.hints as u16;
         self.hints += 1;
-        self.emit(Op::LoopHint { id, hint, exit: 0 }, 0)
+        hint
     }
 
-    /// A loop hint points past the loop, for when the JIT takes it over.
+    /// A back edge points past the loop, for when the JIT takes it over.
     fn patch_hint(&mut self, at: usize) {
         let target = self.here();
-        if let Op::LoopHint { exit, .. } = &mut self.code[at] {
+        if let Op::JumpBack { exit, .. } = &mut self.code[at] {
             *exit = target;
         }
     }
 
+    /// Compile `cond` as a branch taken when it is false, fusing the compare
+    /// into the jump where it is one.
+    fn branch_unless(&mut self, cond: &Expr) -> usize {
+        if let Expr::Bin(op, a, b) = cond {
+            let kind = match op {
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
+                    Some(bin_kind(*op))
+                }
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let mark = self.mark();
+                let ra = self.operand(a);
+                let rb = self.operand(b);
+                self.release(mark);
+                return self.emit(Op::JumpIfNot { kind, a: ra, b: rb, to: 0 }, 0);
+            }
+        }
+        let mark = self.mark();
+        let c = self.alloc();
+        self.expr(cond, c);
+        self.release(mark);
+        self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0)
+    }
+
     fn patch_to(&mut self, at: usize, target: u32) {
         match &mut self.code[at] {
-            Op::Jump { to } | Op::JumpIfFalse { to, .. } | Op::JumpIfTrue { to, .. } => {
-                *to = target
-            }
+            Op::Jump { to }
+            | Op::JumpIfFalse { to, .. }
+            | Op::JumpIfTrue { to, .. }
+            | Op::JumpIfNot { to, .. } => *to = target,
             other => panic!("cannot patch {other:?}"),
         }
     }
@@ -713,11 +736,7 @@ impl FnCompiler {
     fn if_expr(&mut self, arms: &[(Expr, Block)], els: Option<&Block>, dst: Option<Reg>) {
         let mut ends = Vec::new();
         for (i, (cond, body)) in arms.iter().enumerate() {
-            let mark = self.mark();
-            let c = self.alloc();
-            self.expr(cond, c);
-            let next = self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0);
-            self.release(mark);
+            let next = self.branch_unless(cond);
             self.block(body, dst);
             let is_last = i + 1 == arms.len() && els.is_none();
             if !is_last {
@@ -896,11 +915,7 @@ impl FnCompiler {
     /// any of them keeps its extra values.
     fn if_ret(&mut self, arms: &[(Expr, Block)], els: Option<&Block>) {
         for (cond, body) in arms {
-            let mark = self.mark();
-            let c = self.alloc();
-            self.expr(cond, c);
-            let next = self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0);
-            self.release(mark);
+            let next = self.branch_unless(cond);
             self.block_ret(body);
             self.patch(next);
         }
