@@ -157,7 +157,13 @@ pub struct Vm {
     depth: Rc<std::cell::Cell<i64>>,
 }
 
-const MAX_DEPTH: i64 = 200;
+/// How deep rua calls may nest.
+///
+/// Each one costs a Rust stack frame — in the interpreter, and in compiled code
+/// too, which recurses natively. An unoptimised build's frames are several
+/// times larger than a release build's, and this has to be safe in both, so it
+/// is set from what a debug build survives on a 2MB thread with room to spare.
+const MAX_DEPTH: i64 = 150;
 
 impl Default for Vm {
     fn default() -> Self {
