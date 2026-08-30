@@ -130,7 +130,7 @@ pub struct Vm {
     pub(crate) current_fn: Option<Rc<Function>>,
     /// The statement being executed, and the call stack above it, so that an
     /// error can say where it happened.
-    line: u32,
+    pub(crate) line: u32,
     /// One entry per active call: the function, and the line it was called
     /// from. The pointer is valid because the call that pushed it is still on
     /// the Rust stack, holding the function alive.
@@ -163,11 +163,11 @@ pub struct Vm {
 
 /// How deep rua calls may nest.
 ///
-/// Each one costs a Rust stack frame — in the interpreter, and in compiled code
-/// too, which recurses natively. An unoptimised build's frames are several
-/// times larger than a release build's, and this has to be safe in both, so it
-/// is set from what a debug build survives on a 2MB thread with room to spare.
-const MAX_DEPTH: i64 = 120;
+/// A rua-to-rua call no longer costs a Rust stack frame — the VM keeps its own
+/// frame stack — so this is a policy limit rather than a physical one. It still
+/// has to hold for compiled code, which does recurse natively, and for natives
+/// that call back into the interpreter.
+const MAX_DEPTH: i64 = 1000;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -588,6 +588,15 @@ impl Vm {
     }
 
     /// Enter a call, refusing to go deeper than the stack allows.
+    /// Push a traceback entry for a call the VM is entering itself.
+    pub(crate) fn push_frame(&mut self, proto: *const crate::bytecode::Proto, line: u32) {
+        self.frames.push((proto, line));
+    }
+
+    pub(crate) fn pop_frame(&mut self) {
+        self.frames.pop();
+    }
+
     pub(crate) fn enter_depth(&mut self) -> Eval<bool> {
         let d = self.depth.get() + 1;
         self.depth.set(d);
@@ -603,6 +612,58 @@ impl Vm {
     }
 
 
+    /// Try to satisfy a call with compiled code. Returns whether it did.
+    ///
+    /// Also does the profiling that decides when to compile, so it runs on
+    /// every call whether or not the JIT is on.
+    pub(crate) fn try_compiled_call(
+        &mut self,
+        func: &Rc<Function>,
+        arg_start: usize,
+        nargs: u16,
+        ret_to: usize,
+        nres: u16,
+    ) -> bool {
+        let hits = func.hits.get().saturating_add(1);
+        func.hits.set(hits);
+        if func.jit_state.get() == JitState::Cold && hits >= self.jit.threshold {
+            self.try_compile(func);
+        }
+        let Some(code) = func.jit.get() else { return false };
+        let kinds = func.param_kinds.borrow();
+        if kinds.len() != nargs as usize {
+            return false;
+        }
+        let Some(rt_args) =
+            compiled_args(&self.stack[arg_start..arg_start + nargs as usize], &kinds)
+        else {
+            return false;
+        };
+        let Some(ctx) = func.rt.borrow().as_ref().map(|c| c.as_ptr()) else { return false };
+        drop(kinds);
+        // a trap means the compiled code met something it does not handle; it
+        // has written nothing, so the interpreter can simply run the call
+        // SAFETY: this is the context built for this code.
+        let Some(n) = (unsafe { code.call(&rt_args, ctx) }) else { return false };
+        let v = if func.returns_nil.get() { Value::Nil } else { Value::Num(n) };
+        match nres {
+            0 => {}
+            crate::bytecode::MULTI => {
+                self.stack[ret_to] = v.clone();
+                let mut vals = self.take_vec(1);
+                vals.push(v);
+                self.set_multi(vals);
+            }
+            want => {
+                self.stack[ret_to] = v;
+                for i in 1..want as usize {
+                    self.stack[ret_to + i] = Value::Nil;
+                }
+            }
+        }
+        true
+    }
+
     /// Run a function, using its compiled code when that applies.
     pub(crate) fn call_compiled_or_run(
         &mut self,
@@ -612,51 +673,9 @@ impl Vm {
         ret_to: usize,
         nres: u16,
     ) -> Eval<()> {
-        let hits = func.hits.get().saturating_add(1);
-        func.hits.set(hits);
-        if func.jit_state.get() == JitState::Cold && hits >= self.jit.threshold {
-            self.try_compile(func);
+        if self.try_compiled_call(func, arg_start, nargs, ret_to, nres) {
+            return Ok(());
         }
-        if let Some(code) = func.jit.get() {
-            let kinds = func.param_kinds.borrow();
-            if kinds.len() == nargs as usize {
-                if let Some(rt_args) =
-                    compiled_args(&self.stack[arg_start..arg_start + nargs as usize], &kinds)
-                {
-                    let ctx = func.rt.borrow().as_ref().map(|c| c.as_ptr());
-                    drop(kinds);
-                    if let Some(ctx) = ctx {
-                        // SAFETY: this is the context built for this code.
-                        if let Some(n) = unsafe { code.call(&rt_args, ctx) } {
-                            let v = if func.returns_nil.get() {
-                                Value::Nil
-                            } else {
-                                Value::Num(n)
-                            };
-                            match nres {
-                                0 => {}
-                                crate::bytecode::MULTI => {
-                                    self.stack[ret_to] = v.clone();
-                                    let mut vals = self.take_vec(1);
-                                    vals.push(v);
-                                    self.set_multi(vals);
-                                }
-                                want => {
-                                    self.stack[ret_to] = v;
-                                    for i in 1..want as usize {
-                                        self.stack[ret_to + i] = Value::Nil;
-                                    }
-                                }
-                            }
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-        // The traceback holds a borrowed name rather than a counted one: the
-        // frame it names is on the Rust stack for as long as the entry is, and
-        // an error copies the name out while that is still true.
         self.frames.push((Rc::as_ptr(&func.proto), self.line));
         let previous = if self.jit.enabled {
             self.current_fn.replace(func.clone())

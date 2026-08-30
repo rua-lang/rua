@@ -993,3 +993,50 @@ fn conditions_keep_their_semantics() {
     // comparison against a nil constant
     assert_eq!(s(r#"let t = #{}; if t.missing == nil { "absent" } else { "present" }"#), "absent");
 }
+
+/// Calls no longer recurse in Rust, so how deep a rua program may recurse is a
+/// policy limit rather than a property of the host stack — and it holds in an
+/// unoptimised build, where frames are far larger.
+#[test]
+fn deep_recursion_is_bounded_by_policy_not_the_host_stack() {
+    let mut vm = Vm::new();
+    vm.jit.enabled = false;
+    assert_eq!(
+        vm.eval("fn down(n) { if n < 1 { return 0 } down(n - 1) + 1 } down(900)").unwrap()[0],
+        Value::Num(900.0)
+    );
+    // and past the limit it is still a catchable error, not a crash
+    let out = vm
+        .eval("fn down(n) { if n < 1 { return 0 } down(n - 1) + 1 } try(|| down(50000))")
+        .unwrap();
+    assert_eq!(out[0], Value::Bool(false));
+    assert!(out[1].to_string().contains("stack overflow"), "got {}", out[1]);
+}
+
+/// An error raised several calls deep has to leave the interpreter's own state
+/// — register stack, frame stack, depth counter — exactly as it found it, or
+/// the next call runs in a corrupted window.
+#[test]
+fn an_error_unwinds_every_suspended_call() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        fn deep(n) { if n < 1 { error("bottom") } deep(n - 1) }
+        let (ok, why) = try(|| deep(50))
+        // the VM must still work perfectly afterwards
+        fn sum(n) { let s = 0; for i in 0..n { s += i } s }
+        return ok, why, sum(100), deep
+    "#,
+        )
+        .unwrap();
+    assert_eq!(out[0], Value::Bool(false));
+    assert!(out[1].to_string().contains("bottom"), "got {}", out[1]);
+    assert_eq!(out[2], Value::Num(4950.0), "the VM still runs correctly after unwinding");
+    // repeated failures must not leak frames either
+    for _ in 0..100 {
+        let r = vm.eval("let (ok, _) = try(|| deep(30)); ok").unwrap();
+        assert_eq!(r[0], Value::Bool(false));
+    }
+    assert_eq!(vm.eval("sum(10)").unwrap()[0], Value::Num(45.0));
+}

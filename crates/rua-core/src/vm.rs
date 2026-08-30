@@ -11,6 +11,29 @@ use crate::value::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// One suspended call: where to go back to when the current function returns.
+///
+/// rua calls used to recurse in Rust, which made script recursion depth a
+/// function of the host stack — an unoptimised build overflowed at 150 nested
+/// calls — and cost a stack frame's prologue per call. Calls now push one of
+/// these and keep going round the same loop, the way Lua's `goto startfunc`
+/// does.
+pub(crate) struct CallFrame {
+    /// The function to go back to, which also keeps its code alive.
+    caller: Rc<Function>,
+    base: usize,
+    pc: usize,
+    /// Where the callee's results belong, and how many are wanted.
+    ret_to: usize,
+    nres: u16,
+    upvals: Rc<Vec<CellRef>>,
+    /// The line the call was made from, for the traceback.
+    line: u32,
+    /// The callee's frame size, so its registers can be handed back on the way
+    /// out — including when an error unwinds several frames at once.
+    callee_regs: usize,
+}
+
 impl Vm {
     /// Run a compiled function with `args`, and hand back what it returned.
     pub(crate) fn run(&mut self, func: &Rc<Function>, args: Vec<Value>) -> Eval<Vec<Value>> {
@@ -34,7 +57,7 @@ impl Vm {
         args.clear();
         self.recycle_vec(args);
 
-        let out = self.execute(proto);
+        let out = self.execute(func);
         let result = match out {
             Ok((_, MULTI)) => Ok(self.take_multi()),
             Ok((rbase, n)) => {
@@ -83,7 +106,7 @@ impl Vm {
             };
         }
 
-        let out = self.execute(proto);
+        let out = self.execute(func);
         let copied = match out {
             // The common case: a known number of results, straight across.
             // `open_frame` puts the callee's registers above the caller's top,
@@ -168,7 +191,32 @@ impl Vm {
 
     /// Run one function's code. The result is where its return values are:
     /// a register and a count, or [`MULTI`] for "in the multi buffer".
-    fn execute(&mut self, proto: &Proto) -> Eval<(Reg, u16)> {
+    fn execute(&mut self, entry: &Rc<Function>) -> Eval<(Reg, u16)> {
+        let mut frames: Vec<CallFrame> = Vec::new();
+        let out = self.run_frames(entry, &mut frames);
+        if out.is_err() {
+            // an error left calls suspended: give their registers back and put
+            // the interpreter's state where the Rust caller expects it
+            while let Some(fr) = frames.pop() {
+                self.close_frame(self.base, fr.callee_regs);
+                self.base = fr.base;
+                self.upvals = fr.upvals;
+                self.leave_depth();
+                self.pop_frame();
+            }
+        }
+        out
+    }
+
+    fn run_frames(
+        &mut self,
+        entry: &Rc<Function>,
+        frames: &mut Vec<CallFrame>,
+    ) -> Eval<(Reg, u16)> {
+        let mut current = entry.clone();
+        // SAFETY: `current` owns the proto and outlives every use of this
+        // reference; it is refreshed whenever `current` changes.
+        let mut proto: &Proto = unsafe { &*Rc::as_ptr(&current.proto) };
         let mut pc = 0usize;
         loop {
             let op = proto.code[pc];
@@ -334,9 +382,24 @@ impl Vm {
                 }
                 Op::Call { base, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
-                    let callee = self.reg(base);
-                    self.dispatch(&callee, base, nargs, nres)
-                        .map_err(|e| self.here(proto, pc, e))?;
+                    // taking the callee by value avoids a second refcount:
+                    // switching to it moves the handle into `current`
+                    match self.reg(base) {
+                        Value::Func(f) => {
+                            match self.enter_frame(&f, base, nargs, nres, &current, pc, frames) {
+                                Err(e) => return Err(self.here(proto, pc, e)),
+                                Ok(true) => {
+                                    current = f;
+                                    proto = unsafe { &*Rc::as_ptr(&current.proto) };
+                                    pc = 0;
+                                }
+                                Ok(false) => {}
+                            }
+                        }
+                        callee => self
+                            .dispatch(&callee, base, nargs, nres)
+                            .map_err(|e| self.here(proto, pc, e))?,
+                    }
                 }
                 Op::Method { base, name, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
@@ -371,7 +434,16 @@ impl Vm {
                         self.call_value(&callee, args).map_err(|e| self.here(proto, pc, e))?;
                     self.place(base, nres, vals);
                 }
-                Op::Ret { base, n } => return Ok((base, n)),
+                Op::Ret { base, n } => match frames.pop() {
+                    // the outermost function of this activation
+                    None => return Ok((base, n)),
+                    Some(fr) => {
+                        let (caller, next_pc) = self.leave_frame(base, n, fr);
+                        current = caller;
+                        proto = unsafe { &*Rc::as_ptr(&current.proto) };
+                        pc = next_pc;
+                    }
+                },
                 Op::NewTable { dst } => self.set_reg(dst, Value::table(Table::new())),
                 Op::GetIndex { dst, obj, key } => {
                     // `t[i]` on an array is the hot path of most real programs
@@ -593,6 +665,115 @@ impl Vm {
         let vals = self.call_value(callee, args)?;
         self.place(base, nres, vals);
         Ok(())
+    }
+
+    /// Begin a call to a rua function from inside the loop.
+    ///
+    /// Returns whether the interpreter should switch to it: compiled code and
+    /// anything the JIT can satisfy is handled here and needs no frame.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn enter_frame(
+        &mut self,
+        f: &Rc<Function>,
+        base: Reg,
+        nargs: u16,
+        nres: u16,
+        current: &Rc<Function>,
+        pc: usize,
+        frames: &mut Vec<CallFrame>,
+    ) -> Eval<bool> {
+        let arg_start = self.base + base as usize + 1;
+        let ret_to = self.base + base as usize;
+        self.enter_depth()?;
+        if self.try_compiled_call(f, arg_start, nargs, ret_to, nres) {
+            self.leave_depth();
+            return Ok(false);
+        }
+        let callee_regs = f.proto.n_regs;
+        frames.push(CallFrame {
+            caller: current.clone(),
+            base: self.base,
+            pc,
+            ret_to,
+            nres,
+            upvals: std::mem::replace(&mut self.upvals, f.upvals.clone()),
+            line: self.line,
+            callee_regs,
+        });
+        self.push_frame(Rc::as_ptr(&f.proto), self.line);
+        if self.jit.enabled {
+            self.current_fn = Some(f.clone());
+        }
+        let base = self.open_frame(callee_regs);
+        for (i, p) in f.proto.params.iter().enumerate() {
+            let v = if (i as u16) < nargs {
+                self.stack[arg_start + i].clone()
+            } else {
+                Value::Nil
+            };
+            let slot = base + p.reg as usize;
+            self.stack[slot] = if p.cell {
+                Value::Cell(Rc::new(RefCell::new(v)))
+            } else {
+                v
+            };
+        }
+        self.base = base;
+        Ok(true)
+    }
+
+    /// Move a returning function's values into its caller's registers.
+    #[inline(never)]
+    fn return_values(&mut self, base: Reg, n: u16, ret_to: usize, nres: u16) {
+        let start = self.base + base as usize;
+        if n != MULTI && nres != MULTI {
+            for i in 0..nres as usize {
+                let v = if (i as u16) < n {
+                    self.stack[start + i].clone()
+                } else {
+                    Value::Nil
+                };
+                self.stack[ret_to + i] = v;
+            }
+            return;
+        }
+        let mut vals = if n == MULTI {
+            self.take_multi()
+        } else {
+            let mut v = self.take_vec(n as usize);
+            for i in 0..n as usize {
+                v.push(self.stack[start + i].clone());
+            }
+            v
+        };
+        match nres {
+            MULTI => {
+                self.stack[ret_to] = vals.first().cloned().unwrap_or(Value::Nil);
+                self.set_multi(vals);
+            }
+            want => {
+                for i in 0..want as usize {
+                    self.stack[ret_to + i] = vals.get(i).cloned().unwrap_or(Value::Nil);
+                }
+                vals.clear();
+                self.recycle_vec(vals);
+            }
+        }
+    }
+
+    /// Finish a call: hand the results back, give the registers up, and say
+    /// where the caller left off.
+    #[inline(never)]
+    fn leave_frame(&mut self, base: Reg, n: u16, fr: CallFrame) -> (Rc<Function>, usize) {
+        self.return_values(base, n, fr.ret_to, fr.nres);
+        self.close_frame(self.base, fr.callee_regs);
+        self.base = fr.base;
+        self.upvals = fr.upvals;
+        self.leave_depth();
+        self.pop_frame();
+        self.line = fr.line;
+        (fr.caller, fr.pc)
     }
 
     /// Copy `n` registers out into a fresh (pooled) vector.
