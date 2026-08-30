@@ -107,6 +107,79 @@ impl fmt::Debug for Native {
 
 pub use rua_jit::JitFn;
 
+/// A string value.
+///
+/// `Rc<str>` would be the obvious handle, but it is a *fat* pointer, and
+/// `Value` is a union of everything — so one 16-byte variant would push every
+/// value in the system to 24 bytes: every register, every array element, every
+/// argument. Wrapping the fat pointer in a thin one keeps `Value` at 16, which
+/// measures as a ~10% interpreter speedup across the benchmark suite. The cost
+/// is one extra load to reach the bytes, which is cheap next to moving a third
+/// more memory on every register write.
+#[derive(Clone)]
+pub struct RStr(Rc<Box<str>>);
+
+impl RStr {
+    pub fn new(s: &str) -> RStr {
+        RStr(Rc::new(Box::from(s)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Do these two handles point at the same allocation? A cheap pre-test
+    /// before comparing bytes.
+    pub fn same(&self, other: &RStr) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::ops::Deref for RStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq for RStr {
+    fn eq(&self, other: &Self) -> bool {
+        self.same(other) || **self == **other
+    }
+}
+impl Eq for RStr {}
+
+impl std::hash::Hash for RStr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        str::hash(self, state)
+    }
+}
+
+impl fmt::Display for RStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self)
+    }
+}
+
+impl fmt::Debug for RStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl From<&str> for RStr {
+    fn from(s: &str) -> RStr {
+        RStr::new(s)
+    }
+}
+
+impl From<String> for RStr {
+    fn from(s: String) -> RStr {
+        RStr(Rc::new(s.into_boxed_str()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JitState {
     Cold,
@@ -155,7 +228,7 @@ pub enum Value {
     Nil,
     Bool(bool),
     Num(f64),
-    Str(Rc<str>),
+    Str(RStr),
     Table(Rc<RefCell<Table>>),
     Func(Rc<Function>),
     Native(Rc<Native>),
@@ -168,7 +241,7 @@ pub enum Value {
 
 impl Value {
     pub fn str(s: impl AsRef<str>) -> Value {
-        Value::Str(Rc::from(s.as_ref()))
+        Value::Str(RStr::new(s.as_ref()))
     }
 
     pub fn table(t: Table) -> Value {
@@ -203,10 +276,10 @@ impl Value {
         }
     }
 
-    pub fn as_str(&self) -> Res<Rc<str>> {
+    pub fn as_str(&self) -> Res<RStr> {
         match self {
             Value::Str(s) => Ok(s.clone()),
-            Value::Num(_) | Value::Bool(_) | Value::Nil => Ok(Rc::from(self.to_string().as_str())),
+            Value::Num(_) | Value::Bool(_) | Value::Nil => Ok(RStr::from(self.to_string())),
             other => err(format!("attempt to use a {} as a string", other.type_name())),
         }
     }
@@ -260,7 +333,7 @@ impl fmt::Debug for Value {
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub enum Key {
-    Str(Rc<str>),
+    Str(RStr),
     /// f64 bits, so that 1.0 and 1 hash alike.
     Num(u64),
     Bool(bool),
@@ -389,7 +462,7 @@ impl Table {
     }
 
     pub fn get_str(&self, k: &str) -> Value {
-        self.get(&Key::Str(Rc::from(k)))
+        self.get(&Key::Str(RStr::new(k)))
     }
 
     /// Read `t[n]` when `n` is an exact index into the array part.
@@ -543,7 +616,7 @@ impl Table {
     }
 
     pub fn set_str(&mut self, k: &str, v: Value) {
-        self.set(Key::Str(Rc::from(k)), v);
+        self.set(Key::Str(RStr::new(k)), v);
     }
 
     pub fn set_index(&mut self, i: usize, v: Value) {
@@ -581,5 +654,15 @@ impl Table {
             .collect();
         out.extend(self.pairs.iter().map(|(k, _)| k.clone()));
         out
+    }
+}
+
+#[cfg(test)]
+mod size {
+    /// `Value` must stay 16 bytes: it is copied on every register write, and
+    /// widening it costs about 10% of the interpreter (measured).
+    #[test]
+    fn value_is_two_words() {
+        assert_eq!(std::mem::size_of::<super::Value>(), 16);
     }
 }

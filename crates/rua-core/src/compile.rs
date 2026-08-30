@@ -107,7 +107,7 @@ impl FnCompiler {
     fn const_key(&mut self, e: &Expr) -> Option<u16> {
         match e {
             Expr::Num(n) => Some(self.constant(Value::Num(*n))),
-            Expr::Str(s) => Some(self.constant(Value::Str(s.clone()))),
+            Expr::Str(s) => Some(self.constant(Value::str(&**s))),
             _ => None,
         }
     }
@@ -605,7 +605,7 @@ impl FnCompiler {
                 self.emit(Op::Const { dst, k }, 0);
             }
             Expr::Str(s) => {
-                let k = self.constant(Value::Str(s.clone()));
+                let k = self.constant(Value::str(&**s));
                 self.emit(Op::Const { dst, k }, 0);
             }
             Expr::Local(b, _) => {

@@ -38,7 +38,7 @@ fn num_arg(args: &[Value], i: usize) -> Res<f64> {
     arg(args, i).as_num()
 }
 
-fn str_arg(args: &[Value], i: usize) -> Res<Rc<str>> {
+fn str_arg(args: &[Value], i: usize) -> Res<RStr> {
     arg(args, i).as_str()
 }
 
@@ -138,7 +138,7 @@ fn base(vm: &mut Vm) {
     vm.register("globals", |vm, _args| {
         let mut t = Table::new();
         for n in vm.global_names() {
-            t.push(Value::Str(n));
+            t.push(Value::str(&*n));
         }
         one(Value::table(t))
     });
@@ -573,7 +573,7 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                             Value::Nil => {
                                 let (a, b) = (items[j].clone(), items[j - 1].clone());
                                 match (&a, &b) {
-                                    (Value::Str(x), Value::Str(y)) => x < y,
+                                    (Value::Str(x), Value::Str(y)) => **x < **y,
                                     _ => a.as_num()? < b.as_num()?,
                                 }
                             }

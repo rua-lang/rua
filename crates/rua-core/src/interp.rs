@@ -756,7 +756,7 @@ impl Vm {
 
     /// `a.m(..)`: the receiver's own field first, then its type's library —
     /// this is what makes `[3,1,2].sort()` and `"ab".upper()` work.
-    pub(crate) fn method(&mut self, o: &Value, name: &Rc<str>) -> Res<Value> {
+    pub(crate) fn method(&mut self, o: &Value, name: &RStr) -> Res<Value> {
         let key = Key::Str(name.clone());
         let kind = match o {
             Value::Table(t) => {

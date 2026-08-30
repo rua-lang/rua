@@ -256,7 +256,7 @@ impl Vm {
                     let recv = self.reg(base + 1);
                     let name = match &proto.consts[name as usize] {
                         Value::Str(s) => s.clone(),
-                        other => Rc::from(other.to_string().as_str()),
+                        other => RStr::from(other.to_string()),
                     };
                     let m = self.method(&recv, &name).map_err(|e| self.at(proto, pc, e))?;
                     // the receiver is the first argument, as in Rust
@@ -276,7 +276,7 @@ impl Vm {
                         let recv = self.reg(base + 1);
                         let name = match &proto.consts[method as usize] {
                             Value::Str(s) => s.clone(),
-                            other => Rc::from(other.to_string().as_str()),
+                            other => RStr::from(other.to_string()),
                         };
                         self.method(&recv, &name).map_err(|e| self.at(proto, pc, e))?
                     };
