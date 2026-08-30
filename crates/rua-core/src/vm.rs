@@ -273,11 +273,40 @@ impl Vm {
                 Op::Ret { base, n } => return Ok((base, n)),
                 Op::NewTable { dst } => self.set_reg(dst, Value::table(Table::new())),
                 Op::GetIndex { dst, obj, key } => {
-                    let (o, k) = (self.reg(obj), self.reg(key));
-                    let v = self.index(&o, &k).map_err(|e| self.at(proto, pc, e))?;
+                    // `t[i]` on an array is the hot path of most real programs
+                    let fast = match (
+                        &self.stack[self.base + obj as usize],
+                        &self.stack[self.base + key as usize],
+                    ) {
+                        (Value::Table(t), Value::Num(n)) => {
+                            t.borrow().get_num(*n).cloned()
+                        }
+                        _ => None,
+                    };
+                    let v = match fast {
+                        Some(v) => v,
+                        None => {
+                            let (o, k) = (self.reg(obj), self.reg(key));
+                            self.index(&o, &k).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
                     self.set_reg(dst, v);
                 }
                 Op::SetIndex { obj, key, val } => {
+                    // an in-place write into the array part, likewise
+                    let done = match (
+                        &self.stack[self.base + obj as usize],
+                        &self.stack[self.base + key as usize],
+                        &self.stack[self.base + val as usize],
+                    ) {
+                        (Value::Table(t), Value::Num(n), v) => {
+                            t.borrow_mut().set_num(*n, v)
+                        }
+                        _ => false,
+                    };
+                    if done {
+                        continue;
+                    }
                     let o = self.reg(obj);
                     let k = self.reg(key);
                     let v = self.reg(val);

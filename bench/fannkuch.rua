@@ -1,0 +1,52 @@
+// Fannkuch-redux: permutation and array reversal, integer-ish work.
+fn fannkuch(n) {
+    let perm = []
+    let perm1 = []
+    let count = []
+    for i in 0..n { perm.push(0); perm1.push(i); count.push(0) }
+    let max_flips = 0
+    let checksum = 0
+    let r = n
+    let permutations = 0
+    loop {
+        while r != 1 { count[r - 1] = r; r -= 1 }
+        for i in 0..n { perm[i] = perm1[i] }
+        let flips = 0
+        let k = perm[0]
+        while k != 0 {
+            let i = 0
+            let j = k
+            while i < j {
+                let tmp = perm[i]
+                perm[i] = perm[j]
+                perm[j] = tmp
+                i += 1
+                j -= 1
+            }
+            flips += 1
+            k = perm[0]
+        }
+        if flips > max_flips { max_flips = flips }
+        if permutations % 2 == 0 { checksum += flips } else { checksum -= flips }
+        permutations += 1
+        let done = false
+        loop {
+            if r == n { done = true; break }
+            let first = perm1[0]
+            for i in 0..r { perm1[i] = perm1[i + 1] }
+            perm1[r] = first
+            count[r] -= 1
+            if count[r] > 0 { break }
+            r += 1
+        }
+        if done { break }
+    }
+    return checksum, max_flips
+}
+
+let n = if arg.len() > 0 { num(arg[0]) } else { 9 }
+let t = os::clock()
+let (checksum, flips) = fannkuch(n)
+print("{checksum}")
+print("Pfannkuchen({n}) = {flips}")
+print("# fannkuch n={n} in {os::clock() - t:.3}s")

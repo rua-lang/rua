@@ -369,6 +369,37 @@ impl Table {
         self.get(&Key::Str(Rc::from(k)))
     }
 
+    /// Read `t[n]` when `n` is an exact index into the array part.
+    ///
+    /// This is the hot path for every `t[i]` in the language, so it avoids
+    /// building a `Key` and avoids `fract()` — the cast round trip is both the
+    /// integer test and the index.
+    #[inline]
+    pub fn get_num(&self, n: f64) -> Option<&Value> {
+        let i = n as usize;
+        if i as f64 == n {
+            return self.arr.get(i);
+        }
+        None
+    }
+
+    /// Write `t[n] = v` in place when `n` indexes the array part and the write
+    /// cannot change its shape. Returns whether it happened.
+    #[inline]
+    pub fn set_num(&mut self, n: f64, v: &Value) -> bool {
+        let i = n as usize;
+        if i as f64 != n || i >= self.arr.len() || matches!(v, Value::Nil) {
+            return false;
+        }
+        match (&mut self.nums, v) {
+            (Some(cache), Value::Num(x)) => cache[i] = *x,
+            (slot @ Some(_), _) => *slot = None,
+            (None, _) => {}
+        }
+        self.arr[i] = v.clone();
+        true
+    }
+
     /// A contiguous `f64` view of the array part, or `None` if any element is
     /// not a number. Compiled code reads through this directly; it is dropped
     /// by any write to the table, so it can never go stale.

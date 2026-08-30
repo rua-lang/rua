@@ -1,0 +1,29 @@
+// N-queens: recursion with per-call arrays.
+fn solve(n, row, cols, diag1, diag2) {
+    if row == n { return 1 }
+    let count = 0
+    for c in 0..n {
+        let d1 = row + c
+        let d2 = row - c + n
+        if cols[c] == 0 && diag1[d1] == 0 && diag2[d2] == 0 {
+            cols[c] = 1
+            diag1[d1] = 1
+            diag2[d2] = 1
+            count += solve(n, row + 1, cols, diag1, diag2)
+            cols[c] = 0
+            diag1[d1] = 0
+            diag2[d2] = 0
+        }
+    }
+    count
+}
+
+let n = if arg.len() > 0 { num(arg[0]) } else { 11 }
+let t = os::clock()
+let cols = []
+let diag1 = []
+let diag2 = []
+for i in 0..n { cols.push(0) }
+for i in 0..(2 * n + 1) { diag1.push(0); diag2.push(0) }
+print("queens({n}) = {solve(n, 0, cols, diag1, diag2)}")
+print("# queens n={n} in {os::clock() - t:.3}s")

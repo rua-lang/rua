@@ -1,0 +1,31 @@
+// Binary trees: allocation and recursion, the GC-pressure benchmark.
+fn make(depth) {
+    if depth == 0 { return #{ l: nil, r: nil } }
+    #{ l: make(depth - 1), r: make(depth - 1) }
+}
+
+fn check(node) {
+    if node.l == nil { return 1 }
+    1 + check(node.l) + check(node.r)
+}
+
+let max_depth = if arg.len() > 0 { num(arg[0]) } else { 16 }
+let min_depth = 4
+let t = os::clock()
+
+let stretch = max_depth + 1
+print("stretch tree of depth {stretch}\t check: {check(make(stretch))}")
+
+let long_lived = make(max_depth)
+let d = min_depth
+while d <= max_depth {
+    let iterations = 1
+    let e = max_depth - d + min_depth
+    for i in 0..e { iterations = iterations * 2 }
+    let sum = 0
+    for i in 0..iterations { sum += check(make(d)) }
+    print("{iterations}\t trees of depth {d}\t check: {sum}")
+    d += 2
+}
+print("long lived tree of depth {max_depth}\t check: {check(long_lived)}")
+print("# binarytrees depth {max_depth} in {os::clock() - t:.3}s")

@@ -1,0 +1,25 @@
+// Word frequency: strings, hashing and map updates — the non-numeric side.
+fn text(reps) {
+    let words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
+                 "pack", "my", "box", "with", "five", "dozen", "liquor", "jugs"]
+    let parts = []
+    for r in 0..reps {
+        for i in 0..words.len() { parts.push(words[(i * 7 + r * 3) % words.len()]) }
+    }
+    parts.join(" ")
+}
+
+let reps = if arg.len() > 0 { num(arg[0]) } else { 20000 }
+let t = os::clock()
+let body = text(reps)
+let counts = #{}
+for w in body.split(" ") {
+    let seen = counts[w]
+    counts[w] = if seen == nil { 1 } else { seen + 1 }
+}
+let keys = counts.keys()
+keys.sort()
+let total = 0
+for k in keys { total += counts[k] }
+print("distinct = {keys.len()}  total = {total}  first = {keys[0]}:{counts[keys[0]]}")
+print("# wordfreq reps={reps} in {os::clock() - t:.3}s")

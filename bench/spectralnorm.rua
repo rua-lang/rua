@@ -1,0 +1,33 @@
+// Spectral norm: tight float loops over flat arrays.
+fn a(i, j) { 1.0 / ((i + j) * (i + j + 1) / 2 + i + 1) }
+
+fn av(x, y, n) {
+    for i in 0..n {
+        let s = 0.0
+        for j in 0..n { s += a(i, j) * x[j] }
+        y[i] = s
+    }
+}
+
+fn atv(x, y, n) {
+    for i in 0..n {
+        let s = 0.0
+        for j in 0..n { s += a(j, i) * x[j] }
+        y[i] = s
+    }
+}
+
+fn at_av(x, y, t, n) { av(x, t, n); atv(t, y, n) }
+
+let n = if arg.len() > 0 { num(arg[0]) } else { 500 }
+let t0 = os::clock()
+let u = []
+let v = []
+let tmp = []
+for i in 0..n { u.push(1.0); v.push(0.0); tmp.push(0.0) }
+for i in 0..10 { at_av(u, v, tmp, n); at_av(v, u, tmp, n) }
+let vbv = 0.0
+let vv = 0.0
+for i in 0..n { vbv += u[i] * v[i]; vv += v[i] * v[i] }
+print("{math::sqrt(vbv / vv):.9}")
+print("# spectralnorm n={n} in {os::clock() - t0:.3}s")
