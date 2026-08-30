@@ -301,6 +301,8 @@ impl Vm {
                     // the overwhelmingly common case, kept off the generic path
                     let v = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_op(kind, *x, *y)
+                    } else if let Some(b) = crate::interp::equality(kind, x, y) {
+                        Value::Bool(b)
                     } else {
                         let (x, y) = (x.clone(), y.clone());
                         arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
@@ -311,10 +313,13 @@ impl Vm {
                     let x = at!(a);
                     let v = match (x, &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => num_op(kind, *x, *y),
-                        (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
-                            arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
-                        }
+                        (x, y) => match crate::interp::equality(kind, x, y) {
+                            Some(b) => Value::Bool(b),
+                            None => {
+                                let (x, y) = (x.clone(), y.clone());
+                                arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
+                            }
+                        },
                     };
                     set!(dst, v);
                 }
@@ -631,6 +636,8 @@ impl Vm {
                     let (x, y) = (at!(a), at!(b));
                     let taken = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_cmp(kind, *x, *y)
+                    } else if let Some(b) = crate::interp::equality(kind, x, y) {
+                        b
                     } else {
                         let (x, y) = (x.clone(), y.clone());
                         arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
@@ -643,10 +650,13 @@ impl Vm {
                     let (x, y) = (at!(a), &proto.consts[k as usize]);
                     let taken = match (x, y) {
                         (Value::Num(x), Value::Num(y)) => num_cmp(kind, *x, *y),
-                        (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
-                            arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
-                        }
+                        (x, y) => match crate::interp::equality(kind, x, y) {
+                            Some(b) => b,
+                            None => {
+                                let (x, y) = (x.clone(), y.clone());
+                                arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
+                            }
+                        },
                     };
                     if !taken {
                         pc = to as usize;

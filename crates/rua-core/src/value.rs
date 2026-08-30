@@ -366,6 +366,7 @@ impl Value {
     }
 
     /// The index of this value's type name in [`Value::TYPE_NAMES`].
+    #[inline]
     pub fn type_index(&self) -> usize {
         match self {
             Value::Nil => 0,

@@ -973,6 +973,22 @@ impl Vm {
 
 }
 
+/// `==` and `!=` on two values that are not both numbers.
+///
+/// Equality never coerces and never fails, so it needs no ownership of its
+/// operands — and the general path takes its arguments by value, which meant
+/// a reference count up and back down on each side of every comparison
+/// between two tables or two strings. A program that walks a data structure
+/// does that in its inner loop.
+#[inline]
+pub fn equality(op: crate::bytecode::BinKind, l: &Value, r: &Value) -> Option<bool> {
+    match op {
+        crate::bytecode::BinKind::Eq => Some(l == r),
+        crate::bytecode::BinKind::Ne => Some(l != r),
+        _ => None,
+    }
+}
+
 pub fn arith(op: crate::bytecode::BinKind, l: Value, r: Value) -> Res<Value> {
     use crate::bytecode::BinKind::*;
     Ok(match op {
