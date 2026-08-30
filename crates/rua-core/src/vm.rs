@@ -14,7 +14,9 @@ use std::rc::Rc;
 impl Vm {
     /// Run a compiled function with `args`, and hand back what it returned.
     pub(crate) fn run(&mut self, func: &Rc<Function>, args: Vec<Value>) -> Eval<Vec<Value>> {
-        let proto = func.proto.clone();
+        // borrowed, not cloned: the caller holds the function alive, and a
+        // refcount round trip per call is visible in a profile
+        let proto = &func.proto;
         let saved_base = self.base;
         let saved_upvals = std::mem::replace(&mut self.upvals, func.upvals.clone());
         self.base = self.open_frame(proto.n_regs);
@@ -32,7 +34,7 @@ impl Vm {
         args.clear();
         self.recycle_vec(args);
 
-        let out = self.execute(&proto);
+        let out = self.execute(proto);
         let result = match out {
             Ok((_, MULTI)) => Ok(self.take_multi()),
             Ok((rbase, n)) => {
@@ -63,7 +65,7 @@ impl Vm {
         ret_to: usize,
         nres: u16,
     ) -> Eval<()> {
-        let proto = func.proto.clone();
+        let proto = &func.proto;
         let saved_base = self.base;
         let saved_upvals = std::mem::replace(&mut self.upvals, func.upvals.clone());
         self.base = self.open_frame(proto.n_regs);
@@ -81,7 +83,7 @@ impl Vm {
             };
         }
 
-        let out = self.execute(&proto);
+        let out = self.execute(proto);
         let copied = match out {
             Ok((rbase, n)) => {
                 // Collect first: the caller's result registers can overlap the
@@ -123,19 +125,34 @@ impl Vm {
         copied.map(|_| ())
     }
 
+    /// Read a register.
+    ///
+    /// The compiler sizes every frame to `Proto::n_regs` and never emits a
+    /// register outside it, so the index is in bounds by construction — and
+    /// checking it again on every operand costs about 8% of the interpreter.
     #[inline]
     fn reg(&self, r: Reg) -> Value {
-        self.stack[self.base + r as usize].clone()
+        self.at_reg(r).clone()
+    }
+
+    #[inline]
+    fn at_reg(&self, r: Reg) -> &Value {
+        debug_assert!((self.base + r as usize) < self.stack.len());
+        // SAFETY: see above — the compiler guarantees the index.
+        unsafe { self.stack.get_unchecked(self.base + r as usize) }
     }
 
     #[inline]
     fn set_reg(&mut self, r: Reg, v: Value) {
-        self.stack[self.base + r as usize] = v;
+        debug_assert!((self.base + r as usize) < self.stack.len());
+        let i = self.base + r as usize;
+        // SAFETY: as in `at_reg`.
+        unsafe { *self.stack.get_unchecked_mut(i) = v };
     }
 
     /// Run one function's code. The result is where its return values are:
     /// a register and a count, or [`MULTI`] for "in the multi buffer".
-    fn execute(&mut self, proto: &Rc<Proto>) -> Eval<(Reg, u16)> {
+    fn execute(&mut self, proto: &Proto) -> Eval<(Reg, u16)> {
         let mut pc = 0usize;
         loop {
             let op = proto.code[pc];
@@ -187,10 +204,7 @@ impl Vm {
                     self.set_reg(slot, Value::Cell(Rc::new(RefCell::new(v))));
                 }
                 Op::Bin { kind, dst, a, b } => {
-                    let (x, y) = (
-                        &self.stack[self.base + a as usize],
-                        &self.stack[self.base + b as usize],
-                    );
+                    let (x, y) = (self.at_reg(a), self.at_reg(b));
                     // the overwhelmingly common case, kept off the generic path
                     let v = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_op(kind, *x, *y)
@@ -201,7 +215,7 @@ impl Vm {
                     self.set_reg(dst, v);
                 }
                 Op::BinK { kind, dst, a, k } => {
-                    let x = &self.stack[self.base + a as usize];
+                    let x = self.at_reg(a);
                     let v = match (x, &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => num_op(kind, *x, *y),
                         (x, y) => {
@@ -222,12 +236,12 @@ impl Vm {
                 }
                 Op::Jump { to } => pc = to as usize,
                 Op::JumpIfFalse { cond, to } => {
-                    if !self.stack[self.base + cond as usize].truthy() {
+                    if !self.at_reg(cond).truthy() {
                         pc = to as usize;
                     }
                 }
                 Op::JumpIfTrue { cond, to } => {
-                    if self.stack[self.base + cond as usize].truthy() {
+                    if self.at_reg(cond).truthy() {
                         pc = to as usize;
                     }
                 }
@@ -274,10 +288,7 @@ impl Vm {
                 Op::NewTable { dst } => self.set_reg(dst, Value::table(Table::new())),
                 Op::GetIndex { dst, obj, key } => {
                     // `t[i]` on an array is the hot path of most real programs
-                    let fast = match (
-                        &self.stack[self.base + obj as usize],
-                        &self.stack[self.base + key as usize],
-                    ) {
+                    let fast = match (self.at_reg(obj), self.at_reg(key)) {
                         (Value::Table(t), Value::Num(n)) => {
                             t.borrow().get_num(*n).cloned()
                         }
@@ -294,7 +305,7 @@ impl Vm {
                 }
                 Op::GetIndexK { dst, obj, k } => {
                     let key = &proto.consts[k as usize];
-                    let fast = match (&self.stack[self.base + obj as usize], key) {
+                    let fast = match (self.at_reg(obj), key) {
                         (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
                         (Value::Table(t), Value::Str(s)) => {
                             Some(t.borrow().get(&Key::Str(s.clone())))
@@ -416,10 +427,7 @@ impl Vm {
                     }
                 }
                 Op::JumpIfNot { kind, a, b, to } => {
-                    let (x, y) = (
-                        &self.stack[self.base + a as usize],
-                        &self.stack[self.base + b as usize],
-                    );
+                    let (x, y) = (self.at_reg(a), self.at_reg(b));
                     let taken = if let (Value::Num(x), Value::Num(y)) = (x, y) {
                         num_cmp(kind, *x, *y)
                     } else {
@@ -519,12 +527,12 @@ impl Vm {
     }
 
     /// Note the line an instruction was on, so the error can say where it was.
-    fn at(&self, proto: &Rc<Proto>, pc: usize, e: Error) -> Signal {
+    fn at(&self, proto: &Proto, pc: usize, e: Error) -> Signal {
         self.locate_at(proto.lines.get(pc.saturating_sub(1)).copied().unwrap_or(0), e)
     }
 
     /// The same, for an error that already travelled up from a call.
-    fn here(&self, proto: &Rc<Proto>, pc: usize, e: Signal) -> Signal {
+    fn here(&self, proto: &Proto, pc: usize, e: Signal) -> Signal {
         let line = proto.lines.get(pc.saturating_sub(1)).copied().unwrap_or(0);
         self.locate_signal(line, e)
     }

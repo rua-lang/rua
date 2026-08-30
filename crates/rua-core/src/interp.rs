@@ -395,7 +395,7 @@ impl Vm {
 
     /// A loop has gone round another batch of iterations. Returns whether the
     /// JIT took it over and ran it to completion.
-    pub(crate) fn note_loop(&mut self, proto: &Rc<crate::bytecode::Proto>, id: u32) -> bool {
+    pub(crate) fn note_loop(&mut self, proto: &crate::bytecode::Proto, id: u32) -> bool {
         if !self.jit.enabled {
             return false;
         }
