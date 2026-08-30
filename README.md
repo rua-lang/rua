@@ -238,30 +238,44 @@ entirely. `RUA_JIT_CACHE=0` turns that off, `RUA_JIT_DIR` moves it.
 
 ## Speed
 
-Same machine, same programs, best of three. `rua + JIT` is a warm cache; a cold
-one adds about 50ms per compiled function or loop, once.
+`bench/` holds seven programs written twice, once in rua and once in Lua —
+n-body, binary trees, spectral norm, fannkuch, n-queens, matrix multiply and
+word frequency. `bench/run.sh` runs each under every engine and **refuses to
+print a timing until they all produce byte-identical output**: a fast wrong
+answer is not a benchmark. The JIT's disk cache is warmed first, so these
+numbers exclude `rustc`.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| `fib(30)` | 0.333s | **0.010s** | 0.055s | 0.009s |
-| 5M iteration loop, top level | 0.253s | **0.040s** | 0.089s | 0.016s |
-| 5M iteration loop in a function called once | 0.234s | **0.032s** | 0.083s | 0.013s |
-| 2M calls through two helper functions | 1.036s | **0.040s** | 0.203s | 0.020s |
-| 2000 calls × 500 iteration loop | 0.047s | **0.006s** | 0.010s | 0.004s |
-| dot product, 4M array reads | 0.515s | **0.030s** | 0.062s | 0.004s |
-| build + sum a 300k array, in functions | 0.069s | **0.016s** | 0.011s | 0.003s |
+| spectral norm | 2.52s | **0.13s** | 0.64s | 0.03s |
+| n-queens | 0.29s | 0.27s | 0.07s | 0.02s |
+| matrix multiply | 0.70s | 0.71s | 0.17s | 0.02s |
+| fannkuch | 1.00s | 1.00s | 0.28s | 0.05s |
+| word frequency | 0.23s | 0.22s | 0.07s | 0.04s |
+| n-body | 2.10s | 2.09s | 0.48s | 0.05s |
+| binary trees | 7.48s | 7.45s | 3.26s | 1.41s |
 
-Read that honestly:
+Read that honestly. **Where the JIT applies it is decisive** — spectral norm is
+5x faster than Lua 5.4 and 20x faster than rua's own interpreter, because its
+kernels are exactly what the compiler accepts: numbers and flat arrays. **Where
+it does not apply, rua is its interpreter**, and that is 2–4x slower than Lua
+5.4 across the board.
 
-* **Numeric code the JIT accepts lands at or below LuaJIT**, because it really
-  is `rustc -O` output being called directly. The gap on the mixed cases is
-  LuaJIT's tracing compiler doing what it does.
-* **The interpreter alone is 2–4x slower than Lua 5.4.** It is a register
-  bytecode VM over slots the resolver assigned, with calls that pass arguments
-  and results through the register stack without allocating, but Lua's VM has
-  had twenty years of tuning.
-* **The interpreter is where the remaining gap is.** Calls cost about 4x what
-  Lua's do; the JIT hides that for numeric code and cannot for the rest.
+What keeps the other six out of the compiler is worth being precise about:
+
+* **Nested tables.** `bodies[i][3]` and `b[k][j]` — n-body and matrix multiply
+  are built on arrays of arrays, and compiled code only understands a flat one.
+* **Indices it cannot vouch for.** n-queens indexes `diag1[row + c]`. Proving
+  that in range needs value-range analysis; a real JIT would emit a guard and
+  deoptimise, which rua cannot do after a write (see the JIT section).
+* **Multiple return values**, which fannkuch's kernel uses.
+* **Strings, maps and allocation** — word frequency and binary trees are made of
+  exactly the things an f64-only compiler has nothing to say about.
+
+The interpreter's own gap is dispatch: a profile of n-body is 77% the bytecode
+loop itself, spread evenly across instructions rather than piled anywhere
+fixable. Closing that means superinstructions or NaN-boxed values, not a
+targeted fix.
 
 ## FFI: calling C
 
@@ -361,7 +375,8 @@ alive next to the bytecode, because that is what the JIT reads.
 ## Tests
 
 ```sh
-cargo test --workspace     # 48 tests: language, JIT-equals-interpreter, FFI, modules
+cargo test --workspace     # 51 tests: language, JIT-equals-interpreter, FFI, modules
+sh bench/run.sh            # the benchmark suite, with cross-engine output checks
 ```
 
 The JIT tests run the same program with and without compilation and assert the

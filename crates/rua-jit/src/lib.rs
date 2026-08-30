@@ -234,8 +234,8 @@ impl Jit {
     }
 
     fn compile_inner(&mut self, def: &FuncDef, self_ref: SelfRef) -> Lower<Compiled> {
-        if def.params.len() > 4 {
-            return Err("more than 4 parameters".into());
+        if def.params.len() > 16 {
+            return Err("more than 16 parameters".into());
         }
         // A compiled function produces one number, or nothing at all — a
         // procedure like `fn fill(t, n) { ... }` is worth compiling too. What
@@ -294,6 +294,8 @@ impl Jit {
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
         let kinds = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
+        // in a loop there are no parameters, so nothing is stable by that route
+        let stable: HashSet<u16> = HashSet::new();
         let kind_list: Vec<Kind> =
             slots.iter().map(|s| kinds.get(s).copied().unwrap_or(Kind::Num)).collect();
         let mut cx = Ctx {
@@ -306,6 +308,9 @@ impl Jit {
             writes: table_usage(&wrapper).traps_forbidden(),
             kinds,
             in_range: Vec::new(),
+            bounded: Vec::new(),
+            hoisted: Vec::new(),
+            stable_params: stable,
             loop_labels: Vec::new(),
             labels: 0,
             on_trap: quote! { return; },
@@ -505,6 +510,12 @@ impl Jit {
             .iter()
             .map(|b| kinds.get(&b.slot).copied().unwrap_or(Kind::Num))
             .collect();
+        let stable: HashSet<u16> = def
+            .param_bindings
+            .iter()
+            .filter(|b| !writes_slot(&def.body, b.slot))
+            .map(|b| b.slot)
+            .collect();
         let mut cx = Ctx {
             known: def.param_bindings.iter().map(|b| b.slot).collect(),
             self_symbol: symbol.to_string(),
@@ -515,6 +526,9 @@ impl Jit {
             writes: table_usage(&def.body).traps_forbidden(),
             kinds,
             in_range: Vec::new(),
+            bounded: Vec::new(),
+            hoisted: Vec::new(),
+            stable_params: stable,
             loop_labels: Vec::new(),
             labels: 0,
             on_trap: quote! { return 0.0; },
@@ -543,6 +557,20 @@ impl Jit {
                 }
             }
         });
+        // one length check per (table, bound) pair, all before any body code
+        let checks: Vec<TokenStream> = cx
+            .hoisted
+            .iter()
+            .map(|(slot, bound)| {
+                let (_, len) = span_idents(*slot);
+                quote! {
+                    if (#bound).ceil() > (#len as f64) {
+                        *ok = 0;
+                        return 0.0;
+                    }
+                }
+            })
+            .collect();
         let name = format_ident!("{}", symbol);
         let preamble = preamble();
         let file = quote! {
@@ -571,6 +599,7 @@ impl Jit {
                 }
                 let __out = (|| -> f64 {
                     #(#prologue)*
+                    #(#checks)*
                     #body
                 })();
                 *__depth -= 1;
@@ -744,7 +773,7 @@ fn infer_kinds(
 fn note(slot: u16, kind: Kind, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
     match kinds.insert(slot, kind) {
         Some(old) if old != kind => {
-            *bad = Some(format!("a local is used as both {old:?} and {kind:?}"))
+            *bad = Some(format!("slot {slot} is used as both {old:?} and {kind:?}"))
         }
         _ => {}
     }
@@ -858,14 +887,26 @@ fn kinds_expr(
             // an argument handed to a compiled function takes that
             // parameter's kind: that is how a table reaches a helper
             if let Expr::Global(name, _) = &**f {
-                if let Some((_, param_kinds)) = callees.get(&**name) {
-                    if param_kinds.len() == args.len() {
+                match callees.get(&**name) {
+                    Some((_, param_kinds)) if param_kinds.len() == args.len() => {
                         for (a, kind) in args.iter().zip(param_kinds) {
                             match (a, kind) {
                                 (Expr::Local(b, _), Kind::Table | Kind::TableOut) => {
                                     note(b.slot, *kind, kinds, bad)
                                 }
                                 _ => kinds_expr(a, kinds, bad, callees),
+                            }
+                        }
+                        return;
+                    }
+                    _ => {
+                        // An unknown callee — a function not compiled yet,
+                        // including this one calling itself — says nothing
+                        // about its arguments. Guessing "number" here would
+                        // contradict how they are used elsewhere.
+                        for a in args {
+                            if !matches!(a, Expr::Local(..)) {
+                                kinds_expr(a, kinds, bad, callees);
                             }
                         }
                         return;
@@ -1209,6 +1250,15 @@ struct Ctx {
     /// Loop variables known to be a valid index into a given table, from
     /// `for i in 0..t.len()`.
     in_range: Vec<(u16, u16)>,
+    /// Loop variables running `0..bound` where the bound is a parameter or a
+    /// literal — something that can be compared against a table's length once,
+    /// on entry, instead of on every read.
+    bounded: Vec<(u16, TokenStream)>,
+    /// The checks that hoisting produced: `(table slot, bound)`.
+    hoisted: Vec<(u16, TokenStream)>,
+    /// Parameters the body never assigns, whose value at entry is their value
+    /// throughout.
+    stable_params: HashSet<u16>,
     /// For each enclosing loop, the label to break to for `continue`. A counted
     /// loop wraps its body in a labeled block so that `continue` still runs the
     /// increment; a `while` needs no label.
@@ -1669,12 +1719,19 @@ impl Ctx {
                 if let Some(f) = fact {
                     self.in_range.push(f);
                 }
+                let bound = self.hoistable_bound(binding, start, end, *inclusive, body);
+                if let Some(b) = bound.clone() {
+                    self.bounded.push((binding.slot, b));
+                }
                 let label = self.fresh_label();
                 self.loop_labels.push(Some(label.clone()));
                 let b = self.block(body, false);
                 self.loop_labels.pop();
                 if fact.is_some() {
                     self.in_range.pop();
+                }
+                if bound.is_some() {
+                    self.bounded.pop();
                 }
                 let b = b?;
                 self.known = saved;
@@ -2021,10 +2078,52 @@ impl Ctx {
     }
 
     /// Is `key` a loop variable we know indexes `table` safely?
-    fn proven_in_range(&self, key: &Expr, table: u16) -> bool {
-        match key {
-            Expr::Local(b, _) => self.in_range.iter().any(|(v, t)| *v == b.slot && *t == table),
-            _ => false,
+    fn proven_in_range(&mut self, key: &Expr, table: u16) -> bool {
+        let Expr::Local(b, _) = key else { return false };
+        if self.in_range.iter().any(|(v, t)| *v == b.slot && *t == table) {
+            return true;
+        }
+        // `for i in 0..n` reading `t[i]`: comparing `n` against the length of
+        // `t` once, on entry, proves every read in the loop. Entry is before
+        // any write, so trapping there is safe even for code that writes.
+        let bound = self
+            .bounded
+            .iter()
+            .find(|(v, _)| *v == b.slot)
+            .map(|(_, bound)| bound.clone());
+        match bound {
+            Some(bound) => {
+                if !self.hoisted.iter().any(|(t, b)| *t == table && b.to_string() == bound.to_string())
+                {
+                    self.hoisted.push((table, bound));
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The bound of `for i in 0..n`, when it is something we can re-evaluate on
+    /// entry: a literal, or a parameter the body leaves alone.
+    fn hoistable_bound(
+        &mut self,
+        binding: Binding,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) -> Option<TokenStream> {
+        if inclusive || binding.cell || writes_slot(body, binding.slot) {
+            return None;
+        }
+        match start {
+            Expr::Num(n) if *n >= 0.0 => {}
+            _ => return None,
+        }
+        match end {
+            Expr::Num(_) => self.expr(end).ok(),
+            Expr::Local(b, _) if self.stable_params.contains(&b.slot) => self.expr(end).ok(),
+            _ => None,
         }
     }
 

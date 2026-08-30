@@ -15,6 +15,9 @@ printf '%-14s %10s %10s %10s %10s\n' benchmark rua-interp rua-jit lua5.4 luajit
 for b in $BENCHES; do
     size=$(eval echo \$SIZE_$b)
     out_i=$($RUA --no-jit bench/$b.rua $size)
+    # warm the JIT's on-disk cache first: a cold run pays rustc, which is a
+    # real cost but not the one this table is about
+    $RUA bench/$b.rua $size > /dev/null
     out_j=$($RUA bench/$b.rua $size)
     out_l=$(lua5.4 bench/$b.lua $size 2>/dev/null || echo MISSING)
     out_L=$(luajit bench/$b.lua $size 2>/dev/null || echo MISSING)
