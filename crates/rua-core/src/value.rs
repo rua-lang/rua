@@ -435,6 +435,11 @@ impl Table {
 
     /// After growing the array part, pull in any keys that now sit next to it.
     fn absorb_from_map(&mut self) {
+        // the common case is a pure array, where there is nothing to absorb and
+        // hashing the next index on every push is pure overhead
+        if self.map.is_empty() {
+            return;
+        }
         loop {
             let next = Key::Num((self.arr.len() as f64).to_bits());
             match self.map.remove(&next) {
