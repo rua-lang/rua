@@ -126,8 +126,6 @@ pub struct Vm {
     multi: Vec<Value>,
     /// The function being executed, so that a hot loop can nominate it for
     /// compilation. Only tracked when the JIT is on, since that is the only
-    /// thing that reads it.
-    pub(crate) current_fn: Option<Rc<Function>>,
     /// The statement being executed, and the call stack above it, so that an
     /// error can say where it happened.
     pub(crate) line: u32,
@@ -194,7 +192,6 @@ impl Vm {
             top: 0,
             pool: Vec::new(),
             multi: Vec::new(),
-            current_fn: None,
             line: 0,
             frames: Vec::new(),
             modules: HashMap::new(),
@@ -399,7 +396,12 @@ impl Vm {
 
     /// A loop has gone round another batch of iterations. Returns whether the
     /// JIT took it over and ran it to completion.
-    pub(crate) fn note_loop(&mut self, proto: &crate::bytecode::Proto, id: u32) -> bool {
+    pub(crate) fn note_loop(
+        &mut self,
+        proto: &crate::bytecode::Proto,
+        running: &Rc<Function>,
+        id: u32,
+    ) -> bool {
         if !self.jit.enabled {
             return false;
         }
@@ -408,10 +410,9 @@ impl Vm {
         // counter cannot see that; the loop can. This activation stays
         // interpreted (or is taken over by the loop below), but the next call
         // gets the compiled function.
-        if let Some(f) = self.current_fn.clone() {
-            if f.jit_state.get() == JitState::Cold {
-                self.try_compile(&f);
-            }
+        if running.jit_state.get() == JitState::Cold {
+            let f = running.clone();
+            self.try_compile(&f);
         }
         {
             let entry = self.loops.entry(id).or_default();
@@ -581,8 +582,8 @@ impl Vm {
 
     /// Give a frame's registers back, dropping whatever they held.
     pub(crate) fn close_frame(&mut self, base: usize, n_regs: usize) {
-        for i in base..base + n_regs {
-            self.stack[i] = Value::Nil;
+        for slot in &mut self.stack[base..base + n_regs] {
+            Value::put(slot, Value::Nil);
         }
         self.top = base;
     }
@@ -677,15 +678,7 @@ impl Vm {
             return Ok(());
         }
         self.frames.push((Rc::as_ptr(&func.proto), self.line));
-        let previous = if self.jit.enabled {
-            self.current_fn.replace(func.clone())
-        } else {
-            None
-        };
         let out = self.run_into(func, arg_start, nargs, ret_to, nres);
-        if self.jit.enabled {
-            self.current_fn = previous;
-        }
         self.frames.pop();
         out
     }

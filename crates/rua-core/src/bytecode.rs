@@ -168,3 +168,4 @@ impl std::fmt::Debug for Proto {
         write!(f, "proto {} ({} ops)", self.def.name, self.code.len())
     }
 }
+

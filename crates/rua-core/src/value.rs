@@ -116,16 +116,107 @@ pub use rua_jit::JitFn;
 /// measures as a ~10% interpreter speedup across the benchmark suite. The cost
 /// is one extra load to reach the bytes, which is cheap next to moving a third
 /// more memory on every register write.
+///
+/// The handle also carries the string's hash. A table lookup with a string key
+/// is the inner loop of any program that uses tables as objects, and hashing
+/// the bytes again at every one of them is pure repetition: the bytes cannot
+/// change. Computing it at creation costs one pass over a string that was just
+/// copied anyway, and leaves every later lookup a single load.
 #[derive(Clone)]
-pub struct RStr(Rc<Box<str>>);
+pub struct RStr(Rc<StrData>);
+
+#[derive(Debug)]
+pub struct StrData {
+    hash: u64,
+    s: Box<str>,
+}
+
+/// Short strings are interned, as they are in Lua: equal bytes mean one
+/// allocation, so `==` on two symbols is a pointer comparison and a table
+/// lookup keyed by a name never compares bytes at all. A program that uses
+/// tables as objects — or an interpreter, where every step compares symbols —
+/// does that constantly.
+///
+/// Long strings are left alone: interning them would compare the bytes on
+/// every creation, which is the cost it exists to avoid.
+const INTERN_MAX: usize = 40;
+
+thread_local! {
+    static INTERN: RefCell<Interner> = RefCell::new(Interner::default());
+}
+
+/// Strings by hash. Entries are dropped once the interner is the only holder,
+/// which is checked when the table has doubled since the last sweep — the
+/// reference count is the liveness information a mark phase would go looking
+/// for.
+#[derive(Default)]
+struct Interner {
+    map: FxMap<u64, Vec<RStr>>,
+    live: usize,
+    sweep_at: usize,
+}
+
+impl Interner {
+    fn intern(&mut self, hash: u64, s: &str) -> RStr {
+        let bucket = self.map.entry(hash).or_default();
+        for r in bucket.iter() {
+            if &*r.0.s == s {
+                return r.clone();
+            }
+        }
+        let fresh = RStr(Rc::new(StrData {
+            hash,
+            s: Box::from(s),
+        }));
+        bucket.push(fresh.clone());
+        self.live += 1;
+        if self.live > self.sweep_at {
+            self.sweep();
+        }
+        fresh
+    }
+
+    fn sweep(&mut self) {
+        let mut live = 0;
+        self.map.retain(|_, bucket| {
+            bucket.retain(|r| Rc::strong_count(&r.0) > 1);
+            live += bucket.len();
+            !bucket.is_empty()
+        });
+        self.live = live;
+        self.sweep_at = (live * 2).max(512);
+    }
+}
 
 impl RStr {
     pub fn new(s: &str) -> RStr {
-        RStr(Rc::new(Box::from(s)))
+        let hash = crate::hash::str_hash(s);
+        if s.len() > INTERN_MAX {
+            return RStr(Rc::new(StrData {
+                hash,
+                s: Box::from(s),
+            }));
+        }
+        // during thread teardown the table is gone; an uninterned string is
+        // still a correct string
+        INTERN
+            .try_with(|i| i.borrow_mut().intern(hash, s))
+            .unwrap_or_else(|_| {
+                RStr(Rc::new(StrData {
+                    hash,
+                    s: Box::from(s),
+                }))
+            })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.0.s
+    }
+
+    /// The hash of the bytes, computed when the string was made.
+    #[inline]
+    pub fn hash_bits(&self) -> u64 {
+        self.0.hash
     }
 
     /// Do these two handles point at the same allocation? A cheap pre-test
@@ -139,20 +230,22 @@ impl std::ops::Deref for RStr {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.0
+        &self.0.s
     }
 }
 
 impl PartialEq for RStr {
     fn eq(&self, other: &Self) -> bool {
-        self.same(other) || **self == **other
+        // same allocation, then same hash, and only then the bytes: two
+        // different strings almost never reach the third test
+        self.same(other) || (self.0.hash == other.0.hash && self.0.s == other.0.s)
     }
 }
 impl Eq for RStr {}
 
 impl std::hash::Hash for RStr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        str::hash(self, state)
+        state.write_u64(self.0.hash)
     }
 }
 
@@ -176,7 +269,7 @@ impl From<&str> for RStr {
 
 impl From<String> for RStr {
     fn from(s: String) -> RStr {
-        RStr(Rc::new(s.into_boxed_str()))
+        RStr::new(&s)
     }
 }
 
@@ -240,6 +333,26 @@ pub enum Value {
 }
 
 impl Value {
+    /// Overwrite a slot with a new value.
+    ///
+    /// `*slot = v` is the same thing, but it always calls `Value`'s drop glue,
+    /// which is an out-of-line call: too big for LLVM to inline into every
+    /// register write in the interpreter. Most values written over are numbers
+    /// or nil, which need no drop at all, so this tests the tag first and only
+    /// calls the glue when there is something to release. It is worth about a
+    /// tenth of the interpreter.
+    #[inline(always)]
+    pub fn put(slot: &mut Value, v: Value) {
+        match slot {
+            Value::Nil | Value::Num(_) | Value::Bool(_) | Value::Ptr(_) => {
+                // SAFETY: the old value owns nothing, so overwriting the bytes
+                // leaks nothing; `v` is moved in and not dropped here.
+                unsafe { std::ptr::write(slot, v) }
+            }
+            _ => *slot = v,
+        }
+    }
+
     pub fn str(s: impl AsRef<str>) -> Value {
         Value::Str(RStr::new(s.as_ref()))
     }
@@ -465,7 +578,7 @@ impl Table {
         }
         for (k, v) in &self.pairs {
             if let Key::Str(ks) = k {
-                if ks.same(name) || **ks == **name {
+                if ks == name {
                     return Some(v.clone());
                 }
             }
@@ -482,7 +595,7 @@ impl Table {
         }
         for (k, slot) in &mut self.pairs {
             if let Key::Str(ks) = k {
-                if ks.same(name) || **ks == **name {
+                if ks == name {
                     *slot = v.clone();
                     return true;
                 }

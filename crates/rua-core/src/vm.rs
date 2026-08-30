@@ -11,6 +11,7 @@ use crate::value::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+
 /// One suspended call: where to go back to when the current function returns.
 ///
 /// rua calls used to recurse in Rust, which made script recursion depth a
@@ -48,11 +49,12 @@ impl Vm {
         for (i, p) in proto.params.iter().enumerate() {
             let v = args.get_mut(i).map(std::mem::take).unwrap_or(Value::Nil);
             let slot = self.base + p.reg as usize;
-            self.stack[slot] = if p.cell {
+            let v = if p.cell {
                 Value::Cell(Rc::new(RefCell::new(v)))
             } else {
                 v
             };
+            Value::put(&mut self.stack[slot], v);
         }
         args.clear();
         self.recycle_vec(args);
@@ -99,11 +101,12 @@ impl Vm {
                 Value::Nil
             };
             let slot = self.base + p.reg as usize;
-            self.stack[slot] = if p.cell {
+            let v = if p.cell {
                 Value::Cell(Rc::new(RefCell::new(v)))
             } else {
                 v
             };
+            Value::put(&mut self.stack[slot], v);
         }
 
         let out = self.execute(func);
@@ -121,7 +124,7 @@ impl Vm {
                     } else {
                         Value::Nil
                     };
-                    self.stack[ret_to + i] = v;
+                    Value::put(&mut self.stack[ret_to + i], v);
                 }
                 Ok(())
             }
@@ -186,7 +189,7 @@ impl Vm {
         debug_assert!((self.base + r as usize) < self.stack.len());
         let i = self.base + r as usize;
         // SAFETY: as in `at_reg`.
-        unsafe { *self.stack.get_unchecked_mut(i) = v };
+        unsafe { Value::put(self.stack.get_unchecked_mut(i), v) };
     }
 
     /// Run one function's code. The result is where its return values are:
@@ -612,7 +615,7 @@ impl Vm {
                     let counter = &proto.hints[hint as usize];
                     let n = counter.get().wrapping_add(1);
                     counter.set(n);
-                    pc = if n % LOOP_BATCH == 0 && self.note_loop(proto, id) {
+                    pc = if n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id) {
                         exit as usize
                     } else {
                         to as usize
@@ -624,7 +627,7 @@ impl Vm {
                     let counter = &proto.hints[hint as usize];
                     let n = counter.get().wrapping_add(1);
                     counter.set(n);
-                    if n % LOOP_BATCH == 0 && self.note_loop(proto, id) {
+                    if n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id) {
                         pc = exit as usize;
                     }
                 }
@@ -702,9 +705,6 @@ impl Vm {
             callee_regs,
         });
         self.push_frame(Rc::as_ptr(&f.proto), self.line);
-        if self.jit.enabled {
-            self.current_fn = Some(f.clone());
-        }
         let base = self.open_frame(callee_regs);
         for (i, p) in f.proto.params.iter().enumerate() {
             let v = if (i as u16) < nargs {
@@ -713,11 +713,12 @@ impl Vm {
                 Value::Nil
             };
             let slot = base + p.reg as usize;
-            self.stack[slot] = if p.cell {
+            let v = if p.cell {
                 Value::Cell(Rc::new(RefCell::new(v)))
             } else {
                 v
             };
+            Value::put(&mut self.stack[slot], v);
         }
         self.base = base;
         Ok(true)
@@ -734,7 +735,7 @@ impl Vm {
                 } else {
                     Value::Nil
                 };
-                self.stack[ret_to + i] = v;
+                Value::put(&mut self.stack[ret_to + i], v);
             }
             return;
         }
@@ -754,7 +755,8 @@ impl Vm {
             }
             want => {
                 for i in 0..want as usize {
-                    self.stack[ret_to + i] = vals.get(i).cloned().unwrap_or(Value::Nil);
+                    let v = vals.get(i).cloned().unwrap_or(Value::Nil);
+                    Value::put(&mut self.stack[ret_to + i], v);
                 }
                 vals.clear();
                 self.recycle_vec(vals);

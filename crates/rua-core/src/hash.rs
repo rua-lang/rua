@@ -64,3 +64,15 @@ impl Hasher for FxHasher {
 
 pub type FxBuild = BuildHasherDefault<FxHasher>;
 pub type FxMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
+
+/// The hash of a string, computed once when the string is made.
+///
+/// Every table lookup with a string key used to hash the bytes again. Symbol
+/// heavy programs — an interpreter written in rua, say — do that in their
+/// inner loop, so `RStr` carries the result instead.
+pub fn str_hash(s: &str) -> u64 {
+    let mut h = FxHasher::default();
+    h.write(s.as_bytes());
+    h.write_u8(0xff);
+    h.finish()
+}
