@@ -22,17 +22,18 @@ use std::rc::Rc;
 pub(crate) struct CallFrame {
     /// The function to go back to, which also keeps its code alive.
     caller: Rc<Function>,
-    base: usize,
-    pc: usize,
-    /// Where the callee's results belong, and how many are wanted.
-    ret_to: usize,
-    nres: u16,
-    upvals: Rc<Vec<CellRef>>,
+    /// Where the caller's registers and results are. These are stack offsets,
+    /// and the stack is bounded by the recursion limit times a frame size, so
+    /// they need no more than 32 bits — the record is built and copied on
+    /// every single call, and half of it was padding and spare range.
+    base: u32,
+    pc: u32,
+    ret_to: u32,
     /// The line the call was made from, for the traceback.
     line: u32,
-    /// The callee's frame size, so its registers can be handed back on the way
-    /// out — including when an error unwinds several frames at once.
-    callee_regs: usize,
+    /// How many results the caller wants.
+    nres: u16,
+    upvals: Rc<Vec<CellRef>>,
 }
 
 impl Vm {
@@ -73,7 +74,7 @@ impl Vm {
             Err(e) => Err(e),
         };
 
-        self.close_frame(self.base, proto.n_regs);
+        self.close_frame(self.base);
         self.base = saved_base;
         self.upvals = saved_upvals;
         result
@@ -161,7 +162,7 @@ impl Vm {
             Err(e) => Err(e),
         };
 
-        self.close_frame(self.base, proto.n_regs);
+        self.close_frame(self.base);
         self.base = saved_base;
         self.upvals = saved_upvals;
         copied.map(|_| ())
@@ -184,8 +185,8 @@ impl Vm {
             // an error left calls suspended: give their registers back and put
             // the interpreter's state where the Rust caller expects it
             while let Some(fr) = frames.pop() {
-                self.close_frame(self.base, fr.callee_regs);
-                self.base = fr.base;
+                self.close_frame(self.base);
+                self.base = fr.base as usize;
                 self.upvals = fr.upvals;
                 self.leave_depth();
                 self.pop_frame();
@@ -741,19 +742,17 @@ impl Vm {
             self.leave_depth();
             return Ok(false);
         }
-        let callee_regs = f.proto.n_regs;
         frames.push(CallFrame {
             caller: current.clone(),
-            base: self.base,
-            pc,
-            ret_to,
+            base: self.base as u32,
+            pc: pc as u32,
+            ret_to: ret_to as u32,
+            line: self.line,
             nres,
             upvals: std::mem::replace(&mut self.upvals, f.upvals.clone()),
-            line: self.line,
-            callee_regs,
         });
         self.push_frame(Rc::as_ptr(&f.proto), self.line);
-        let base = self.open_frame(callee_regs);
+        let base = self.open_frame(f.proto.n_regs);
         for (i, p) in f.proto.params.iter().enumerate() {
             let v = if (i as u16) < nargs {
                 std::mem::take(&mut self.stack[arg_start + i])
@@ -787,6 +786,45 @@ impl Vm {
             }
             return;
         }
+        // Whatever is being returned, find where it is: the returning
+        // function's registers, or the results of the call it ended with,
+        // which are usually still in registers themselves.
+        let from = if n == MULTI {
+            match self.multi_in_regs() {
+                Some((at, k)) => Some((at, k)),
+                None => None,
+            }
+        } else {
+            Some((start, n))
+        };
+
+        // A caller that wants a spread reserved one register and reads the rest
+        // from the buffer, so results can only stay in registers when there is
+        // at most one of them — or when the caller asked for a fixed count, and
+        // reserved exactly that many.
+        let fits = from.is_some_and(|(_, count)| nres != MULTI || count <= 1);
+        if let (true, Some((src, count))) = (fits, from) {
+            // A register to register move: the source frame sits above the
+            // destination, so the two windows never overlap.
+            let want = if nres == MULTI { count } else { nres };
+            for i in 0..want as usize {
+                let v = if (i as u16) < count {
+                    self.stack[src + i].clone()
+                } else {
+                    Value::Nil
+                };
+                Value::put(&mut self.stack[ret_to + i], v);
+            }
+            if nres == MULTI {
+                self.set_multi_at(ret_to, want);
+            } else {
+                self.multi_at = None;
+            }
+            return;
+        }
+
+        // The remaining cases need the values as a list: more results than the
+        // caller reserved room for, or results a native produced.
         let mut vals = if n == MULTI {
             self.take_multi()
         } else {
@@ -798,7 +836,8 @@ impl Vm {
         };
         match nres {
             MULTI => {
-                self.stack[ret_to] = vals.first().cloned().unwrap_or(Value::Nil);
+                let first = vals.first().cloned().unwrap_or(Value::Nil);
+                Value::put(&mut self.stack[ret_to], first);
                 self.set_multi(vals);
             }
             want => {
@@ -816,14 +855,14 @@ impl Vm {
     /// where the caller left off.
     #[inline(never)]
     fn leave_frame(&mut self, base: Reg, n: u16, fr: CallFrame) -> (Rc<Function>, usize) {
-        self.return_values(base, n, fr.ret_to, fr.nres);
-        self.close_frame(self.base, fr.callee_regs);
-        self.base = fr.base;
+        self.return_values(base, n, fr.ret_to as usize, fr.nres);
+        self.close_frame(self.base);
+        self.base = fr.base as usize;
         self.upvals = fr.upvals;
         self.leave_depth();
         self.pop_frame();
         self.line = fr.line;
-        (fr.caller, fr.pc)
+        (fr.caller, fr.pc as usize)
     }
 
     /// Move `n` registers out into a fresh (pooled) vector.

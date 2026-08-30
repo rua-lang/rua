@@ -124,6 +124,12 @@ pub struct Vm {
     pool: Vec<Vec<Value>>,
     /// The values of the last call that produced "as many as there are".
     multi: Vec<Value>,
+    /// Where the last multi-value call left its results, when they are still
+    /// sitting in the registers it wrote them to: the stack index and how
+    /// many. A call whose results feed straight into another call or a return
+    /// — which is what a tail position is — then needs no vector at all.
+    /// While this is set, `multi` is empty.
+    pub(crate) multi_at: Option<(u32, u16)>,
     /// The function being executed, so that a hot loop can nominate it for
     /// compilation. Only tracked when the JIT is on, since that is the only
     /// The statement being executed, and the call stack above it, so that an
@@ -192,6 +198,7 @@ impl Vm {
             top: 0,
             pool: Vec::new(),
             multi: Vec::new(),
+            multi_at: None,
             line: 0,
             frames: Vec::new(),
             modules: HashMap::new(),
@@ -610,8 +617,13 @@ impl Vm {
     }
 
     /// Give a frame's registers back, dropping whatever they held.
-    pub(crate) fn close_frame(&mut self, base: usize, n_regs: usize) {
-        for slot in &mut self.stack[base..base + n_regs] {
+    ///
+    /// The frame reaches from `base` to the top of the stack: a call that
+    /// opened a frame above this one closed it again on the way out, so `top`
+    /// is where this frame ends and the callee's register count need not be
+    /// carried around to find it.
+    pub(crate) fn close_frame(&mut self, base: usize) {
+        for slot in &mut self.stack[base..self.top] {
             Value::put(slot, Value::Nil);
         }
         self.top = base;
@@ -720,15 +732,39 @@ impl Vm {
         }
     }
 
-    /// Take the values of the last multi-value call.
+    /// Take the values of the last multi-value call, as a vector. Results
+    /// left in registers are copied out here, which is why the paths that can
+    /// consume them where they lie do so before calling this.
     pub(crate) fn take_multi(&mut self) -> Vec<Value> {
+        if let Some((at, n)) = self.multi_at.take() {
+            let mut out = self.take_vec(n as usize);
+            for i in 0..n as usize {
+                out.push(self.stack[at as usize + i].clone());
+            }
+            return out;
+        }
         let empty = self.take_vec(0);
         std::mem::replace(&mut self.multi, empty)
     }
 
     pub(crate) fn set_multi(&mut self, vals: Vec<Value>) {
+        self.multi_at = None;
         let old = std::mem::replace(&mut self.multi, vals);
         self.recycle_vec(old);
+    }
+
+    /// Publish results that are already in registers.
+    pub(crate) fn set_multi_at(&mut self, at: usize, n: u16) {
+        if !self.multi.is_empty() {
+            let old = std::mem::take(&mut self.multi);
+            self.recycle_vec(old);
+        }
+        self.multi_at = Some((at as u32, n));
+    }
+
+    /// Where the last call's results are, if they are still in registers.
+    pub(crate) fn multi_in_regs(&self) -> Option<(usize, u16)> {
+        self.multi_at.map(|(at, n)| (at as usize, n))
     }
 
     /// The global slot a chunk's reference points at, resolving it once.
