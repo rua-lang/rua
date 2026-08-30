@@ -429,6 +429,48 @@ impl Jit {
         Ok(CompiledLoop { code, slots, kinds: kind_list, inlined: cx.inlined })
     }
 
+    /// Keep the on-disk cache from growing without limit.
+    ///
+    /// Every distinct version of every compiled function leaves an object
+    /// behind, and a session that edits code as it runs produces a lot of them.
+    /// Oldest go first; anything still mapped by a running process stays valid
+    /// until it unmaps, and a later run simply recompiles what it needs.
+    fn prune_cache(&self) {
+        let cap = std::env::var("RUA_JIT_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(128)
+            * 1024
+            * 1024;
+        let Ok(entries) = std::fs::read_dir(&self.dir) else { return };
+        let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = Vec::new();
+        let mut total = 0u64;
+        for e in entries.flatten() {
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            total += meta.len();
+            files.push((modified, meta.len(), e.path()));
+        }
+        if total <= cap {
+            return;
+        }
+        // drop the oldest until comfortably under, so this does not run every
+        // time a single object is added
+        files.sort_by_key(|(t, _, _)| *t);
+        let target = cap / 2;
+        for (_, len, path) in files {
+            if total <= target {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total -= len;
+            }
+        }
+    }
+
     /// Write the source out, run rustc over it, and dlopen the result.
     ///
     /// `stem` names the files and `symbol` names the entry point: they differ
@@ -455,7 +497,14 @@ impl Jit {
             let tmp = self.dir.join(format!("lib{stem}.{}.tmp", std::process::id()));
             let out = Command::new("rustc")
                 .args([
-                    "--edition", "2021", "-O", "-C", "debuginfo=0", "--crate-type", "cdylib",
+                    "--edition", "2021", "-O", "-C", "debuginfo=0",
+                    // an unstripped object is 4MB of symbol table for a
+                    // function of a dozen instructions
+                    "-C", "strip=symbols",
+                    // generated code cannot panic, and unwinding out of it
+                    // across the FFI boundary would be undefined anyway
+                    "-C", "panic=abort",
+                    "--crate-type", "cdylib",
                     // the file name carries a hash and a pid, which is not a
                     // legal crate name
                     "--crate-name", "rua_jit_unit", "-o",
@@ -473,6 +522,7 @@ impl Jit {
             }
             std::fs::rename(&tmp, &so).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_file(&rs);
+            self.prune_cache();
         }
         // SAFETY: a cdylib we just produced, whose symbol we just named. The
         // handle is leaked so the code pages outlive every call site.
