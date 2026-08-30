@@ -531,6 +531,7 @@ impl Vm {
                         at!(val),
                     ) {
                         (Value::Table(t), Value::Num(n), v) => t.borrow_mut().set_num(*n, v),
+                        (Value::Table(t), Value::Str(s), v) => t.borrow_mut().set_field(s, v),
                         _ => false,
                     };
                     if done {
@@ -559,6 +560,8 @@ impl Vm {
                         (Value::Table(t), Value::Num(n), v) => {
                             t.borrow_mut().set_num(*n, v)
                         }
+                        // `t[name] = v` with the name in a register
+                        (Value::Table(t), Value::Str(s), v) => t.borrow_mut().set_field(s, v),
                         _ => false,
                     };
                     if done {

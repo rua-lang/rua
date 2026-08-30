@@ -365,6 +365,24 @@ impl Value {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
+    /// The index of this value's type name in [`Value::TYPE_NAMES`].
+    pub fn type_index(&self) -> usize {
+        match self {
+            Value::Nil => 0,
+            Value::Bool(_) => 1,
+            Value::Num(_) => 2,
+            Value::Str(_) => 3,
+            Value::Table(_) => 4,
+            Value::Func(_) | Value::Native(_) => 5,
+            Value::Ptr(_) => 6,
+            Value::Cell(c) => c.borrow().type_index(),
+        }
+    }
+
+    pub const TYPE_NAMES: [&'static str; 7] = [
+        "nil", "boolean", "number", "string", "table", "function", "cdata",
+    ];
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Nil => "nil",
@@ -573,37 +591,56 @@ impl Table {
     /// scan is short; a table big enough to have built an index falls back.
     #[inline]
     pub fn get_field(&self, name: &RStr) -> Option<Value> {
-        if self.index.is_some() {
-            return None;
-        }
-        for (k, v) in &self.pairs {
-            if let Key::Str(ks) = k {
-                if ks == name {
-                    return Some(v.clone());
-                }
+        Some(match self.probe_str(name) {
+            Some(i) => self.pairs[i].1.clone(),
+            None => Value::Nil,
+        })
+    }
+
+    /// Where a string key lives in `pairs`.
+    ///
+    /// The hash index is keyed by `Key`, and building one from a name means an
+    /// `Rc` clone: an increment on the way in and a decrement on the way out,
+    /// at every field read in the program. This borrows the handle instead —
+    /// a bitwise copy that is never dropped and never leaves this function, so
+    /// nothing owns it and nothing double-frees.
+    #[inline]
+    fn probe_str(&self, name: &RStr) -> Option<usize> {
+        match &self.index {
+            Some(ix) => {
+                let borrowed = std::mem::ManuallyDrop::new(Key::Str(
+                    // SAFETY: `name` outlives `borrowed`, which is never
+                    // dropped, stored or handed out.
+                    unsafe { std::ptr::read(name) },
+                ));
+                ix.get(&borrowed).copied()
             }
+            None => self.pairs.iter().position(|(k, _)| match k {
+                Key::Str(ks) => ks == name,
+                _ => false,
+            }),
         }
-        Some(Value::Nil)
     }
 
     /// Write `t.field = v` in the same way. Returns whether it happened; a nil
     /// value goes the long way round, since removing an entry moves the rest.
     #[inline]
     pub fn set_field(&mut self, name: &RStr, v: &Value) -> bool {
-        if self.index.is_some() || matches!(v, Value::Nil) {
+        if matches!(v, Value::Nil) {
             return false;
         }
-        for (k, slot) in &mut self.pairs {
-            if let Key::Str(ks) = k {
-                if ks == name {
-                    *slot = v.clone();
-                    return true;
-                }
-            }
+        if let Some(i) = self.probe_str(name) {
+            self.pairs[i].1 = v.clone();
+            return true;
         }
         self.pairs.push((Key::Str(name.clone()), v.clone()));
-        if self.pairs.len() > INDEX_THRESHOLD {
-            self.reindex();
+        let last = self.pairs.len() - 1;
+        match &mut self.index {
+            Some(ix) => {
+                ix.insert(Key::Str(name.clone()), last);
+            }
+            None if self.pairs.len() > INDEX_THRESHOLD => self.reindex(),
+            None => {}
         }
         true
     }

@@ -86,7 +86,13 @@ fn base(vm: &mut Vm) {
     vm.register("format", |_vm, args| {
         one(Value::str(format_impl(&str_arg(args, 0)?, rest(args))?))
     });
-    vm.register("type", |_vm, args| one(Value::str(arg(args, 0).type_name())));
+    // The names are made once. `type(x)` is a test, not a string operation,
+    // and a script that leans on it — an interpreter written in rua, say —
+    // should not allocate and hash a fresh string every time it asks.
+    let type_names: Vec<Value> = Value::TYPE_NAMES.iter().map(|n| Value::str(n)).collect();
+    vm.register("type", move |_vm, args| {
+        one(type_names[arg(args, 0).type_index()].clone())
+    });
     vm.register("str", |_vm, args| one(Value::str(arg(args, 0).to_string())));
     vm.register("num", |_vm, args| {
         one(match arg(args, 0).as_num() {
