@@ -438,6 +438,19 @@ impl Vm {
                         pc = to as usize;
                     }
                 }
+                Op::JumpIfNotK { kind, a, k, to } => {
+                    let (x, y) = (self.at_reg(a), &proto.consts[k as usize]);
+                    let taken = match (x, y) {
+                        (Value::Num(x), Value::Num(y)) => num_cmp(kind, *x, *y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
+                        }
+                    };
+                    if !taken {
+                        pc = to as usize;
+                    }
+                }
                 Op::JumpBack { to, id, hint, exit } => {
                     let counter = &proto.hints[hint as usize];
                     let n = counter.get().wrapping_add(1);

@@ -155,6 +155,7 @@ impl FnCompiler {
             | Op::JumpIfFalse { to, .. }
             | Op::JumpIfTrue { to, .. }
             | Op::JumpIfNot { to, .. }
+            | Op::JumpIfNotK { to, .. }
             | Op::JumpBack { to, .. } => *to = target,
             Op::IterNext { exit, .. } => *exit = target,
             other => panic!("cannot patch {other:?}"),
@@ -288,10 +289,9 @@ impl FnCompiler {
             }
             Stat::While(id, cond, body) => {
                 let top = self.here();
-                let mark = self.mark();
-                let exit = self.branch_unless(cond);
-                self.release(mark);
-                self.loops.push(LoopCtx { breaks: vec![exit], continues: Vec::new() });
+                let mut exits = Vec::new();
+                self.cond_jump(cond, true, &mut exits);
+                self.loops.push(LoopCtx { breaks: exits, continues: Vec::new() });
                 self.block(body, None);
                 let ctx = self.loops.pop().expect("pushed above");
                 for at in ctx.continues {
@@ -456,27 +456,91 @@ impl FnCompiler {
 
     /// Compile `cond` as a branch taken when it is false, fusing the compare
     /// into the jump where it is one.
-    fn branch_unless(&mut self, cond: &Expr) -> usize {
-        if let Expr::Bin(op, a, b) = cond {
-            let kind = match op {
-                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
-                    Some(bin_kind(*op))
+    /// Compile a condition straight into branches.
+    ///
+    /// `if a < b && c == 0 { .. }` should be two compare-and-jumps, not two
+    /// booleans built in registers and then tested. Recursing through `&&`,
+    /// `||` and `!` the way Lua's `luaK_goiffalse` does keeps every operand out
+    /// of a register. The returned sites all jump when the condition fails
+    /// (`when_false`) or when it holds; the caller patches them.
+    fn cond_jump(&mut self, cond: &Expr, when_false: bool, out: &mut Vec<usize>) {
+        match cond {
+            Expr::Bin(BinOp::And, a, b) => {
+                if when_false {
+                    // either half failing fails the whole thing
+                    self.cond_jump(a, true, out);
+                    self.cond_jump(b, true, out);
+                } else {
+                    let mut skip = Vec::new();
+                    self.cond_jump(a, true, &mut skip);
+                    self.cond_jump(b, false, out);
+                    for at in skip {
+                        self.patch(at);
+                    }
                 }
-                _ => None,
-            };
+            }
+            Expr::Bin(BinOp::Or, a, b) => {
+                if when_false {
+                    let mut holds = Vec::new();
+                    self.cond_jump(a, false, &mut holds);
+                    self.cond_jump(b, true, out);
+                    for at in holds {
+                        self.patch(at);
+                    }
+                } else {
+                    self.cond_jump(a, false, out);
+                    self.cond_jump(b, false, out);
+                }
+            }
+            Expr::Un(UnOp::Not, a) => self.cond_jump(a, !when_false, out),
+            _ => {
+                let at = self.cond_leaf(cond, when_false);
+                out.push(at);
+            }
+        }
+    }
+
+    /// One comparison, or one value tested for truth.
+    fn cond_leaf(&mut self, cond: &Expr, when_false: bool) -> usize {
+        if let Expr::Bin(op, a, b) = cond {
+            // jumping when the comparison is *true* is the same as jumping
+            // when its opposite is false, so one instruction covers both
+            let kind = if when_false { compare_kind(*op) } else { compare_kind(*op).map(invert) };
             if let Some(kind) = kind {
                 let mark = self.mark();
                 let ra = self.operand(a);
-                let rb = self.operand(b);
+                let at = match self.const_operand(b) {
+                    Some(k) => self.emit(Op::JumpIfNotK { kind, a: ra, k, to: 0 }, 0),
+                    None => {
+                        let rb = self.operand(b);
+                        self.emit(Op::JumpIfNot { kind, a: ra, b: rb, to: 0 }, 0)
+                    }
+                };
                 self.release(mark);
-                return self.emit(Op::JumpIfNot { kind, a: ra, b: rb, to: 0 }, 0);
+                return at;
             }
         }
         let mark = self.mark();
         let c = self.alloc();
         self.expr(cond, c);
         self.release(mark);
-        self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0)
+        if when_false {
+            self.emit(Op::JumpIfFalse { cond: c, to: 0 }, 0)
+        } else {
+            self.emit(Op::JumpIfTrue { cond: c, to: 0 }, 0)
+        }
+    }
+
+    /// A literal that a comparison can take directly.
+    fn const_operand(&mut self, e: &Expr) -> Option<u16> {
+        let v = match e {
+            Expr::Num(n) => Value::Num(*n),
+            Expr::Str(s) => Value::str(&**s),
+            Expr::Bool(b) => Value::Bool(*b),
+            Expr::Nil => Value::Nil,
+            _ => return None,
+        };
+        Some(self.constant(v))
     }
 
     fn patch_to(&mut self, at: usize, target: u32) {
@@ -484,7 +548,8 @@ impl FnCompiler {
             Op::Jump { to }
             | Op::JumpIfFalse { to, .. }
             | Op::JumpIfTrue { to, .. }
-            | Op::JumpIfNot { to, .. } => *to = target,
+            | Op::JumpIfNot { to, .. }
+            | Op::JumpIfNotK { to, .. } => *to = target,
             other => panic!("cannot patch {other:?}"),
         }
     }
@@ -736,13 +801,16 @@ impl FnCompiler {
     fn if_expr(&mut self, arms: &[(Expr, Block)], els: Option<&Block>, dst: Option<Reg>) {
         let mut ends = Vec::new();
         for (i, (cond, body)) in arms.iter().enumerate() {
-            let next = self.branch_unless(cond);
+            let mut next = Vec::new();
+            self.cond_jump(cond, true, &mut next);
             self.block(body, dst);
             let is_last = i + 1 == arms.len() && els.is_none();
             if !is_last {
                 ends.push(self.emit(Op::Jump { to: 0 }, 0));
             }
-            self.patch(next);
+            for at in next {
+                self.patch(at);
+            }
         }
         match els {
             Some(b) => self.block(b, dst),
@@ -801,11 +869,7 @@ impl FnCompiler {
                 self.patch(at);
             }
             if let Some(guard) = &arm.guard {
-                let m = self.mark();
-                let g = self.alloc();
-                self.expr(guard, g);
-                misses.push(self.emit(Op::JumpIfFalse { cond: g, to: 0 }, 0));
-                self.release(m);
+                self.cond_jump(guard, true, &mut misses);
             }
             self.block(&arm.body, dst);
             ends.push(self.emit(Op::Jump { to: 0 }, 0));
@@ -915,9 +979,12 @@ impl FnCompiler {
     /// any of them keeps its extra values.
     fn if_ret(&mut self, arms: &[(Expr, Block)], els: Option<&Block>) {
         for (cond, body) in arms {
-            let next = self.branch_unless(cond);
+            let mut next = Vec::new();
+            self.cond_jump(cond, true, &mut next);
             self.block_ret(body);
-            self.patch(next);
+            for at in next {
+                self.patch(at);
+            }
         }
         match els {
             Some(b) => self.block_ret(b),
@@ -955,6 +1022,27 @@ fn compile_function(def: &Rc<FuncDef>) -> Rc<Proto> {
     let mut f = FnCompiler::new(def.clone(), def.n_slots);
     f.block_ret(&def.body);
     Rc::new(f.finish())
+}
+
+/// The comparison this operator is, if it is one.
+fn compare_kind(op: BinOp) -> Option<BinKind> {
+    match op {
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => Some(bin_kind(op)),
+        _ => None,
+    }
+}
+
+/// The comparison that is true exactly when this one is false.
+fn invert(kind: BinKind) -> BinKind {
+    match kind {
+        BinKind::Lt => BinKind::Ge,
+        BinKind::Ge => BinKind::Lt,
+        BinKind::Le => BinKind::Gt,
+        BinKind::Gt => BinKind::Le,
+        BinKind::Eq => BinKind::Ne,
+        BinKind::Ne => BinKind::Eq,
+        other => other,
+    }
 }
 
 fn bin_kind(op: BinOp) -> BinKind {

@@ -957,3 +957,39 @@ fn object_keys_keep_their_identity() {
     assert_eq!(out[2].to_string(), "value", "the key still finds its entry");
     assert_eq!(out[3], Value::Num(2.0));
 }
+
+/// Conditions compile straight to branches now, through `&&`, `||` and `!`.
+/// That rewrite has to preserve short-circuiting, rua's truthiness (every
+/// number is true, including 0) and the value forms of the same operators.
+#[test]
+fn conditions_keep_their_semantics() {
+    // short circuit: the right side must not run
+    assert_eq!(
+        s(r#"
+        let calls = []
+        fn t(name, v) { calls.push(name); v }
+        if t("a", false) && t("b", true) { }
+        if t("c", true) || t("d", true) { }
+        calls.join(",")
+    "#),
+        "a,c"
+    );
+    // truthiness in condition position
+    assert_eq!(s(r#"if 0 { "t" } else { "f" }"#), "t");
+    assert_eq!(s(r#"if "" { "t" } else { "f" }"#), "t");
+    assert_eq!(s(r#"if nil { "t" } else { "f" }"#), "f");
+    assert_eq!(s(r#"if !nil { "t" } else { "f" }"#), "t");
+    assert_eq!(s(r#"if !0 { "t" } else { "f" }"#), "f");
+    // chains, with and without constants
+    assert_eq!(s(r#"let n = 5; if n > 1 && n < 10 && n != 7 { "in" } else { "out" }"#), "in");
+    assert_eq!(s(r#"let n = 5; if !(n > 1) || n == 5 { "y" } else { "n" }"#), "y");
+    assert_eq!(s(r#"let n = 5; if n < 1 || n > 9 { "y" } else { "n" }"#), "n");
+    // as values they still yield an operand, not a boolean
+    assert_eq!(s(r#"false || "fallback""#), "fallback");
+    assert_eq!(s(r#"0 && "zero is true""#), "zero is true");
+    // in a while condition and a match guard
+    assert_eq!(n("let i = 0; while i < 3 && true { i += 1 } i"), 3.0);
+    assert_eq!(s(r#"match 4 { x if x > 1 && x < 9 => "mid", _ => "out" }"#), "mid");
+    // comparison against a nil constant
+    assert_eq!(s(r#"let t = #{}; if t.missing == nil { "absent" } else { "present" }"#), "absent");
+}

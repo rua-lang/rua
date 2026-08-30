@@ -63,6 +63,9 @@ pub enum Op {
     /// Compare and branch in one: jump when `a <kind> b` is false. Loop
     /// conditions are the whole reason this exists.
     JumpIfNot { kind: BinKind, a: Reg, b: Reg, to: u32 },
+    /// The same against a constant: `x == 0`, `t[i] == nil`. Comparing with a
+    /// literal is most of what conditions do.
+    JumpIfNotK { kind: BinKind, a: Reg, k: u16, to: u32 },
     /// A loop's back edge: count the iteration for the JIT and jump. `exit` is
     /// where to continue if the JIT takes the loop over.
     JumpBack { to: u32, id: u32, hint: u16, exit: u32 },
