@@ -54,6 +54,19 @@ pub enum Op {
     Bin { kind: BinKind, dst: Reg, a: Reg, b: Reg },
     /// The same, with a constant on the right: `i + 1`, `x < n`, `x % 5`.
     BinK { kind: BinKind, dst: Reg, a: Reg, k: u16 },
+
+    // The four arithmetic operations that dominate every profile, given their
+    // own opcodes so the VM branches once on the instruction rather than a
+    // second time on the operation. A rewrite pass produces these from `Bin`
+    // and `BinK`; everything else keeps the generic form, because specialising
+    // the whole table measured *worse* — the jump table stops fitting.
+    Add { dst: Reg, a: Reg, b: Reg },
+    Sub { dst: Reg, a: Reg, b: Reg },
+    Mul { dst: Reg, a: Reg, b: Reg },
+    Div { dst: Reg, a: Reg, b: Reg },
+    AddK { dst: Reg, a: Reg, k: u16 },
+    SubK { dst: Reg, a: Reg, k: u16 },
+    MulK { dst: Reg, a: Reg, k: u16 },
     Neg { dst: Reg, a: Reg },
     Not { dst: Reg, a: Reg },
 

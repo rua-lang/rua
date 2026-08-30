@@ -125,12 +125,16 @@ pub struct Vm {
     /// The values of the last call that produced "as many as there are".
     multi: Vec<Value>,
     /// The function being executed, so that a hot loop can nominate it for
-    /// compilation.
+    /// compilation. Only tracked when the JIT is on, since that is the only
+    /// thing that reads it.
     pub(crate) current_fn: Option<Rc<Function>>,
     /// The statement being executed, and the call stack above it, so that an
     /// error can say where it happened.
     line: u32,
-    frames: Vec<(Rc<str>, u32)>,
+    /// One entry per active call: the function, and the line it was called
+    /// from. The pointer is valid because the call that pushed it is still on
+    /// the Rust stack, holding the function alive.
+    frames: Vec<(*const crate::bytecode::Proto, u32)>,
     /// Modules already loaded by `require`, keyed by canonical path.
     pub modules: HashMap<String, Value>,
     /// Compiled functions that inlined a call to a global, so that assigning to
@@ -163,7 +167,7 @@ pub struct Vm {
 /// too, which recurses natively. An unoptimised build's frames are several
 /// times larger than a release build's, and this has to be safe in both, so it
 /// is set from what a debug build survives on a 2MB thread with room to spare.
-const MAX_DEPTH: i64 = 150;
+const MAX_DEPTH: i64 = 120;
 
 impl Default for Vm {
     fn default() -> Self {
@@ -382,12 +386,12 @@ impl Vm {
                 message: e.message.clone(),
                 located: true,
                 line,
-                where_: self
+                where_: self.frames.last().map(|(p, _)| frame_name(*p)).filter(|n| !n.is_empty()),
+                trace: self
                     .frames
-                    .last()
-                    .map(|(n, _)| n.clone())
-                    .filter(|n| !n.is_empty()),
-                trace: self.frames.clone(),
+                    .iter()
+                    .map(|(p, line)| (frame_name(*p), *line))
+                    .collect(),
             })),
             other => other,
         }
@@ -650,10 +654,19 @@ impl Vm {
                 }
             }
         }
-        self.frames.push((func.proto.name.clone(), self.line));
-        let previous = self.current_fn.replace(func.clone());
+        // The traceback holds a borrowed name rather than a counted one: the
+        // frame it names is on the Rust stack for as long as the entry is, and
+        // an error copies the name out while that is still true.
+        self.frames.push((Rc::as_ptr(&func.proto), self.line));
+        let previous = if self.jit.enabled {
+            self.current_fn.replace(func.clone())
+        } else {
+            None
+        };
         let out = self.run_into(func, arg_start, nargs, ret_to, nres);
-        self.current_fn = previous;
+        if self.jit.enabled {
+            self.current_fn = previous;
+        }
         self.frames.pop();
         out
     }
@@ -875,7 +888,7 @@ impl Vm {
                         }
                     }
                 }
-                self.frames.push((func.proto.name.clone(), self.line));
+                self.frames.push((Rc::as_ptr(&func.proto), self.line));
                 let out = self.run(func, args);
                 self.frames.pop();
                 out
@@ -1042,6 +1055,15 @@ fn hooks() -> RtHooks {
         push: rua_rt_push as *const () as usize,
         set: rua_rt_set as *const () as usize,
     }
+}
+
+/// The name of the function a traceback frame refers to.
+///
+/// # Safety
+/// Frames are popped as their calls return, so a pointer in the vector always
+/// belongs to a call still on the stack, which holds the proto alive.
+fn frame_name(p: *const crate::bytecode::Proto) -> Rc<str> {
+    unsafe { (*p).name.clone() }
 }
 
 /// Turn call arguments into the shape compiled code expects, or `None` when

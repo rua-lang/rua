@@ -52,7 +52,28 @@ impl FnCompiler {
         }
     }
 
-    fn finish(self) -> Proto {
+    /// Turn the generic arithmetic instructions into their specialised forms.
+    ///
+    /// Done here rather than at the emit sites so that the compiler stays
+    /// written in terms of one `Bin`, and the specialisation is a single table
+    /// to read and change.
+    fn specialise(code: &mut [Op]) {
+        for op in code.iter_mut() {
+            *op = match *op {
+                Op::Bin { kind: BinKind::Add, dst, a, b } => Op::Add { dst, a, b },
+                Op::Bin { kind: BinKind::Sub, dst, a, b } => Op::Sub { dst, a, b },
+                Op::Bin { kind: BinKind::Mul, dst, a, b } => Op::Mul { dst, a, b },
+                Op::Bin { kind: BinKind::Div, dst, a, b } => Op::Div { dst, a, b },
+                Op::BinK { kind: BinKind::Add, dst, a, k } => Op::AddK { dst, a, k },
+                Op::BinK { kind: BinKind::Sub, dst, a, k } => Op::SubK { dst, a, k },
+                Op::BinK { kind: BinKind::Mul, dst, a, k } => Op::MulK { dst, a, k },
+                other => other,
+            };
+        }
+    }
+
+    fn finish(mut self) -> Proto {
+        Self::specialise(&mut self.code);
         let params = self
             .def
             .param_bindings

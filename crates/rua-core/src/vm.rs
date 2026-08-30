@@ -85,9 +85,25 @@ impl Vm {
 
         let out = self.execute(proto);
         let copied = match out {
+            // The common case: a known number of results, straight across.
+            // `open_frame` puts the callee's registers above the caller's top,
+            // so the two windows are disjoint and no temporary is needed —
+            // routing every return through a pooled vector was costing about
+            // 150 host instructions per call.
+            Ok((rbase, n)) if n != MULTI && nres != MULTI => {
+                let start = self.base + rbase as usize;
+                for i in 0..nres as usize {
+                    let v = if (i as u16) < n {
+                        self.stack[start + i].clone()
+                    } else {
+                        Value::Nil
+                    };
+                    self.stack[ret_to + i] = v;
+                }
+                Ok(())
+            }
             Ok((rbase, n)) => {
-                // Collect first: the caller's result registers can overlap the
-                // callee's, so copying in place would read what it just wrote.
+                // A spread, which does need the values as a list.
                 let mut vals = if n == MULTI {
                     self.take_multi()
                 } else {
@@ -221,6 +237,77 @@ impl Vm {
                         (x, y) => {
                             let (x, y) = (x.clone(), y.clone());
                             arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                // the specialised arithmetic: one branch, not two
+                Op::Add { dst, a, b } => {
+                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::Sub { dst, a, b } => {
+                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::Mul { dst, a, b } => {
+                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::Div { dst, a, b } => {
+                    let v = match (self.at_reg(a), self.at_reg(b)) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x / y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Div, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::AddK { dst, a, k } => {
+                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::SubK { dst, a, k } => {
+                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
+                        }
+                    };
+                    self.set_reg(dst, v);
+                }
+                Op::MulK { dst, a, k } => {
+                    let v = match (self.at_reg(a), &proto.consts[k as usize]) {
+                        (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
+                        (x, y) => {
+                            let (x, y) = (x.clone(), y.clone());
+                            arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
                     self.set_reg(dst, v);
@@ -491,13 +578,13 @@ impl Vm {
             self.place(base, nres, vals);
             return Ok(());
         }
-        // a plain rua function needs no argument vector at all
+        // a plain rua function needs no argument vector at all, and the callee
+        // is already owned by our caller, so it needs no second refcount either
         if let Value::Func(func) = callee {
-            let func = func.clone();
             if self.enter_depth()? {
                 let arg_start = self.base + base as usize + 1;
                 let ret_to = self.base + base as usize;
-                let out = self.call_compiled_or_run(&func, arg_start, nargs, ret_to, nres);
+                let out = self.call_compiled_or_run(func, arg_start, nargs, ret_to, nres);
                 self.leave_depth();
                 return out;
             }
