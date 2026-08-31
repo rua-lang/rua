@@ -29,6 +29,8 @@ struct FnCompiler {
     protos: Vec<Rc<Proto>>,
     globals: Vec<GlobalRef>,
     hints: usize,
+    /// How many inline caches this function needs, one per constant field read.
+    caches: usize,
     free: Reg,
     max_regs: Reg,
     loops: Vec<LoopCtx>,
@@ -45,6 +47,7 @@ impl FnCompiler {
             protos: Vec::new(),
             globals: Vec::new(),
             hints: 0,
+            caches: 0,
             free: n_slots as Reg,
             max_regs: n_slots as Reg,
             loops: Vec::new(),
@@ -90,6 +93,7 @@ impl FnCompiler {
             globals: self.globals,
             n_regs: self.max_regs as usize + 1,
             hints: (0..self.hints).map(|_| std::cell::Cell::new(0)).collect(),
+            caches: (0..self.caches).map(|_| std::cell::Cell::new(0)).collect(),
             params,
         }
     }
@@ -279,7 +283,8 @@ impl FnCompiler {
                     let cur = self.alloc();
                     match self.const_key(key) {
                         Some(k) => {
-                            self.emit(Op::GetIndexK { dst: cur, obj: o, k }, 0);
+                            let ic = self.next_cache();
+                            self.emit(Op::GetIndexK { dst: cur, obj: o, k, ic }, 0);
                             let rhs = self.operand(e);
                             self.emit(Op::Bin { kind, dst: cur, a: cur, b: rhs }, 0);
                             self.emit(Op::SetIndexK { obj: o, k, val: cur }, 0);
@@ -462,6 +467,13 @@ impl FnCompiler {
     }
 
     /// A fresh iteration counter slot for a loop.
+    /// A fresh inline cache slot for one constant field read.
+    fn next_cache(&mut self) -> u16 {
+        let at = self.caches as u16;
+        self.caches += 1;
+        at
+    }
+
     fn next_hint(&mut self) -> u16 {
         let hint = self.hints as u16;
         self.hints += 1;
@@ -713,7 +725,10 @@ impl FnCompiler {
                 let mark = self.mark();
                 let o = self.operand(obj);
                 match self.const_key(key) {
-                    Some(k) => self.emit(Op::GetIndexK { dst, obj: o, k }, 0),
+                    Some(k) => {
+                        let ic = self.next_cache();
+                        self.emit(Op::GetIndexK { dst, obj: o, k, ic }, 0)
+                    }
                     None => {
                         let k = self.operand(key);
                         self.emit(Op::GetIndex { dst, obj: o, key: k }, 0)

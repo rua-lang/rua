@@ -515,11 +515,14 @@ impl Vm {
                     };
                     set!(dst, v);
                 }
-                Op::GetIndexK { dst, obj, k } => {
+                Op::GetIndexK { dst, obj, k, ic } => {
                     let key = &proto.consts[k as usize];
                     let fast = match (at!(obj), key) {
                         (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
-                        (Value::Table(t), Value::Str(s)) => t.borrow().get_field(s),
+                        (Value::Table(t), Value::Str(s)) => {
+                            let at = &proto.caches[ic as usize];
+                            Some(t.borrow().get_field_cached(s, at))
+                        }
                         _ => None,
                     };
                     let v = match fast {

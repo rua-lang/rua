@@ -591,6 +591,28 @@ impl Table {
     /// otherwise a pointer comparison. Object-shaped tables are small, so the
     /// scan is short; a table big enough to have built an index falls back.
     #[inline]
+    /// `t.name`, remembering where it was found.
+    ///
+    /// A field read is a scan or a hash probe; both are avoidable, because the
+    /// same line of a program reads the same field of objects built the same
+    /// way. The cache holds a position, and checking it is one pointer
+    /// comparison — the names are interned, so equal names are one allocation.
+    #[inline]
+    pub fn get_field_cached(&self, name: &RStr, at: &std::cell::Cell<u32>) -> Value {
+        if let Some((Key::Str(ks), v)) = self.pairs.get(at.get() as usize) {
+            if ks.same(name) {
+                return v.clone();
+            }
+        }
+        match self.probe_str(name) {
+            Some(i) => {
+                at.set(i as u32);
+                self.pairs[i].1.clone()
+            }
+            None => Value::Nil,
+        }
+    }
+
     pub fn get_field(&self, name: &RStr) -> Option<Value> {
         Some(match self.probe_str(name) {
             Some(i) => self.pairs[i].1.clone(),

@@ -105,7 +105,7 @@ pub enum Op {
     /// `dst = obj[k]` for a constant index: `t[3]`, `node.left`. Most indexing
     /// in real code is this shape, and it saves loading the key into a
     /// register first.
-    GetIndexK { dst: Reg, obj: Reg, k: u16 },
+    GetIndexK { dst: Reg, obj: Reg, k: u16, ic: u16 },
     /// `obj[key] = val`
     SetIndex { obj: Reg, key: Reg, val: Reg },
     /// `obj[k] = val` for a constant index.
@@ -145,6 +145,10 @@ pub struct Proto {
     /// One iteration counter per loop, so counting costs a `Cell` bump rather
     /// than a hash lookup.
     pub hints: Vec<Cell<u32>>,
+    /// One slot per constant field read, remembering where that field was
+    /// found last time. Objects built the same way have their fields in the
+    /// same order, so the guess is nearly always right and the scan is skipped.
+    pub caches: Vec<Cell<u32>>,
     /// Parameters, in order, with the register each lands in.
     pub params: Vec<ParamSlot>,
 }
