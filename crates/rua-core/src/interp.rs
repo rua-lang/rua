@@ -610,12 +610,21 @@ impl Vm {
 
     /// Globals that already hold compiled code, with what their parameters
     /// have to be — a direct call can only pass numbers.
-    fn compiled_globals(&self) -> HashMap<String, (usize, Vec<Kind>)> {
+    fn compiled_globals(&self) -> HashMap<String, rua_jit::Callable> {
         let mut out = HashMap::new();
         for (name, slot) in &self.gnames {
             if let Value::Func(g) = &self.gvals[*slot as usize] {
                 if let Some(code) = g.jit.get() {
-                    out.insert(name.to_string(), (code.address(), g.param_kinds.borrow().clone()));
+                    out.insert(
+                        name.to_string(),
+                        rua_jit::Callable {
+                            addr: code.address(),
+                            kinds: g.param_kinds.borrow().clone(),
+                            // the syntax, so a small callee can be compiled
+                            // into the caller's object and inlined there
+                            def: Some(g.def().clone()),
+                        },
+                    );
                 }
             }
         }

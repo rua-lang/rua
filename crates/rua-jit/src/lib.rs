@@ -194,7 +194,7 @@ pub struct SelfRef {
     /// these become direct calls to their machine code. The runtime promises
     /// to throw the result away if any of them is reassigned. The kinds are
     /// the callee's parameters — a direct call can only pass numbers.
-    pub compiled_globals: HashMap<String, (usize, Vec<Kind>)>,
+    pub compiled_globals: HashMap<String, Callable>,
     /// Addresses of the runtime hooks compiled code calls for table reads.
     pub hooks: RtHooks,
 }
@@ -342,6 +342,7 @@ impl Jit {
         }
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
+        let self_hooks = self_ref.hooks;
         let Kinds { mut kinds, inner_of } = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
         // A loop may take a flag from outside and hand it back: the runtime
         // marshals those as booleans either way, so unlike a function's
@@ -383,6 +384,7 @@ impl Jit {
             mutable_views,
             bools,
             spans_used: HashSet::new(),
+            to_inline: Vec::new(),
             kinds,
             inner_of,
             len_of: length_locals(&wrapper),
@@ -537,6 +539,7 @@ impl Jit {
         let parsed: syn::File =
             syn::parse2(file).map_err(|e| format!("generated Rust did not parse: {e}"))?;
         let src = prettyplease::unparse(&parsed);
+        let src = self.splice_inlined(src, &symbol, &cx.to_inline, self_hooks)?;
         let code = self.build(&symbol, &symbol, &src, "a hot loop")?;
         // SAFETY: `build` returned the address of the `extern "C"` symbol above.
         let code: LoopFn = unsafe { std::mem::transmute::<*const (), LoopFn>(code) };
@@ -660,6 +663,7 @@ impl Jit {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
         }
+        let hooks = self_ref.hooks;
         let Kinds { mut kinds, inner_of } = infer_kinds(&def.body, &self_ref.compiled_globals)?;
         let bools = boolean_locals(
             &def.body,
@@ -701,6 +705,7 @@ impl Jit {
             mutable_views,
             bools,
             spans_used: HashSet::new(),
+            to_inline: Vec::new(),
             kinds,
             inner_of,
             len_of: length_locals(&def.body),
@@ -824,8 +829,57 @@ impl Jit {
         };
         let parsed: syn::File =
             syn::parse2(file).map_err(|e| format!("generated Rust did not parse: {e}"))?;
-        Ok((prettyplease::unparse(&parsed), cx.inlined, param_kinds))
+        let src = prettyplease::unparse(&parsed);
+        let src = self.splice_inlined(src, symbol, &cx.to_inline, hooks)?;
+        Ok((src, cx.inlined, param_kinds))
     }
+}
+
+impl Jit {
+    /// Compile the small callees into an object beside the code that calls
+    /// them, just above it, so that `rustc` can inline them.
+    fn splice_inlined(
+        &self,
+        mut src: String,
+        symbol: &str,
+        to_inline: &[std::rc::Rc<FuncDef>],
+        hooks: RtHooks,
+    ) -> Lower<String> {
+        if to_inline.is_empty() {
+            return Ok(src);
+        }
+        let mut extra = String::new();
+        for d in to_inline {
+            let sym = format!("rua_inl_{}", d.id);
+            let ends_with_return =
+                matches!(d.body.stats.last(), Some(Stat::Return(v)) if v.len() == 1);
+            let leaf = SelfRef {
+                upval: None,
+                global: None,
+                compiled_globals: HashMap::new(),
+                hooks,
+            };
+            let returns_nil = d.body.tail.is_none() && !ends_with_return;
+            let (callee_src, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
+            extra.push_str(item_of(&callee_src, &sym));
+        }
+        let at = item_start(&src, symbol);
+        src.insert_str(at, &extra);
+        Ok(src)
+    }
+}
+
+/// Where a generated file's entry point begins, attribute and all.
+fn item_start(src: &str, symbol: &str) -> usize {
+    let needle = format!("pub unsafe extern \"C\" fn {symbol}(");
+    let at = src.find(&needle).unwrap_or(src.len());
+    src[..at].rfind("#[no_mangle]").unwrap_or(at)
+}
+
+/// One generated file's entry point, without the preamble it shares with
+/// every other.
+fn item_of<'a>(src: &'a str, symbol: &str) -> &'a str {
+    &src[item_start(src, symbol)..]
 }
 
 impl Default for Jit {
@@ -979,10 +1033,7 @@ struct Kinds {
     inner_of: HashMap<u16, u16>,
 }
 
-fn infer_kinds(
-    b: &Block,
-    callees: &HashMap<String, (usize, Vec<Kind>)>,
-) -> Result<Kinds, String> {
+fn infer_kinds(b: &Block, callees: &Callees) -> Result<Kinds, String> {
     let mut kinds = HashMap::new();
     let mut bad = None;
     // `let b = t[i]` says nothing on its own: `b` is a number if it is used as
@@ -1368,8 +1419,18 @@ fn note(slot: u16, kind: Kind, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<
     }
 }
 
+/// A compiled global this function may call: where its code is, what it
+/// expects, and the syntax it was compiled from — which is what lets a small
+/// one be compiled into this object as well and inlined by `rustc`.
+#[derive(Clone, Debug)]
+pub struct Callable {
+    pub addr: usize,
+    pub kinds: Vec<Kind>,
+    pub def: Option<std::rc::Rc<FuncDef>>,
+}
+
 /// What the inference walk needs to know about the functions being called.
-type Callees = HashMap<String, (usize, Vec<Kind>)>;
+type Callees = HashMap<String, Callable>;
 
 fn kinds_block(
     b: &Block,
@@ -1504,8 +1565,8 @@ fn kinds_expr(
             // parameter's kind: that is how a table reaches a helper
             if let Expr::Global(name, _) = &**f {
                 match callees.get(&**name) {
-                    Some((_, param_kinds)) if param_kinds.len() == args.len() => {
-                        for (a, kind) in args.iter().zip(param_kinds) {
+                    Some(c) if c.kinds.len() == args.len() => {
+                        for (a, kind) in args.iter().zip(&c.kinds) {
                             match (a, kind) {
                                 (
                                     Expr::Local(b, _),
@@ -1749,6 +1810,7 @@ fn preamble() -> TokenStream {
             unused_variables,
             unused_assignments,
             unreachable_code,
+            unused_labels,
             dead_code
         )]
 
@@ -1954,6 +2016,9 @@ struct Ctx {
     /// Arrays of arrays reached as `t[k][j]`, which want every element's view
     /// fetched once on entry rather than one per access.
     spans_used: HashSet<u16>,
+    /// Small callees to compile into this object, so that `rustc` can inline
+    /// them instead of the call going through a pointer.
+    to_inline: Vec<std::rc::Rc<FuncDef>>,
     /// Does this code write through its views? They are fetched writable if
     /// so, and the runtime keeps or discards what was written.
     mutable_views: bool,
@@ -3204,11 +3269,44 @@ impl Ctx {
                 }
             });
         }
+        // A small callee with nothing but numbers is compiled into this
+        // object as well, and called by name: `rustc` then inlines it, where a
+        // call through the runtime's table cannot be. Spectral norm's kernel
+        // is one three-line function called n squared times.
+        if let Expr::Global(name, _) = f {
+            if let Some(c) = self.self_ref.compiled_globals.get(&**name) {
+                if let Some(def) = c.def.clone() {
+                    if c.kinds.len() == args.len()
+                        && c.kinds.iter().all(|k| *k == Kind::Num)
+                        && worth_inlining(&def)
+                    {
+                        let sym = format_ident!("rua_inl_{}", def.id);
+                        if !self.to_inline.iter().any(|d| d.id == def.id) {
+                            self.to_inline.push(def.clone());
+                        }
+                        self.inlined.push(name.to_string());
+                        let a: Vec<_> =
+                            args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
+                        let trap = self.on_trap.clone();
+                        return Ok(quote! {
+                            {
+                                let __args = [
+                                    #(RtArg { num: #a, table: std::ptr::null_mut() }),*
+                                ];
+                                let __r = unsafe { #sym(__args.as_ptr(), rt, ok) };
+                                if unsafe { *ok } == 0 { #trap }
+                                __r
+                            }
+                        });
+                    }
+                }
+            }
+        }
         // a call to another already compiled function becomes a direct call to
         // its machine code, at the address the runtime handed us
         if let Expr::Global(name, _) = f {
             let entry = self.self_ref.compiled_globals.get(&**name).cloned();
-            if let Some((_addr, kinds)) = entry {
+            if let Some(Callable { kinds, .. }) = entry {
                 if kinds.len() == args.len() {
                     // A direct call hands over an `RtArg` array, so it can pass
                     // a table the caller already holds — but never one the
@@ -3312,6 +3410,24 @@ impl Ctx {
         }
         Err("call to a non-inlinable function".into())
     }
+}
+
+/// Is this callee small and self-contained enough to compile into its
+/// caller's object?
+///
+/// It must call nothing itself — then it needs no callee table of its own, and
+/// the hooks it may use are the same in any context — and it must produce a
+/// value, since an inlined call is an expression.
+fn worth_inlining(def: &FuncDef) -> bool {
+    if !called_globals(def).is_empty() || def.params.len() > 4 {
+        return false;
+    }
+    if def.param_bindings.iter().any(|b| b.cell) {
+        return false;
+    }
+    let ends_with_return =
+        matches!(def.body.stats.last(), Some(Stat::Return(v)) if v.len() == 1);
+    def.body.tail.is_some() || ends_with_return
 }
 
 /// The math whitelist, shared by `math::sqrt(x)` and `x.sqrt()`.
