@@ -1507,9 +1507,10 @@ fn kinds_expr(
                     Some((_, param_kinds)) if param_kinds.len() == args.len() => {
                         for (a, kind) in args.iter().zip(param_kinds) {
                             match (a, kind) {
-                                (Expr::Local(b, _), Kind::Table | Kind::TableOut) => {
-                                    note(b.slot, *kind, kinds, bad)
-                                }
+                                (
+                                    Expr::Local(b, _),
+                                    Kind::Table | Kind::TableOut | Kind::Tables { .. },
+                                ) => note(b.slot, *kind, kinds, bad),
                                 _ => kinds_expr(a, kinds, bad, callees, links, longest),
                             }
                         }
