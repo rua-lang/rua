@@ -231,6 +231,13 @@ against zero. Which locals those are is a property of the scope, not the
 register: the compiler reuses one register for a flag in one block and a number
 in another.
 
+**A small callee is compiled into its caller's object.** A call between
+compiled functions otherwise goes through a pointer in the runtime's table,
+which nothing can inline across shared objects. A callee that calls nothing
+itself, takes only numbers and produces a value is emitted beside its caller
+and called by name, so `rustc` inlines it — spectral norm's kernel is three
+lines called n squared times, and the call cost more than the arithmetic.
+
 Everything compiled is an `f64`, and rua is Lua-shaped — every number is true,
 including `0` — so a boolean and the number encoding it are indistinguishable in
 compiled code. A condition therefore has to be *provably* boolean (a comparison,
@@ -279,26 +286,24 @@ list, the Y combinator. It spends its time on symbol lookup through chained
 environments, cons-cell allocation, string dispatch on special forms and deep
 recursion, and none of that is anything `rustc` can be handed.
 
-| | rua interp | rua + JIT | lua 5.4 | luajit |
-|---|---|---|---|---|
-| spectral norm | 1.19s | **0.060s** | 0.62s | 0.025s |
-| n-body | 1.16s | **0.098s** | 0.47s | 0.042s |
-| fannkuch | 0.58s | **0.106s** | 0.27s | 0.042s |
-| matrix multiply | 0.39s | **0.072s** | 0.17s | 0.018s |
-| n-queens | 0.13s | **0.040s** | 0.07s | 0.020s |
-| word frequency | 0.15s | 0.14s | 0.06s | 0.035s |
-| binary trees | 3.97s | 3.99s | 3.27s | 1.414s |
-| Scheme interpreter | 3.07s | 3.01s | 1.37s | 0.558s |
+| | rua interp | rua + JIT | lua 5.4 | luajit | vs luajit |
+|---|---|---|---|---|---|
+| n-body | 1.17s | **0.049s** | 0.474s | 0.042s | **1.17x** |
+| spectral norm | 1.19s | **0.053s** | 0.620s | 0.028s | 1.89x |
+| n-queens | 0.13s | **0.040s** | 0.073s | 0.020s | 2.00x |
+| fannkuch | 0.59s | **0.106s** | 0.278s | 0.052s | 2.04x |
+| matrix multiply | 0.35s | **0.068s** | 0.173s | 0.018s | 3.78x |
+| binary trees | 4.04s | 4.02s | 3.296s | 1.423s | 2.82x |
+| word frequency | 0.15s | 0.14s | 0.068s | 0.043s | 3.35x |
+| Scheme interpreter | 3.00s | 2.96s | 1.370s | 0.551s | 5.38x |
 
-**Five of the eight are faster than Lua 5.4** — spectral norm by 10x, n-body by
-4.8x, fannkuch by 2.6x, matrix multiply by 2.4x, n-queens by 1.8x. Against
-LuaJIT, which is the honest comparison for a language with a compiler, rua is
-2.0x to 2.8x off on everything it compiles and 4x to 5.4x off on the three it
-does not.
+**Five of the eight are faster than Lua 5.4** — n-body and spectral norm by
+about 10x, the rest by 1.8x to 2.6x — and n-body is within 17% of LuaJIT.
 
 Read that honestly. **Where the JIT applies it is decisive**, and **where it
-does not, rua is its interpreter** — 1.2–2.4x slower than Lua 5.4, and that is
-the gap that no longer has an easy answer.
+does not, rua is its interpreter** — 1.2x to 2.2x slower than Lua 5.4, and 2.8x
+to 5.4x off LuaJIT. That gap is the value representation, and it does not have
+an easy answer.
 
 What keeps the last three out of the compiler:
 
@@ -308,14 +313,7 @@ What keeps the last three out of the compiler:
 * **Returning a table**, which a compiled entry point cannot: it returns one
   `f64`.
 * **Closures, maps and allocation** — binary trees and the Scheme are made of
-  them, and an f64 compiler has nothing to offer.
-
-What used to be on that list and no longer is: arrays of arrays, an index the
-compiler cannot prove, a function that reads and writes the same table,
-recursion through a function that takes an array, a flag held in a local, a
-compound write to an element, and a loop whose iterations are few but heavy.
-Those seven were the whole difference between n-body at 29x off LuaJIT and
-n-body at 2.3x.
+  them.
 
 
 ### What the interpreter's time actually goes on
