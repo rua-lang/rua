@@ -259,20 +259,28 @@ recursion, and none of that is anything `rustc` can be handed.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| spectral norm | 1.25s | **0.09s** | 0.63s | 0.03s |
-| n-queens | 0.14s | 0.14s | 0.07s | 0.02s |
-| matrix multiply | 0.41s | 0.43s | 0.17s | 0.02s |
-| fannkuch | 0.66s | 0.68s | 0.27s | 0.04s |
-| word frequency | 0.16s | 0.17s | 0.07s | 0.05s |
-| n-body | 1.29s | 1.28s | 0.49s | 0.04s |
-| binary trees | 4.35s | 4.36s | 3.25s | 1.43s |
-| Scheme interpreter | 3.79s | 3.73s | 1.38s | 0.55s |
+| spectral norm | 1.17s | **0.09s** | 0.63s | 0.026s |
+| n-queens | 0.12s | 0.13s | 0.07s | 0.020s |
+| matrix multiply | 0.37s | 0.39s | 0.16s | 0.023s |
+| fannkuch | 0.61s | 0.62s | 0.27s | 0.043s |
+| word frequency | 0.17s | 0.16s | 0.06s | 0.036s |
+| n-body | 1.23s | 1.24s | 0.48s | 0.042s |
+| binary trees | 4.01s | 4.03s | 3.26s | 1.411s |
+| Scheme interpreter | 3.45s | 3.37s | 1.37s | 0.553s |
 
 Read that honestly. **Where the JIT applies it is decisive** — spectral norm is
-7x faster than Lua 5.4 and 14x faster than rua's own interpreter, because its
+7x faster than Lua 5.4 and 13x faster than rua's own interpreter, because its
 kernels are exactly what the compiler accepts: numbers and flat arrays. **Where
-it does not apply, rua is its interpreter**, and that is 1.3–2.8x slower than
+it does not apply, rua is its interpreter**, and that is 1.2–2.8x slower than
 Lua 5.4.
+
+**LuaJIT is another matter.** It is 3–30x ahead here, and the shape of the gap
+says why: where rua's compiler applies it is within 3.4x (spectral norm), and
+where it does not, LuaJIT's tracing compiler is running native code over n-body
+and matrix multiply while rua is interpreting them. Closing that is not a
+question of tuning the interpreter — it is whether the compiler covers the
+program. Nested tables, which is all that keeps n-body and matrix multiply out,
+would be the place to start.
 
 What keeps the other seven out of the compiler is worth being precise about:
 
@@ -318,15 +326,26 @@ several plausible ones were thrown away for measuring zero.
   measurement was taken against a binary that had not been rebuilt, because
   `cargo build --release` in this workspace builds the library and not the CLI.
   The lesson was cheap and the correction is the point of writing numbers down.
+* **Instruction count beat instruction cost on counted loops.** `for i in 0..n`
+  spent three instructions an iteration where Lua spends one, because Lua fuses
+  the step, the test and the jump. Fusing it too took a counting loop from 1.91G
+  host instructions to 1.17G, against Lua's 0.69G.
+* **A call should not copy its arguments.** Lua's callee registers *are* the
+  caller's argument slots. rua opened a fresh window above everything and moved
+  each argument into it; now the frame opens on the arguments and the common
+  call binds nothing at all.
+* **Not clearing a returning frame's registers** would be worth about 2.5%, and
+  is not taken: reference counting makes a stale slot a leak rather than the
+  delayed collection it would be under a GC.
 
-Since those changes the Scheme benchmark runs 21.1G instructions in 8.4G
-cycles, down from 28.0G and 12.6G. Lua runs the same program in 9.4G and 3.0G,
-so what is left is roughly 2.2x the instructions at a similar rate.
+Since those changes the Scheme benchmark runs 3.45s where it started at 5.65s.
+Lua runs the same program in 1.37s, and the remaining gap is about 2.2x the
+machine instructions at a slightly lower rate per cycle.
 
 Where they go is the value representation. Every register write drops what was
 there and every read of a heap value bumps a reference count; Lua's values are
 the same 16 bytes but garbage collected, so a copy is a plain move, and a call
-is 177 host instructions against rua's 545. Removing that — a POD value with a
+is 177 host instructions against rua's 570. Removing that — a POD value with a
 tracing GC — measured as a further 1.3x. It is a different interpreter, not a
 patch to this one. What this one does instead is hand the hot numeric parts to
 `rustc`.
