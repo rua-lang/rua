@@ -59,6 +59,12 @@ pub(crate) const LOOP_BATCH: u32 = 1000;
 /// a function that the ordinary call counter compiles anyway.
 const LOOP_HOT: u64 = 50_000;
 
+/// A loop counter set to this means "already compiled": the interpreter hands
+/// the loop over at once rather than counting another thousand iterations
+/// first. Counting is how a loop is *found*; once found, every iteration left
+/// in it belongs to the compiled code.
+pub(crate) const LOOP_READY: u32 = u32::MAX;
+
 /// The state of one loop: hot enough yet, and the code if it compiled.
 #[derive(Default)]
 struct LoopEntry {
@@ -465,6 +471,11 @@ impl Vm {
             return false;
         };
         self.consider_loop(id, &stat).unwrap_or(false)
+    }
+
+    /// Hand a loop the JIT has already taken to its compiled code.
+    pub(crate) fn enter_loop(&mut self, id: u32) -> bool {
+        self.run_compiled_loop(id, &Stat::Break).unwrap_or(false)
     }
 
     /// Run a loop that is already compiled, if its locals are all numbers.

@@ -6,7 +6,7 @@
 //! machinery here — only errors travel back up the Rust stack.
 
 use crate::bytecode::*;
-use crate::interp::{arith, Eval, Signal, Vm, LOOP_BATCH};
+use crate::interp::{arith, Eval, Signal, Vm, LOOP_BATCH, LOOP_READY};
 use crate::value::*;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -702,11 +702,28 @@ impl Vm {
                     };
                     if going {
                         let hits = &proto.hints[hint as usize];
-                        let n = hits.get().wrapping_add(1);
-                        hits.set(n);
+                        let n = hits.get();
                         // when the JIT takes the loop over it runs it out, and
                         // the instruction after this one is where that ends
-                        if !(n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id)) {
+                        let taken = if n == LOOP_READY {
+                            let ran = self.enter_loop(id);
+                            if !ran {
+                                // its locals are not what the compiled code
+                                // wants this time: go back to counting
+                                proto.hints[hint as usize].set(0);
+                            }
+                            ran
+                        } else {
+                            let n = n.wrapping_add(1);
+                            hits.set(n);
+                            let ran = n % LOOP_BATCH == 0
+                                && self.note_loop(proto, &current, id);
+                            if ran {
+                                proto.hints[hint as usize].set(LOOP_READY);
+                            }
+                            ran
+                        };
+                        if !taken {
                             pc = to as usize;
                         }
                         resync!();
@@ -714,13 +731,23 @@ impl Vm {
                 }
                 Op::JumpBack { to, id, hint, exit } => {
                     let counter = &proto.hints[hint as usize];
-                    let n = counter.get().wrapping_add(1);
-                    counter.set(n);
-                    pc = if n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id) {
-                        exit as usize
+                    let n = counter.get();
+                    let taken = if n == LOOP_READY {
+                        let ran = self.enter_loop(id);
+                        if !ran {
+                            proto.hints[hint as usize].set(0);
+                        }
+                        ran
                     } else {
-                        to as usize
+                        let n = n.wrapping_add(1);
+                        counter.set(n);
+                        let ran = n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id);
+                        if ran {
+                            proto.hints[hint as usize].set(LOOP_READY);
+                        }
+                        ran
                     };
+                    pc = if taken { exit as usize } else { to as usize };
                     resync!();
                 }
                 Op::LoopHint { id, hint, exit } => {
