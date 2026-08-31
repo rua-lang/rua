@@ -184,7 +184,7 @@ control to it *while the loop is running*, then picks the locals back up. That
 is on-stack replacement, and it is what makes a script's top level, or a `main`
 that is only ever called once, run at compiled speed.
 
-**Tables.** A parameter that is only ever indexed or asked for its
+**Tables.** A parameter that is indexed, appended to, or asked for its
 length is passed as a table. Compiled code gets a contiguous view of its array
 part — built on demand, thrown away by any write to the table, so it can never
 go stale — and reads elements straight out of it with a bounds check:
@@ -198,16 +198,26 @@ fn dot(a, b) {
 ```
 
 If an element turns out not to be a number, compiled code *traps*: it sets a
-flag and returns, and the interpreter runs the call instead — sound because
-nothing has been written yet.
+flag and returns, and the interpreter runs the call instead.
 
-Compiled code may also *append* to a table, which is what makes array building
-compile. That needs the trap never to happen after a write, so a function that
-appends may only read through an index the compiler can prove is in range
-(`t[i]` inside `for i in 0..t.len()` over that same table, where the body
-assigns neither), may not call another compiled function (whose trap would
-unwind past the writes), and is skipped entirely when the table it writes is
-the same one it reads.
+**Arrays of arrays** work the same way one level down. `let b = bodies[i]`
+binds an element, and the element's address and the view of its numbers are
+fetched there — once per binding rather than once per access — so `b[3]` is a
+load. `t[k][j]` without the binding compiles too, fetching the view at the
+access, which is worth it exactly when the element changes every time round the
+loop. The runtime checks on the way in that every element is a table of numbers
+long enough for the constant indexes the body uses, so the body needs no test
+of its own.
+
+**Writes go through the view, and a trap takes them back.** While compiled code
+runs, the numeric view *is* the table: a write is one store, and when the call
+ends the runtime copies the view back over the array part. If the call trapped
+instead, it throws the view away and every write goes with it, so the
+interpreter can run the call again from the start. That is what lets compiled
+code write and still bail out — a function that reads and writes the same
+table, indexes it somewhere the compiler cannot prove, or recurses through
+another compiled function, all compile. Only an *append* still forbids
+trapping, because it has really changed the array part.
 
 Everything compiled is an `f64`, and rua is Lua-shaped — every number is true,
 including `0` — so a boolean and the number encoding it are indistinguishable in
@@ -259,40 +269,47 @@ recursion, and none of that is anything `rustc` can be handed.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| spectral norm | 1.17s | **0.09s** | 0.63s | 0.026s |
-| n-queens | 0.12s | 0.13s | 0.07s | 0.020s |
-| matrix multiply | 0.37s | 0.39s | 0.16s | 0.023s |
-| fannkuch | 0.61s | 0.62s | 0.27s | 0.043s |
-| word frequency | 0.17s | 0.16s | 0.06s | 0.036s |
-| n-body | 1.23s | 1.24s | 0.48s | 0.042s |
-| binary trees | 4.01s | 4.03s | 3.26s | 1.411s |
-| Scheme interpreter | 3.45s | 3.37s | 1.37s | 0.553s |
+| spectral norm | 1.08s | **0.094s** | 0.63s | 0.025s |
+| n-body | 1.23s | **0.091s** | 0.48s | 0.044s |
+| n-queens | 0.14s | **0.034s** | 0.07s | 0.021s |
+| matrix multiply | 0.34s | 0.33s | 0.18s | 0.018s |
+| fannkuch | 0.59s | 0.63s | 0.28s | 0.047s |
+| word frequency | 0.15s | 0.16s | 0.06s | 0.035s |
+| binary trees | 3.89s | 3.87s | 3.26s | 1.427s |
+| Scheme interpreter | 3.37s | 3.31s | 1.37s | 0.553s |
 
-Read that honestly. **Where the JIT applies it is decisive** — spectral norm is
-7x faster than Lua 5.4 and 13x faster than rua's own interpreter, because its
-kernels are exactly what the compiler accepts: numbers and flat arrays. **Where
-it does not apply, rua is its interpreter**, and that is 1.2–2.8x slower than
-Lua 5.4.
+Three of the eight are faster than Lua 5.4 outright — spectral norm by 6.7x,
+n-body by 5.3x, n-queens by 2x — and those three are within 1.6x to 3.8x of
+LuaJIT.
 
-**LuaJIT is another matter.** It is 3–30x ahead here, and the shape of the gap
-says why: where rua's compiler applies it is within 3.4x (spectral norm), and
-where it does not, LuaJIT's tracing compiler is running native code over n-body
-and matrix multiply while rua is interpreting them. Closing that is not a
-question of tuning the interpreter — it is whether the compiler covers the
-program. Nested tables, which is all that keeps n-body and matrix multiply out,
-would be the place to start.
 
-What keeps the other seven out of the compiler is worth being precise about:
+Read that honestly. **Where the JIT applies it is decisive**, and **where it
+does not, rua is its interpreter** — 1.2–2.7x slower than Lua 5.4 and 2.7–6x
+off LuaJIT.
 
-* **Nested tables.** `bodies[i][3]` and `b[k][j]` — n-body and matrix multiply
-  are built on arrays of arrays, and compiled code only understands a flat one.
-* **Indices it cannot vouch for.** n-queens indexes `diag1[row + c]`. Proving
-  that in range needs value-range analysis; a real JIT would emit a guard and
-  deoptimise, which rua cannot do after a write (see the JIT section).
-* **Multiple return values**, which fannkuch's kernel uses.
-* **Strings, maps and allocation** — word frequency, binary trees and the
-  Scheme are made of exactly the things an f64-only compiler has nothing to say
-  about.
+**Against LuaJIT the gap is entirely about coverage.** On the three compiled
+benchmarks rua is 1.6–3.8x off it; on the five it will not compile, 4.4–18.6x.
+That is not a question of how fast the interpreter is. It is whether the
+compiler takes the program.
+
+What keeps the other five out is worth being precise about:
+
+* **Building tables.** Matrix multiply and word frequency create an array per
+  row (`let row = []`, `row.push(sum)`); fannkuch does the same in its setup.
+  Compiled code can append to a table it was handed, but cannot make one.
+* **Returning a table.** `multiply` hands back the matrix it built, and a
+  compiled entry point returns one `f64`.
+* **Control flow that returns down some paths and falls off the end of
+  others**, which is fannkuch's shape.
+* **Strings, maps and closures** — binary trees and the Scheme are made of
+  exactly the things an f64-only compiler has nothing to say about.
+
+What used to be on this list and no longer is: arrays of arrays, an index the
+compiler cannot prove, recursion through a function that takes an array, and a
+function that reads and writes the same table. Those four were what kept n-body
+and n-queens interpreted, and they came off it by making compiled writes
+undoable rather than by proving more.
+
 
 ### What the interpreter's time actually goes on
 
