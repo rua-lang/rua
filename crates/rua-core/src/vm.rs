@@ -421,9 +421,11 @@ impl Vm {
                 }
                 Op::Call { base, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
-                    // taking the callee by value avoids a second refcount:
-                    // switching to it moves the handle into `current`
-                    match get!(base) {
+                    // The callee register is dead once the call is under way
+                    // — the results land on top of it — so the handle is moved
+                    // out rather than copied: no reference count on the way in
+                    // and none on the way out.
+                    match unsafe { std::mem::take(&mut *regs.add(base as usize)) } {
                         Value::Func(f) => {
                             match self.enter_frame(&f, base, nargs, nres, &current, pc, frames) {
                                 Err(e) => return Err(self.here(proto, pc, e)),
