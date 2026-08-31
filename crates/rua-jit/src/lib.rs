@@ -2015,10 +2015,27 @@ impl Ctx {
                     // this code may not bail out part way, so an index it
                     // cannot vouch for is not compilable
                     return Err("an unproven index in code that cannot trap".into());
+                } else if self.mutable_views {
+                    // The index cannot be vouched for, so it is tested here:
+                    // inside the array part the write is a store through the
+                    // view, and anywhere else — growing the table, or landing
+                    // in the keyed part — is the interpreter's business.
+                    let (ptr, len) = span_idents(slot);
+                    let trap = self.on_trap.clone();
+                    let _ = &id;
+                    quote! {
+                        {
+                            let __i = #i;
+                            let __u = __i as usize;
+                            let __v = #v;
+                            if __i < 0.0 || __i.fract() != 0.0 || __u >= #len {
+                                unsafe { *ok = 0; }
+                                #trap
+                            }
+                            unsafe { *#ptr.add(__u) = __v; }
+                        }
+                    }
                 } else {
-                    // the write may be out of range — growing the table, or
-                    // landing in the keyed part — which the interpreter has to
-                    // do instead
                     let trap = self.on_trap.clone();
                     quote! {
                         unsafe { rua_set(rt, #id, #i, #v, ok) };
