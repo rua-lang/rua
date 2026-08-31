@@ -213,11 +213,23 @@ of its own.
 runs, the numeric view *is* the table: a write is one store, and when the call
 ends the runtime copies the view back over the array part. If the call trapped
 instead, it throws the view away and every write goes with it, so the
-interpreter can run the call again from the start. That is what lets compiled
-code write and still bail out — a function that reads and writes the same
-table, indexes it somewhere the compiler cannot prove, or recurses through
-another compiled function, all compile. Only an *append* still forbids
-trapping, because it has really changed the array part.
+interpreter can run the call again from the start. An append is recorded with
+the length the table had before it and truncated back the same way.
+
+Everything compiled code does to a table therefore undoes itself, and the rule
+that shaped the whole compiler — never trap once you have written — is gone
+with it. A function that reads and writes the same table, indexes it somewhere
+the compiler cannot prove, recurses through another compiled function, or
+builds an array while doing it, all compile.
+
+**A hot loop is entered at once, not every thousandth turn.** Counting is how a
+loop is found; once found, every iteration left in it belongs to the compiled
+code. The counter doubles as the flag, so the check costs the same cell read.
+
+**A local that only ever holds a boolean** is carried as 0.0/1.0 and tested
+against zero. Which locals those are is a property of the scope, not the
+register: the compiler reuses one register for a flag in one block and a number
+in another.
 
 Everything compiled is an `f64`, and rua is Lua-shaped — every number is true,
 including `0` — so a boolean and the number encoding it are indistinguishable in
@@ -269,46 +281,41 @@ recursion, and none of that is anything `rustc` can be handed.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| spectral norm | 1.08s | **0.094s** | 0.63s | 0.025s |
-| n-body | 1.23s | **0.091s** | 0.48s | 0.044s |
-| n-queens | 0.14s | **0.034s** | 0.07s | 0.021s |
-| matrix multiply | 0.34s | 0.33s | 0.18s | 0.018s |
-| fannkuch | 0.59s | 0.63s | 0.28s | 0.047s |
-| word frequency | 0.15s | 0.16s | 0.06s | 0.035s |
-| binary trees | 3.89s | 3.87s | 3.26s | 1.427s |
-| Scheme interpreter | 3.37s | 3.31s | 1.37s | 0.553s |
+| spectral norm | 1.19s | **0.060s** | 0.62s | 0.025s |
+| n-body | 1.16s | **0.098s** | 0.47s | 0.042s |
+| fannkuch | 0.58s | **0.106s** | 0.27s | 0.042s |
+| matrix multiply | 0.39s | **0.072s** | 0.17s | 0.018s |
+| n-queens | 0.13s | **0.040s** | 0.07s | 0.020s |
+| word frequency | 0.15s | 0.14s | 0.06s | 0.035s |
+| binary trees | 3.97s | 3.99s | 3.27s | 1.414s |
+| Scheme interpreter | 3.07s | 3.01s | 1.37s | 0.558s |
 
-Three of the eight are faster than Lua 5.4 outright — spectral norm by 6.7x,
-n-body by 5.3x, n-queens by 2x — and those three are within 1.6x to 3.8x of
-LuaJIT.
-
+**Five of the eight are faster than Lua 5.4** — spectral norm by 10x, n-body by
+4.8x, fannkuch by 2.6x, matrix multiply by 2.4x, n-queens by 1.8x. Against
+LuaJIT, which is the honest comparison for a language with a compiler, rua is
+2.0x to 2.8x off on everything it compiles and 4x to 5.4x off on the three it
+does not.
 
 Read that honestly. **Where the JIT applies it is decisive**, and **where it
-does not, rua is its interpreter** — 1.2–2.7x slower than Lua 5.4 and 2.7–6x
-off LuaJIT.
+does not, rua is its interpreter** — 1.2–2.4x slower than Lua 5.4, and that is
+the gap that no longer has an easy answer.
 
-**Against LuaJIT the gap is entirely about coverage.** On the three compiled
-benchmarks rua is 1.6–3.8x off it; on the five it will not compile, 4.4–18.6x.
-That is not a question of how fast the interpreter is. It is whether the
-compiler takes the program.
+What keeps the last three out of the compiler:
 
-What keeps the other five out is worth being precise about:
+* **Building tables and strings.** Word frequency creates an array per call and
+  joins strings; compiled code can append to a table it was handed but cannot
+  make one, and has nothing to say about strings at all.
+* **Returning a table**, which a compiled entry point cannot: it returns one
+  `f64`.
+* **Closures, maps and allocation** — binary trees and the Scheme are made of
+  them, and an f64 compiler has nothing to offer.
 
-* **Building tables.** Matrix multiply and word frequency create an array per
-  row (`let row = []`, `row.push(sum)`); fannkuch does the same in its setup.
-  Compiled code can append to a table it was handed, but cannot make one.
-* **Returning a table.** `multiply` hands back the matrix it built, and a
-  compiled entry point returns one `f64`.
-* **Control flow that returns down some paths and falls off the end of
-  others**, which is fannkuch's shape.
-* **Strings, maps and closures** — binary trees and the Scheme are made of
-  exactly the things an f64-only compiler has nothing to say about.
-
-What used to be on this list and no longer is: arrays of arrays, an index the
-compiler cannot prove, recursion through a function that takes an array, and a
-function that reads and writes the same table. Those four were what kept n-body
-and n-queens interpreted, and they came off it by making compiled writes
-undoable rather than by proving more.
+What used to be on that list and no longer is: arrays of arrays, an index the
+compiler cannot prove, a function that reads and writes the same table,
+recursion through a function that takes an array, a flag held in a local, a
+compound write to an element, and a loop whose iterations are few but heavy.
+Those seven were the whole difference between n-body at 29x off LuaJIT and
+n-body at 2.3x.
 
 
 ### What the interpreter's time actually goes on
