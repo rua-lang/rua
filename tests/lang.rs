@@ -1070,3 +1070,33 @@ fn method_call_spreading_a_call_keeps_its_receiver() {
         2.0
     );
 }
+
+/// Compiled code writes through a view of a table's numbers, and a trap throws
+/// that view away so the interpreter can run the call again from the start.
+/// If the writes survived a trap, the re-run would apply them twice — which is
+/// exactly what this checks, since the value written depends on what is there.
+#[test]
+fn a_trap_undoes_what_compiled_code_wrote() {
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm
+        .eval(
+            r#"
+        fn step(t, k) {
+            t[0] = t[0] + 1
+            t[k] = 0
+            t[0]
+        }
+        let t = [0, 0, 0, 0]
+        // in range: compiled after the first couple of calls
+        for i in 0..20 { step(t, 1) }
+        // out of range: the compiled code traps part way, having already
+        // written t[0], and the interpreter runs the whole call again
+        step(t, 99)
+        return t[0];
+        "#,
+        )
+        .unwrap();
+    assert!(vm.jit.compiled >= 1, "`step` should have been compiled");
+    assert_eq!(out[0].as_num().unwrap(), 21.0, "t[0] counted once per call");
+}

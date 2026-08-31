@@ -69,6 +69,10 @@ pub struct RtCtx {
     /// `fn(table, index, ptr_out, len_out, ok) -> table` — the table at
     /// `t[i]`, and a view of its array part.
     pub inner: usize,
+    /// The same two, for code that writes: the view is writable, and the
+    /// runtime keeps or discards what was written when the call ends.
+    pub span_mut: usize,
+    pub inner_mut: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -86,6 +90,8 @@ pub struct RtHooks {
     pub push: usize,
     pub set: usize,
     pub inner: usize,
+    pub span_mut: usize,
+    pub inner_mut: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -308,7 +314,9 @@ impl Jit {
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
         let Kinds { mut kinds, inner_of } = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
-        let writes = table_usage(&wrapper).traps_forbidden();
+        let usage = table_usage(&wrapper);
+        let writes = usage.traps_forbidden();
+        let mutable_views = usage.writes_tables();
         relax_checks(&mut kinds, writes);
         // in a loop there are no parameters, so nothing is stable by that route
         let stable: HashSet<u16> = HashSet::new();
@@ -322,6 +330,7 @@ impl Jit {
             inlined: Vec::new(),
             self_params_numeric: true,
             writes,
+            mutable_views,
             kinds,
             inner_of,
             len_of: length_locals(&wrapper),
@@ -409,10 +418,15 @@ impl Jit {
                 }
                 Kind::Table => {
                     let (ptr, len) = span_idents(*slot);
+                    let fetch = if mutable_views {
+                        quote! { let #ptr: *mut f64 = rua_span_mut(rt, #id, &mut #len, ok); }
+                    } else {
+                        quote! { let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok); }
+                    };
                     quote! {
                         let #id: *mut c_void = (*regs.add(#idx)).table;
                         let mut #len: usize = 0;
-                        let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok);
+                        #fetch
                         if *ok == 0 { return; }
                     }
                 }
@@ -576,7 +590,9 @@ impl Jit {
             return Err("a parameter is captured by a closure".into());
         }
         let Kinds { mut kinds, inner_of } = infer_kinds(&def.body, &self_ref.compiled_globals)?;
-        let writes = table_usage(&def.body).traps_forbidden();
+        let usage = table_usage(&def.body);
+        let writes = usage.traps_forbidden();
+        let mutable_views = usage.writes_tables();
         relax_checks(&mut kinds, writes);
         // Only parameters may be tables — except an element of an array of
         // arrays, which is a local by construction: `let b = bodies[i]`.
@@ -607,6 +623,7 @@ impl Jit {
             inlined: Vec::new(),
             self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
             writes,
+            mutable_views,
             kinds,
             inner_of,
             len_of: length_locals(&def.body),
@@ -647,10 +664,15 @@ impl Jit {
                 }
                 Kind::Table => {
                     let (ptr, len) = span_idents(b.slot);
+                    let fetch = if cx.mutable_views {
+                        quote! { let #ptr: *mut f64 = rua_span_mut(rt, #id, &mut #len, ok); }
+                    } else {
+                        quote! { let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok); }
+                    };
                     quote! {
                         let #id: *mut c_void = (*args.add(#idx)).table;
                         let mut #len: usize = 0;
-                        let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok);
+                        #fetch
                         if *ok == 0 { return 0.0; }
                     }
                 }
@@ -1392,6 +1414,8 @@ fn preamble() -> TokenStream {
             pub push: usize,
             pub set: usize,
             pub inner: usize,
+            pub span_mut: usize,
+            pub inner_mut: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1446,6 +1470,42 @@ fn preamble() -> TokenStream {
         }
 
         /// # Safety
+        /// As `rua_span`. What is written through this view is kept, or
+        /// thrown away, when the call that fetched it ends.
+        #[inline(always)]
+        unsafe fn rua_span_mut(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            len: *mut usize,
+            ok: *mut i32,
+        ) -> *mut f64 {
+            let f: unsafe extern "C" fn(*mut c_void, *mut usize, *mut i32) -> *mut f64 =
+                std::mem::transmute((*rt).span_mut as *const ());
+            f(t, len, ok)
+        }
+
+        /// # Safety
+        /// As `rua_inner`, for code that writes to the element.
+        #[inline(always)]
+        unsafe fn rua_inner_mut(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            i: f64,
+            ptr: *mut *mut f64,
+            len: *mut usize,
+            ok: *mut i32,
+        ) -> *mut c_void {
+            let f: unsafe extern "C" fn(
+                *mut c_void,
+                f64,
+                *mut *mut f64,
+                *mut usize,
+                *mut i32,
+            ) -> *mut c_void = std::mem::transmute((*rt).inner_mut as *const ());
+            f(t, i, ptr, len, ok)
+        }
+
+        /// # Safety
         /// `t` is a live table of tables and `i` an index inside it. The
         /// element's view stays valid for the same reason a top level one
         /// does: nothing reshapes it while this code runs.
@@ -1489,6 +1549,9 @@ fn preamble() -> TokenStream {
 /// Lowering context: which frame slots are in scope as plain f64 locals.
 struct Ctx {
     known: HashSet<u16>,
+    /// Does this code write through its views? They are fetched writable if
+    /// so, and the runtime keeps or discards what was written.
+    mutable_views: bool,
     /// Slots bound by `let b = t[i]` where the elements are tables, and the
     /// array they came from. Their view is fetched where they are bound rather
     /// than on entry.
@@ -1595,8 +1658,18 @@ struct TableUse {
 
 impl TableUse {
     /// May compiled code bail out to the interpreter part way through?
+    ///
+    /// An in-place write goes through the numeric view, and the runtime throws
+    /// that view away if the call traps, so those writes undo themselves. An
+    /// append does not: it has already changed the array part.
     fn traps_forbidden(&self) -> bool {
-        self.pushes || self.read.intersection(&self.written).next().is_some()
+        self.pushes
+    }
+
+    /// Does this code write to a table at all? Those it writes are handed to
+    /// it as writable views.
+    fn writes_tables(&self) -> bool {
+        !self.written.is_empty()
     }
 }
 
@@ -1875,11 +1948,22 @@ impl Ctx {
                 // table of numbers, and the index is proven, so this cannot
                 // fail; the check is what makes that a wrong answer rather
                 // than a wild pointer if it ever did.
+                let fetch = if self.mutable_views {
+                    quote! {
+                        let mut #ptr: *mut f64 = std::ptr::null_mut();
+                        let #id: *mut c_void =
+                            unsafe { rua_inner_mut(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
+                    }
+                } else {
+                    quote! {
+                        let mut #ptr: *const f64 = std::ptr::null();
+                        let #id: *mut c_void =
+                            unsafe { rua_inner(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
+                    }
+                };
                 quote! {
                     let mut #len: usize = 0;
-                    let mut #ptr: *const f64 = std::ptr::null();
-                    let #id: *mut c_void =
-                        unsafe { rua_inner(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
+                    #fetch
                     if unsafe { *ok } == 0 { #trap }
                 }
             }
@@ -1920,7 +2004,9 @@ impl Ctx {
                 let i = self.expr(key)?;
                 let v = self.expr(&exprs[0])?;
                 if self.proven_in_range(key, slot) {
-                    quote! { unsafe { rua_set(rt, #id, #i, #v, ok) }; }
+                    let (ptr, _) = span_idents(slot);
+                    let _ = &id;
+                    quote! { unsafe { *#ptr.add((#i) as usize) = #v; } }
                 } else if self.writes {
                     // this code may not bail out part way, so an index it
                     // cannot vouch for is not compilable

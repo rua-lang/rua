@@ -693,6 +693,32 @@ impl Table {
     /// A contiguous `f64` view of the array part, or `None` if any element is
     /// not a number. Compiled code reads through this directly; it is dropped
     /// by any write to the table, so it can never go stale.
+    /// A view of the numeric array part that compiled code writes *through*.
+    ///
+    /// While compiled code runs, this cache is the authority: writing to it
+    /// costs one store rather than a call back into the runtime. The array
+    /// part is left alone, which is what makes a trap recoverable — throwing
+    /// the cache away throws every compiled write away with it.
+    pub fn nums_span_mut(&mut self) -> Option<(*mut f64, usize)> {
+        self.nums_span()?;
+        let cache = self.nums.as_mut()?;
+        Some((cache.as_mut_ptr(), cache.len()))
+    }
+
+    /// Compiled code finished: copy what it wrote back over the array part.
+    pub fn commit_nums(&mut self) {
+        if let Some(cache) = &self.nums {
+            for (slot, n) in self.arr.iter_mut().zip(cache) {
+                *slot = Value::Num(*n);
+            }
+        }
+    }
+
+    /// Compiled code bailed out: throw away what it wrote.
+    pub fn discard_nums(&mut self) {
+        self.nums = None;
+    }
+
     pub fn nums_span(&mut self) -> Option<(*const f64, usize)> {
         if self.nums.is_none() {
             let mut out = Vec::with_capacity(self.arr.len());

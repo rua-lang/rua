@@ -89,6 +89,8 @@ impl RtCtxHolder {
             push: hooks.push,
             set: hooks.set,
             inner: hooks.inner,
+            span_mut: hooks.span_mut,
+            inner_mut: hooks.inner_mut,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -542,9 +544,12 @@ impl Vm {
         // SAFETY: `regs` has one entry per slot the loop was compiled for, of
         // the kind it was compiled for, every table pointer is live here, and
         // `ctx` is the context built for this loop.
+        let mark = dirty_mark();
         unsafe { (compiled.code)(regs.as_mut_ptr(), ctx, &mut ok) };
+        // as above: a trap gives up everything the loop wrote
+        unsafe { settle_dirty(mark, ok != 0) };
         if ok == 0 {
-            return false; // trapped: nothing was written, so just interpret
+            return false;
         }
         for (i, (slot, kind)) in compiled.slots.iter().zip(&compiled.kinds).enumerate() {
             if *kind == Kind::Num {
@@ -702,10 +707,18 @@ impl Vm {
         };
         let Some(ctx) = func.rt.borrow().as_ref().map(|c| c.as_ptr()) else { return false };
         drop(kinds);
-        // a trap means the compiled code met something it does not handle; it
-        // has written nothing, so the interpreter can simply run the call
-        // SAFETY: this is the context built for this code.
-        let Some(n) = (unsafe { code.call(&rt_args, ctx) }) else { return false };
+        // A trap means the compiled code met something it does not handle. The
+        // interpreter then runs the call from the start, so anything compiled
+        // code wrote has to go: it wrote through the numeric views, and
+        // throwing those away leaves the tables as they were.
+        // SAFETY: this is the context built for this code, and every table it
+        // wrote through is alive until this call returns.
+        let mark = dirty_mark();
+        let Some(n) = (unsafe { code.call(&rt_args, ctx) }) else {
+            unsafe { settle_dirty(mark, false) };
+            return false;
+        };
+        unsafe { settle_dirty(mark, true) };
         let v = if func.returns_nil.get() { Value::Nil } else { Value::Num(n) };
         match nres {
             0 => {}
@@ -1201,6 +1214,110 @@ pub unsafe extern "C" fn rua_rt_inner(
     }
 }
 
+thread_local! {
+    /// Tables compiled code is writing through their numeric view.
+    ///
+    /// The pointers are alive for as long as the call that handed them out:
+    /// the caller holds every table it passed, and compiled code cannot drop
+    /// one. When the call ends they are committed, or thrown away if it
+    /// bailed — which is what lets compiled code write and still trap.
+    static DIRTY: RefCell<Vec<*const RefCell<Table>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn dirty_mark() -> usize {
+    DIRTY.with(|d| d.borrow().len())
+}
+
+fn note_dirty(t: *const RefCell<Table>) {
+    DIRTY.with(|d| {
+        let mut d = d.borrow_mut();
+        if !d.contains(&t) {
+            d.push(t);
+        }
+    });
+}
+
+/// Finish the writes compiled code made: keep them, or undo them.
+///
+/// # Safety
+/// Every pointer recorded since `mark` still points at a live table, which
+/// holds while the call that handed it to compiled code has not returned.
+unsafe fn settle_dirty(mark: usize, keep: bool) {
+    DIRTY.with(|d| {
+        let tail: Vec<*const RefCell<Table>> = d.borrow_mut().split_off(mark);
+        for t in tail {
+            let table = &*t;
+            if keep {
+                (*table.as_ptr()).commit_nums();
+            } else {
+                (*table.as_ptr()).discard_nums();
+            }
+        }
+    });
+}
+
+/// A view of a table's numbers that compiled code writes through.
+///
+/// # Safety
+/// As `rua_rt_span`.
+pub unsafe extern "C" fn rua_rt_span_mut(
+    t: *mut std::ffi::c_void,
+    len: *mut usize,
+    ok: *mut i32,
+) -> *mut f64 {
+    if t.is_null() {
+        *ok = 0;
+        return std::ptr::null_mut();
+    }
+    let table = t as *const RefCell<Table>;
+    match (*(*table).as_ptr()).nums_span_mut() {
+        Some((ptr, n)) => {
+            *len = n;
+            note_dirty(table);
+            ptr
+        }
+        None => {
+            *ok = 0;
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `t[i]` when the elements are tables, for code that writes to them.
+///
+/// # Safety
+/// As `rua_rt_inner`.
+pub unsafe extern "C" fn rua_rt_inner_mut(
+    t: *mut std::ffi::c_void,
+    i: f64,
+    ptr: *mut *mut f64,
+    len: *mut usize,
+    ok: *mut i32,
+) -> *mut std::ffi::c_void {
+    if t.is_null() {
+        *ok = 0;
+        return std::ptr::null_mut();
+    }
+    let table = &*(t as *const RefCell<Table>);
+    let Some(Value::Table(elem)) = (*table.as_ptr()).get_num(i) else {
+        *ok = 0;
+        return std::ptr::null_mut();
+    };
+    let addr = Rc::as_ptr(elem);
+    match (*elem.as_ptr()).nums_span_mut() {
+        Some((p, n)) => {
+            *ptr = p;
+            *len = n;
+            note_dirty(addr);
+            addr as *mut std::ffi::c_void
+        }
+        None => {
+            *ok = 0;
+            std::ptr::null_mut()
+        }
+    }
+}
+
 fn hooks() -> RtHooks {
     RtHooks {
         len: rua_rt_len as *const () as usize,
@@ -1209,6 +1326,8 @@ fn hooks() -> RtHooks {
         push: rua_rt_push as *const () as usize,
         set: rua_rt_set as *const () as usize,
         inner: rua_rt_inner as *const () as usize,
+        span_mut: rua_rt_span_mut as *const () as usize,
+        inner_mut: rua_rt_inner_mut as *const () as usize,
     }
 }
 
