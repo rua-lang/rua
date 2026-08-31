@@ -741,6 +741,22 @@ impl Table {
         self.nums = None;
     }
 
+    /// Is the array part all there is? An append then adds one slot and takes
+    /// nothing from the keyed part, so undoing it is a truncation.
+    pub fn is_plain_array(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Undo appends compiled code made, back to the length it started at.
+    pub fn truncate_arr(&mut self, n: usize) {
+        if n < self.arr.len() {
+            self.arr.truncate(n);
+            if let Some(cache) = &mut self.nums {
+                cache.truncate(n);
+            }
+        }
+    }
+
     pub fn nums_span(&mut self) -> Option<(*const f64, usize)> {
         if self.nums.is_none() {
             let mut out = Vec::with_capacity(self.arr.len());

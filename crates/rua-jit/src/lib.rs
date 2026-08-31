@@ -38,6 +38,18 @@ impl RtArg {
     }
 }
 
+/// One element of an array of arrays: a view of its numbers.
+///
+/// Fetching these one at a time costs a call back into the runtime at every
+/// access, which is the whole cost of a matrix multiply's inner loop. The
+/// runtime builds the array once when the compiled code starts.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RtSpan {
+    pub ptr: *const f64,
+    pub len: usize,
+}
+
 /// Another compiled function this one calls directly: where its code is, and
 /// the context to run it with.
 #[repr(C)]
@@ -73,6 +85,9 @@ pub struct RtCtx {
     /// runtime keeps or discards what was written when the call ends.
     pub span_mut: usize,
     pub inner_mut: usize,
+    /// `fn(table, len_out, ok) -> *const RtSpan` — a view of every element at
+    /// once.
+    pub spans: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -92,6 +107,7 @@ pub struct RtHooks {
     pub inner: usize,
     pub span_mut: usize,
     pub inner_mut: usize,
+    pub spans: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -364,6 +380,7 @@ impl Jit {
             writes,
             mutable_views,
             bools,
+            spans_used: HashSet::new(),
             kinds,
             inner_of,
             len_of: length_locals(&wrapper),
@@ -432,6 +449,7 @@ impl Jit {
         self.generation += 1;
         let symbol = format!("rua_loop_{}", self.generation);
         let name = format_ident!("{}", symbol);
+        let spans_used = cx.spans_used.clone();
         let loads = slots.iter().zip(&kind_list).enumerate().map(|(i, (slot, kind))| {
             let id = ident(*slot);
             let idx = Literal::usize_suffixed(i);
@@ -442,6 +460,16 @@ impl Jit {
                 Kind::TableOut => quote! { let #id: *mut c_void = (*regs.add(#idx)).table; },
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(*slot);
+                    let all = if spans_used.contains(slot) {
+                        let (sp, spn) = spans_idents(*slot);
+                        quote! {
+                            let mut #spn: usize = 0;
+                            let #sp: *const RtSpan = rua_spans(rt, #id, &mut #spn, ok);
+                            if *ok == 0 { return; }
+                        }
+                    } else {
+                        quote! {}
+                    };
                     quote! {
                         let #id: *mut c_void = (*regs.add(#idx)).table;
                         let #len: usize = {
@@ -449,6 +477,7 @@ impl Jit {
                             if *ok == 0 { return; }
                             n as usize
                         };
+                        #all
                     }
                 }
                 Kind::Table => {
@@ -664,6 +693,7 @@ impl Jit {
             writes,
             mutable_views,
             bools,
+            spans_used: HashSet::new(),
             kinds,
             inner_of,
             len_of: length_locals(&def.body),
@@ -695,6 +725,16 @@ impl Jit {
                 // which is once per element rather than once per access.
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(b.slot);
+                    let all = if cx.spans_used.contains(&b.slot) {
+                        let (sp, spn) = spans_idents(b.slot);
+                        quote! {
+                            let mut #spn: usize = 0;
+                            let #sp: *const RtSpan = rua_spans(rt, #id, &mut #spn, ok);
+                            if *ok == 0 { return 0.0; }
+                        }
+                    } else {
+                        quote! {}
+                    };
                     quote! {
                         let #id: *mut c_void = (*args.add(#idx)).table;
                         let #len: usize = {
@@ -702,6 +742,7 @@ impl Jit {
                             if *ok == 0 { return 0.0; }
                             n as usize
                         };
+                        #all
                     }
                 }
                 Kind::Table => {
@@ -1712,6 +1753,13 @@ fn preamble() -> TokenStream {
 
         #[repr(C)]
         #[derive(Clone, Copy)]
+        pub struct RtSpan {
+            pub ptr: *const f64,
+            pub len: usize,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
         pub struct Callee {
             pub entry: usize,
             pub ctx: *const RtCtx,
@@ -1727,6 +1775,7 @@ fn preamble() -> TokenStream {
             pub inner: usize,
             pub span_mut: usize,
             pub inner_mut: usize,
+            pub spans: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1765,10 +1814,10 @@ fn preamble() -> TokenStream {
         /// `t` is a live table pointer, and `rt` the context we were called
         /// with.
         #[inline(always)]
-        unsafe fn rua_push(rt: *const RtCtx, t: *mut c_void, v: f64) {
-            let f: unsafe extern "C" fn(*mut c_void, f64) = 
+        unsafe fn rua_push(rt: *const RtCtx, t: *mut c_void, v: f64, ok: *mut i32) {
+            let f: unsafe extern "C" fn(*mut c_void, f64, *mut i32) =
                 std::mem::transmute((*rt).push as *const ());
-            f(t, v)
+            f(t, v, ok)
         }
 
         /// # Safety
@@ -1778,6 +1827,21 @@ fn preamble() -> TokenStream {
             let f: unsafe extern "C" fn(*mut c_void, f64, f64, *mut i32) =
                 std::mem::transmute((*rt).set as *const ());
             f(t, i, v, ok)
+        }
+
+        /// # Safety
+        /// As `rua_span`, for every element of an array of arrays at once.
+        /// The array the runtime hands back lives until this call ends.
+        #[inline(always)]
+        unsafe fn rua_spans(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            len: *mut usize,
+            ok: *mut i32,
+        ) -> *const RtSpan {
+            let f: unsafe extern "C" fn(*mut c_void, *mut usize, *mut i32) -> *const RtSpan =
+                std::mem::transmute((*rt).spans as *const ());
+            f(t, len, ok)
         }
 
         /// # Safety
@@ -1862,6 +1926,9 @@ struct Ctx {
     known: HashSet<u16>,
     /// Locals that only ever hold a boolean, held as 0.0/1.0.
     bools: HashSet<u16>,
+    /// Arrays of arrays reached as `t[k][j]`, which want every element's view
+    /// fetched once on entry rather than one per access.
+    spans_used: HashSet<u16>,
     /// Does this code write through its views? They are fetched writable if
     /// so, and the runtime keeps or discards what was written.
     mutable_views: bool,
@@ -1973,11 +2040,12 @@ struct TableUse {
 impl TableUse {
     /// May compiled code bail out to the interpreter part way through?
     ///
-    /// An in-place write goes through the numeric view, and the runtime throws
-    /// that view away if the call traps, so those writes undo themselves. An
-    /// append does not: it has already changed the array part.
+    /// Never. An in-place write goes through the numeric view and the runtime
+    /// throws that view away if the call traps; an append is recorded with the
+    /// length it started from and truncated back. Everything compiled code
+    /// does to a table undoes itself, so it may bail out anywhere.
     fn traps_forbidden(&self) -> bool {
-        self.pushes
+        false
     }
 
     /// Does this code write to a table at all? Those it writes are handed to
@@ -2188,6 +2256,10 @@ fn writes_slot_expr(e: &Expr, slot: u16) -> bool {
 }
 
 /// The pointer and length holding a table slot's array view.
+fn spans_idents(slot: u16) -> (proc_macro2::Ident, proc_macro2::Ident) {
+    (format_ident!("__sp{}", slot), format_ident!("__spn{}", slot))
+}
+
 fn span_idents(slot: u16) -> (proc_macro2::Ident, proc_macro2::Ident) {
     (format_ident!("p{}", slot), format_ident!("n{}", slot))
 }
@@ -2761,19 +2833,25 @@ impl Ctx {
                 }
                 let ki = self.expr(&k)?;
                 let j = self.expr(key)?;
+                let _ = &outer;
+                self.spans_used.insert(slot);
+                let (sp, spn) = spans_idents(slot);
                 quote! {
                     {
-                        let mut __el: usize = 0;
-                        let mut __ep: *const f64 = std::ptr::null();
-                        unsafe { rua_inner(rt, #outer, #ki, &mut __ep, &mut __el, ok) };
-                        if unsafe { *ok } == 0 { #trap }
-                        let __j = #j;
-                        let __u = __j as usize;
-                        if __j < 0.0 || __j.fract() != 0.0 || __u >= __el {
+                        let __k = #ki;
+                        let __ku = __k as usize;
+                        if __k < 0.0 || __k.fract() != 0.0 || __ku >= #spn {
                             unsafe { *ok = 0; }
                             #trap
                         }
-                        unsafe { *__ep.add(__u) }
+                        let __e = unsafe { *#sp.add(__ku) };
+                        let __j = #j;
+                        let __u = __j as usize;
+                        if __j < 0.0 || __j.fract() != 0.0 || __u >= __e.len {
+                            unsafe { *ok = 0; }
+                            #trap
+                        }
+                        unsafe { *__e.ptr.add(__u) }
                     }
                 }
             }
@@ -2836,7 +2914,14 @@ impl Ctx {
                         // `push` yields no value; as an expression it is nil,
                         // which the numeric subset cannot hold, so it is only
                         // ever compiled in statement position
-                        quote! { { unsafe { rua_push(rt, #id, #v) }; 0.0 } }
+                        let trap = self.on_trap.clone();
+                        quote! {
+                            {
+                                unsafe { rua_push(rt, #id, #v, ok) };
+                                if unsafe { *ok } == 0 { #trap }
+                                0.0
+                            }
+                        }
                     }
                     _ => return Err(format!("`{name}` on a table")),
                 }

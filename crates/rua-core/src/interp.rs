@@ -57,7 +57,7 @@ pub(crate) const LOOP_BATCH: u32 = 1000;
 /// interpreted iterations, so this waits for real evidence that the loop is
 /// where the program lives. A loop that runs briefly but often usually sits in
 /// a function that the ordinary call counter compiles anyway.
-const LOOP_HOT: u64 = 50_000;
+const LOOP_HOT: u64 = 5_000;
 
 /// A loop counter set to this means "already compiled": the interpreter hands
 /// the loop over at once rather than counting another thousand iterations
@@ -97,6 +97,7 @@ impl RtCtxHolder {
             inner: hooks.inner,
             span_mut: hooks.span_mut,
             inner_mut: hooks.inner_mut,
+            spans: hooks.spans,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -1163,13 +1164,22 @@ pub unsafe extern "C" fn rua_rt_span(
 /// # Safety
 /// As [`rua_rt_len`].
 #[no_mangle]
-pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64) {
+pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64, ok: *mut i32) {
     debug_assert!(!t.is_null(), "compiled code pushed to a null table");
     if t.is_null() {
+        *ok = 0;
         return;
     }
-    let table = &*(t as *const RefCell<Table>);
-    (*table.as_ptr()).push(Value::Num(v));
+    let table = t as *const RefCell<Table>;
+    // Appending to a table that has keyed entries can pull one of them into
+    // the array part, and undoing that is not a truncation. Compiled code
+    // builds plain arrays; anything else is the interpreter's business.
+    if !(*(*table).as_ptr()).is_plain_array() {
+        *ok = 0;
+        return;
+    }
+    note_append(table, (*(*table).as_ptr()).len());
+    (*(*table).as_ptr()).push(Value::Num(v));
 }
 
 /// Write a number already inside a table's array part, for compiled code. In
@@ -1240,18 +1250,42 @@ thread_local! {
     /// the caller holds every table it passed, and compiled code cannot drop
     /// one. When the call ends they are committed, or thrown away if it
     /// bailed — which is what lets compiled code write and still trap.
-    static DIRTY: RefCell<Vec<*const RefCell<Table>>> = const { RefCell::new(Vec::new()) };
+    static DIRTY: RefCell<Vec<Dirty>> = const { RefCell::new(Vec::new()) };
 }
 
-fn dirty_mark() -> usize {
-    DIRTY.with(|d| d.borrow().len())
+/// A table compiled code changed, and what it takes to put it back.
+#[derive(Clone, Copy)]
+struct Dirty {
+    table: *const RefCell<Table>,
+    /// The length it had before compiled code appended to it, if it did.
+    appended_from: Option<usize>,
+}
+
+/// How much of the two scratch lists belongs to calls already under way.
+fn dirty_mark() -> (usize, usize) {
+    (
+        DIRTY.with(|d| d.borrow().len()),
+        SPANS.with(|s| s.borrow().len()),
+    )
 }
 
 fn note_dirty(t: *const RefCell<Table>) {
     DIRTY.with(|d| {
         let mut d = d.borrow_mut();
-        if !d.contains(&t) {
-            d.push(t);
+        if !d.iter().any(|e| e.table == t) {
+            d.push(Dirty { table: t, appended_from: None });
+        }
+    });
+}
+
+/// Compiled code is about to append to a table: remember how long it was, so
+/// that a trap can put it back.
+fn note_append(t: *const RefCell<Table>, len: usize) {
+    DIRTY.with(|d| {
+        let mut d = d.borrow_mut();
+        match d.iter_mut().find(|e| e.table == t) {
+            Some(e) => e.appended_from = Some(e.appended_from.unwrap_or(len).min(len)),
+            None => d.push(Dirty { table: t, appended_from: Some(len) }),
         }
     });
 }
@@ -1261,15 +1295,22 @@ fn note_dirty(t: *const RefCell<Table>) {
 /// # Safety
 /// Every pointer recorded since `mark` still points at a live table, which
 /// holds while the call that handed it to compiled code has not returned.
-unsafe fn settle_dirty(mark: usize, keep: bool) {
+unsafe fn settle_dirty(mark: (usize, usize), keep: bool) {
+    // the element views this call was given die with it, and only those
+    SPANS.with(|s| s.borrow_mut().truncate(mark.1));
     DIRTY.with(|d| {
-        let tail: Vec<*const RefCell<Table>> = d.borrow_mut().split_off(mark);
-        for t in tail {
-            let table = &*t;
+        let tail: Vec<Dirty> = d.borrow_mut().split_off(mark.0);
+        for e in tail {
+            let table = &*e.table;
             if keep {
                 (*table.as_ptr()).commit_nums();
             } else {
+                // the view goes, taking every in-place write with it, and the
+                // array part goes back to the length it had before the appends
                 (*table.as_ptr()).discard_nums();
+                if let Some(len) = e.appended_from {
+                    (*table.as_ptr()).truncate_arr(len);
+                }
             }
         }
     });
@@ -1337,6 +1378,52 @@ pub unsafe extern "C" fn rua_rt_inner_mut(
     }
 }
 
+thread_local! {
+    /// The element views handed to compiled code, kept alive for as long as
+    /// the call that asked for them.
+    static SPANS: RefCell<Vec<Box<[rua_jit::RtSpan]>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A view of every element of an array of arrays, built once.
+///
+/// # Safety
+/// `t` is a live table pointer; the array stays valid until the compiled call
+/// that asked for it ends, which is when the runtime drops it.
+pub unsafe extern "C" fn rua_rt_spans(
+    t: *mut std::ffi::c_void,
+    len: *mut usize,
+    ok: *mut i32,
+) -> *const rua_jit::RtSpan {
+    if t.is_null() {
+        *ok = 0;
+        return std::ptr::null();
+    }
+    let outer = &*(t as *const RefCell<Table>);
+    let n = (*outer.as_ptr()).len();
+    let mut out: Vec<rua_jit::RtSpan> = Vec::with_capacity(n);
+    for k in 0..n {
+        let elem = match (*outer.as_ptr()).get_num(k as f64) {
+            Some(Value::Table(e)) => e.clone(),
+            _ => {
+                *ok = 0;
+                return std::ptr::null();
+            }
+        };
+        match (*elem.as_ptr()).nums_span() {
+            Some((p, l)) => out.push(rua_jit::RtSpan { ptr: p, len: l }),
+            None => {
+                *ok = 0;
+                return std::ptr::null();
+            }
+        }
+    }
+    *len = n;
+    let boxed = out.into_boxed_slice();
+    let addr = boxed.as_ptr();
+    SPANS.with(|s| s.borrow_mut().push(boxed));
+    addr
+}
+
 fn hooks() -> RtHooks {
     RtHooks {
         len: rua_rt_len as *const () as usize,
@@ -1347,6 +1434,7 @@ fn hooks() -> RtHooks {
         inner: rua_rt_inner as *const () as usize,
         span_mut: rua_rt_span_mut as *const () as usize,
         inner_mut: rua_rt_inner_mut as *const () as usize,
+        spans: rua_rt_spans as *const () as usize,
     }
 }
 
