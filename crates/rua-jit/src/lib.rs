@@ -89,6 +89,9 @@ pub struct RtCtx {
     /// once, and the same for code that writes through them.
     pub spans: usize,
     pub spans_mut: usize,
+    /// `fn(table, ok)` — this code is about to append to that table, so
+    /// remember how long it was in case the call has to be undone.
+    pub note_append: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -110,6 +113,7 @@ pub struct RtHooks {
     pub inner_mut: usize,
     pub spans: usize,
     pub spans_mut: usize,
+    pub note_append: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -461,7 +465,11 @@ impl Jit {
                 Kind::Num | Kind::Bool | Kind::Dead => {
                     quote! { let mut #id: f64 = (*regs.add(#idx)).num; }
                 }
-                Kind::TableOut => quote! { let #id: *mut c_void = (*regs.add(#idx)).table; },
+                Kind::TableOut => quote! {
+                    let #id: *mut c_void = (*regs.add(#idx)).table;
+                    rua_note_append(rt, #id, ok);
+                    if *ok == 0 { return; }
+                },
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(*slot);
                     let all = if spans_used.contains(slot) {
@@ -731,7 +739,11 @@ impl Jit {
                 Kind::Num | Kind::Bool | Kind::Dead => {
                     quote! { let mut #id: f64 = (*args.add(#idx)).num; }
                 }
-                Kind::TableOut => quote! { let #id: *mut c_void = (*args.add(#idx)).table; },
+                Kind::TableOut => quote! {
+                    let #id: *mut c_void = (*args.add(#idx)).table;
+                    rua_note_append(rt, #id, ok);
+                    if *ok == 0 { return 0.0; }
+                },
                 // An array of arrays arrives as an address and a length: the
                 // views of its elements are fetched where they are bound,
                 // which is once per element rather than once per access.
@@ -1849,6 +1861,7 @@ fn preamble() -> TokenStream {
             pub inner_mut: usize,
             pub spans: usize,
             pub spans_mut: usize,
+            pub note_append: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1887,10 +1900,20 @@ fn preamble() -> TokenStream {
         /// `t` is a live table pointer, and `rt` the context we were called
         /// with.
         #[inline(always)]
-        unsafe fn rua_push(rt: *const RtCtx, t: *mut c_void, v: f64, ok: *mut i32) {
-            let f: unsafe extern "C" fn(*mut c_void, f64, *mut i32) =
+        unsafe fn rua_push(rt: *const RtCtx, t: *mut c_void, v: f64) {
+            let f: unsafe extern "C" fn(*mut c_void, f64) =
                 std::mem::transmute((*rt).push as *const ());
-            f(t, v, ok)
+            f(t, v)
+        }
+
+        /// # Safety
+        /// `t` is a live table pointer. Said once, on the way in, rather than
+        /// at every append.
+        #[inline(always)]
+        unsafe fn rua_note_append(rt: *const RtCtx, t: *mut c_void, ok: *mut i32) {
+            let f: unsafe extern "C" fn(*mut c_void, *mut i32) =
+                std::mem::transmute((*rt).note_append as *const ());
+            f(t, ok)
         }
 
         /// # Safety
@@ -3020,14 +3043,7 @@ impl Ctx {
                         // `push` yields no value; as an expression it is nil,
                         // which the numeric subset cannot hold, so it is only
                         // ever compiled in statement position
-                        let trap = self.on_trap.clone();
-                        quote! {
-                            {
-                                unsafe { rua_push(rt, #id, #v, ok) };
-                                if unsafe { *ok } == 0 { #trap }
-                                0.0
-                            }
-                        }
+                        quote! { { unsafe { rua_push(rt, #id, #v) }; 0.0 } }
                     }
                     _ => return Err(format!("`{name}` on a table")),
                 }

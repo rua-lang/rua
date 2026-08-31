@@ -99,6 +99,7 @@ impl RtCtxHolder {
             inner_mut: hooks.inner_mut,
             spans: hooks.spans,
             spans_mut: hooks.spans_mut,
+            note_append: hooks.note_append,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -1183,8 +1184,22 @@ pub unsafe extern "C" fn rua_rt_span(
 /// # Safety
 /// As [`rua_rt_len`].
 #[no_mangle]
-pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64, ok: *mut i32) {
+pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64) {
     debug_assert!(!t.is_null(), "compiled code pushed to a null table");
+    if t.is_null() {
+        return;
+    }
+    let table = &*(t as *const RefCell<Table>);
+    (*table.as_ptr()).push(Value::Num(v));
+}
+
+/// Compiled code is about to append to this table: remember how long it is, so
+/// that a trap can put it back. Said once on the way in rather than at every
+/// append.
+///
+/// # Safety
+/// As [`rua_rt_push`].
+pub unsafe extern "C" fn rua_rt_note_append(t: *mut std::ffi::c_void, ok: *mut i32) {
     if t.is_null() {
         *ok = 0;
         return;
@@ -1198,7 +1213,6 @@ pub unsafe extern "C" fn rua_rt_push(t: *mut std::ffi::c_void, v: f64, ok: *mut 
         return;
     }
     note_append(table, (*(*table).as_ptr()).len());
-    (*(*table).as_ptr()).push(Value::Num(v));
 }
 
 /// Write a number already inside a table's array part, for compiled code. In
@@ -1509,6 +1523,7 @@ fn hooks() -> RtHooks {
         inner_mut: rua_rt_inner_mut as *const () as usize,
         spans: rua_rt_spans as *const () as usize,
         spans_mut: rua_rt_spans_mut as *const () as usize,
+        note_append: rua_rt_note_append as *const () as usize,
     }
 }
 

@@ -862,6 +862,7 @@ impl Table {
     /// Undo appends compiled code made, back to the length it started at.
     pub fn truncate_arr(&mut self, n: usize) {
         if n < self.arr.len() {
+            bump_shape_epoch();
             self.arr.truncate(n);
             if let Some(cache) = &mut self.nums {
                 cache.truncate(n);
@@ -910,7 +911,10 @@ impl Table {
             // an in-place numeric write can stay in the view too
             match (&mut self.nums, &v) {
                 (Some(cache), Value::Num(n)) if i < cache.len() => cache[i] = *n,
-                (slot @ Some(_), _) => *slot = None,
+                (slot @ Some(_), _) => {
+                    *slot = None;
+                    bump_shape_epoch();
+                }
                 (None, _) => {}
             }
             if i < self.arr.len() {
@@ -1009,7 +1013,12 @@ impl Table {
     /// Append, including a nil: `[1, nil, 2]` keeps its three slots, so that
     /// `len()` and iteration agree with what was written.
     pub fn push(&mut self, v: Value) {
-        bump_shape_epoch();
+        // Only a *move* invalidates what compiled code holds. A push that fits
+        // in the space already there moves nothing, and a matrix multiply
+        // pushing a row at a time would otherwise throw away the views of
+        // every other row on each one.
+        let room = self.arr.capacity();
+        let room_nums = self.nums.as_ref().map_or(usize::MAX, |c| c.capacity());
         // Keep the numeric view in step rather than dropping it. Filling an
         // array and then reading it is the common shape, and rebuilding the
         // view on the next read costs more than the whole fill.
@@ -1019,6 +1028,11 @@ impl Table {
             (None, _) => {}
         }
         self.arr.push(v);
+        if self.arr.capacity() != room
+            || self.nums.as_ref().map_or(usize::MAX, |c| c.capacity()) != room_nums
+        {
+            bump_shape_epoch();
+        }
         self.absorb_from_map();
     }
 
