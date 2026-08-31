@@ -66,6 +66,9 @@ pub struct RtCtx {
     /// `fn(table, index, value)` — write a number already inside the array
     /// part. In place, so the view a caller holds stays valid.
     pub set: usize,
+    /// `fn(table, index, ptr_out, len_out, ok) -> table` — the table at
+    /// `t[i]`, and a view of its array part.
+    pub inner: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -82,6 +85,7 @@ pub struct RtHooks {
     pub span: usize,
     pub push: usize,
     pub set: usize,
+    pub inner: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -92,6 +96,12 @@ pub enum Kind {
     Table,
     /// A table compiled code only ever appends to.
     TableOut,
+    /// A table whose elements are themselves tables — an array of bodies, a
+    /// matrix — each with a numeric array part of at least this many elements.
+    /// The runtime checks that on the way in, which is what lets the compiled
+    /// body read `b[3]` with no test of its own: an array of arrays is only
+    /// out of the compiler's reach for as long as nothing checks its shape.
+    Tables(u32),
 }
 
 /// A compiled entry point: arguments in, one number out.
@@ -293,7 +303,7 @@ impl Jit {
         }
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
-        let kinds = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
+        let Kinds { kinds, inner_of } = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
         // in a loop there are no parameters, so nothing is stable by that route
         let stable: HashSet<u16> = HashSet::new();
         let kind_list: Vec<Kind> =
@@ -307,6 +317,8 @@ impl Jit {
             self_params_numeric: true,
             writes: table_usage(&wrapper).traps_forbidden(),
             kinds,
+            inner_of,
+            len_of: length_locals(&wrapper),
             in_range: Vec::new(),
             bounded: Vec::new(),
             hoisted: Vec::new(),
@@ -378,6 +390,17 @@ impl Jit {
             match kind {
                 Kind::Num => quote! { let mut #id: f64 = (*regs.add(#idx)).num; },
                 Kind::TableOut => quote! { let #id: *mut c_void = (*regs.add(#idx)).table; },
+                Kind::Tables(_) => {
+                    let (_, len) = span_idents(*slot);
+                    quote! {
+                        let #id: *mut c_void = (*regs.add(#idx)).table;
+                        let #len: usize = {
+                            let n = rua_len(rt, #id, ok);
+                            if *ok == 0 { return; }
+                            n as usize
+                        };
+                    }
+                }
                 Kind::Table => {
                     let (ptr, len) = span_idents(*slot);
                     quote! {
@@ -398,7 +421,7 @@ impl Jit {
                     let i = Literal::usize_suffixed(i);
                     Some(quote! { (*regs.add(#i)).num = #id; })
                 }
-                Kind::Table | Kind::TableOut => None,
+                Kind::Table | Kind::TableOut | Kind::Tables(_) => None,
             }
         });
         let preamble = preamble();
@@ -546,10 +569,12 @@ impl Jit {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
         }
-        let kinds = infer_kinds(&def.body, &self_ref.compiled_globals)?;
-        // only parameters may be tables: a local always holds a number
+        let Kinds { kinds, inner_of } = infer_kinds(&def.body, &self_ref.compiled_globals)?;
+        // Only parameters may be tables — except an element of an array of
+        // arrays, which is a local by construction: `let b = bodies[i]`.
         for (slot, kind) in &kinds {
-            if *kind == Kind::Table
+            if matches!(kind, Kind::Table | Kind::Tables(_))
+                && !inner_of.contains_key(slot)
                 && !def.param_bindings.iter().any(|b| b.slot == *slot)
             {
                 return Err("a table is held in a local, not a parameter".into());
@@ -575,6 +600,8 @@ impl Jit {
             self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
             writes: table_usage(&def.body).traps_forbidden(),
             kinds,
+            inner_of,
+            len_of: length_locals(&def.body),
             in_range: Vec::new(),
             bounded: Vec::new(),
             hoisted: Vec::new(),
@@ -596,6 +623,20 @@ impl Jit {
             match cx.kinds.get(&b.slot).copied().unwrap_or(Kind::Num) {
                 Kind::Num => quote! { let mut #id: f64 = (*args.add(#idx)).num; },
                 Kind::TableOut => quote! { let #id: *mut c_void = (*args.add(#idx)).table; },
+                // An array of arrays arrives as an address and a length: the
+                // views of its elements are fetched where they are bound,
+                // which is once per element rather than once per access.
+                Kind::Tables(_) => {
+                    let (_, len) = span_idents(b.slot);
+                    quote! {
+                        let #id: *mut c_void = (*args.add(#idx)).table;
+                        let #len: usize = {
+                            let n = rua_len(rt, #id, ok);
+                            if *ok == 0 { return 0.0; }
+                            n as usize
+                        };
+                    }
+                }
                 Kind::Table => {
                     let (ptr, len) = span_idents(b.slot);
                     quote! {
@@ -805,18 +846,100 @@ fn walk_expr(e: &Expr, out: &mut Vec<String>) {
 
 /// Work out what each slot holds: a table if it is indexed or asked for its
 /// length, a number otherwise. Disagreement means the JIT stays out of it.
+/// What the slots of a function hold: the kind of each, and which of them are
+/// elements of an array of arrays, bound by `let b = t[i]`.
+struct Kinds {
+    kinds: HashMap<u16, Kind>,
+    /// Element slot to the array-of-arrays slot it was bound from.
+    inner_of: HashMap<u16, u16>,
+}
+
 fn infer_kinds(
     b: &Block,
     callees: &HashMap<String, (usize, Vec<Kind>)>,
-) -> Result<HashMap<u16, Kind>, String> {
+) -> Result<Kinds, String> {
     let mut kinds = HashMap::new();
     let mut bad = None;
+    // `let b = t[i]` says nothing on its own: `b` is a number if it is used as
+    // one and an inner table if it is indexed, and which it is decides whether
+    // `t` is a flat table or an array of arrays. So the walk records the link
+    // and the answer is settled once everything has been seen.
+    let mut links: Vec<(u16, u16)> = Vec::new();
+    // How long an element has to be, recorded by the same walk so that no
+    // constant index can slip past it. The lowering checks what it emits
+    // against this too, so a miss would refuse the function rather than read
+    // off the end of one.
+    let mut longest: HashMap<u16, u32> = HashMap::new();
     // a local passed straight to a compiled function takes that parameter's
     // kind, which is how a table reaches a helper
-    kinds_block(b, &mut kinds, &mut bad, callees);
+    kinds_block(b, &mut kinds, &mut bad, callees, &mut links, &mut longest);
+
+    let mut inner_of = HashMap::new();
+    for (inner, outer) in &links {
+        match kinds.get(inner) {
+            Some(Kind::Table) => {
+                inner_of.insert(*inner, *outer);
+                note(*outer, Kind::Tables(0), &mut kinds, &mut bad);
+            }
+            // an ordinary `let x = t[i]`: a number out of a flat table
+            _ => {
+                note(*inner, Kind::Num, &mut kinds, &mut bad);
+                note(*outer, Kind::Table, &mut kinds, &mut bad);
+            }
+        }
+    }
+
+    // Compiled code reads `b[3]` with no test of its own, so every element of
+    // the array has to be at least that long; the runtime checks it on the way
+    // in, where trapping is still safe.
+    for (inner, outer) in &inner_of {
+        let need = longest.get(inner).copied().unwrap_or(0);
+        if let Some(Kind::Tables(have)) = kinds.get(outer).copied() {
+            kinds.insert(*outer, Kind::Tables(have.max(need)));
+        }
+    }
+
     match bad {
         Some(why) => Err(why),
-        None => Ok(kinds),
+        None => Ok(Kinds { kinds, inner_of }),
+    }
+}
+
+/// `t[3]` needs `t` to have four elements. Remember the largest such demand.
+/// Locals bound once, at the top of a function, to `t.len()` and never
+/// touched again: the table they measure.
+///
+/// That is the shape of `let n = t.len()` above a loop over `0..n`, and it is
+/// what lets the loop's reads be proven on entry — where the length can be
+/// named directly, and where trapping is still safe because nothing has been
+/// written yet. Anything else that writes the local disqualifies it, which is
+/// checked by taking the binding out and asking whether anything is left.
+fn length_locals(body: &Block) -> HashMap<u16, u16> {
+    let mut out = HashMap::new();
+    for (i, st) in body.stats.iter().enumerate() {
+        let Stat::LetSlots(bs, es) = st else { continue };
+        let ([b], [Expr::Method(obj, name, args)]) = (&bs[..], &es[..]) else { continue };
+        if b.cell || &**name != "len" || !args.is_empty() {
+            continue;
+        }
+        let Expr::Local(t, _) = &**obj else { continue };
+        let mut rest = body.clone();
+        rest.stats.remove(i);
+        if writes_slot(&rest, b.slot) {
+            continue;
+        }
+        out.insert(b.slot, t.slot);
+    }
+    out
+}
+
+fn note_const_index(slot: u16, key: &Expr, longest: &mut HashMap<u16, u32>) {
+    if let Expr::Num(n) = key {
+        if *n >= 0.0 && n.fract() == 0.0 && *n < u32::MAX as f64 {
+            let need = *n as u32 + 1;
+            let at = longest.entry(slot).or_insert(0);
+            *at = (*at).max(need);
+        }
     }
 }
 
@@ -837,12 +960,14 @@ fn kinds_block(
     kinds: &mut HashMap<u16, Kind>,
     bad: &mut Option<String>,
     callees: &Callees,
+    links: &mut Vec<(u16, u16)>,
+    longest: &mut HashMap<u16, u32>,
 ) {
     for st in &b.stats {
-        kinds_stat(st, kinds, bad, callees);
+        kinds_stat(st, kinds, bad, callees, links, longest);
     }
     if let Some(t) = &b.tail {
-        kinds_expr(t, kinds, bad, callees);
+        kinds_expr(t, kinds, bad, callees, links, longest);
     }
 }
 
@@ -851,16 +976,27 @@ fn kinds_stat(
     kinds: &mut HashMap<u16, Kind>,
     bad: &mut Option<String>,
     callees: &Callees,
+    links: &mut Vec<(u16, u16)>,
+    longest: &mut HashMap<u16, u32>,
 ) {
     match st {
-        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees)),
+        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees, links, longest)),
         Stat::LetSlots(bs, es) => {
+            // `let b = t[i]`: what `b` is decides what `t` is, and neither is
+            // known yet
+            if let ([b], [Expr::Index(obj, key)]) = (&bs[..], &es[..]) {
+                if let Expr::Local(t, _) = &**obj {
+                    links.push((b.slot, t.slot));
+                    kinds_expr(key, kinds, bad, callees, links, longest);
+                    return;
+                }
+            }
             for b in bs {
                 note(b.slot, Kind::Num, kinds, bad);
             }
-            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees));
+            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees, links, longest));
         }
-        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => kinds_expr(e, kinds, bad, callees),
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => kinds_expr(e, kinds, bad, callees, links, longest),
         Stat::Assign(ts, es) => {
             for t in ts {
                 // `t[i] = v` writes in place, which the view survives, so the
@@ -868,34 +1004,35 @@ fn kinds_stat(
                 if let Expr::Index(obj, key) = t {
                     if let Expr::Local(b, _) = &**obj {
                         note(b.slot, Kind::Table, kinds, bad);
-                        kinds_expr(key, kinds, bad, callees);
+                        note_const_index(b.slot, key, longest);
+                        kinds_expr(key, kinds, bad, callees, links, longest);
                         continue;
                     }
                 }
-                kinds_expr(t, kinds, bad, callees);
+                kinds_expr(t, kinds, bad, callees, links, longest);
             }
-            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees));
+            es.iter().for_each(|e| kinds_expr(e, kinds, bad, callees, links, longest));
         }
         Stat::OpAssign(t, _, e) => {
-            kinds_expr(t, kinds, bad, callees);
-            kinds_expr(e, kinds, bad, callees);
+            kinds_expr(t, kinds, bad, callees, links, longest);
+            kinds_expr(e, kinds, bad, callees, links, longest);
         }
         Stat::While(_, c, b) => {
-            kinds_expr(c, kinds, bad, callees);
-            kinds_block(b, kinds, bad, callees);
+            kinds_expr(c, kinds, bad, callees, links, longest);
+            kinds_block(b, kinds, bad, callees, links, longest);
         }
-        Stat::Loop(_, b) => kinds_block(b, kinds, bad, callees),
+        Stat::Loop(_, b) => kinds_block(b, kinds, bad, callees, links, longest),
         Stat::ForRange { binding, start, end, body, .. } => {
             if let Some(b) = binding {
                 note(b.slot, Kind::Num, kinds, bad);
             }
-            kinds_expr(start, kinds, bad, callees);
-            kinds_expr(end, kinds, bad, callees);
-            kinds_block(body, kinds, bad, callees);
+            kinds_expr(start, kinds, bad, callees, links, longest);
+            kinds_expr(end, kinds, bad, callees, links, longest);
+            kinds_block(body, kinds, bad, callees, links, longest);
         }
         Stat::ForIn { body, iter, .. } => {
-            kinds_expr(iter, kinds, bad, callees);
-            kinds_block(body, kinds, bad, callees);
+            kinds_expr(iter, kinds, bad, callees, links, longest);
+            kinds_block(body, kinds, bad, callees, links, longest);
         }
         Stat::Break | Stat::Continue => {}
     }
@@ -906,16 +1043,19 @@ fn kinds_expr(
     kinds: &mut HashMap<u16, Kind>,
     bad: &mut Option<String>,
     callees: &Callees,
+    links: &mut Vec<(u16, u16)>,
+    longest: &mut HashMap<u16, u32>,
 ) {
     match e {
         // `t[i]` and `t.len()` are what make a slot a table
         Expr::Index(obj, key) => {
             if let Expr::Local(b, _) = &**obj {
                 note(b.slot, Kind::Table, kinds, bad);
+                note_const_index(b.slot, key, longest);
             } else {
-                kinds_expr(obj, kinds, bad, callees);
+                kinds_expr(obj, kinds, bad, callees, links, longest);
             }
-            kinds_expr(key, kinds, bad, callees);
+            kinds_expr(key, kinds, bad, callees, links, longest);
         }
         Expr::Method(obj, name, args) => {
             match (&**obj, &**name) {
@@ -923,16 +1063,16 @@ fn kinds_expr(
                 // about which kind this is
                 (Expr::Local(_, _), "len") => {}
                 (Expr::Local(b, _), "push") => note(b.slot, Kind::TableOut, kinds, bad),
-                _ => kinds_expr(obj, kinds, bad, callees),
+                _ => kinds_expr(obj, kinds, bad, callees, links, longest),
             }
-            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees));
+            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees, links, longest));
         }
         Expr::Local(b, _) => note(b.slot, Kind::Num, kinds, bad),
         Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
-            kinds_expr(a, kinds, bad, callees);
-            kinds_expr(b, kinds, bad, callees);
+            kinds_expr(a, kinds, bad, callees, links, longest);
+            kinds_expr(b, kinds, bad, callees, links, longest);
         }
-        Expr::Un(_, a) => kinds_expr(a, kinds, bad, callees),
+        Expr::Un(_, a) => kinds_expr(a, kinds, bad, callees, links, longest),
         Expr::Call(f, args) => {
             // an argument handed to a compiled function takes that
             // parameter's kind: that is how a table reaches a helper
@@ -944,7 +1084,7 @@ fn kinds_expr(
                                 (Expr::Local(b, _), Kind::Table | Kind::TableOut) => {
                                     note(b.slot, *kind, kinds, bad)
                                 }
-                                _ => kinds_expr(a, kinds, bad, callees),
+                                _ => kinds_expr(a, kinds, bad, callees, links, longest),
                             }
                         }
                         return;
@@ -956,47 +1096,47 @@ fn kinds_expr(
                         // contradict how they are used elsewhere.
                         for a in args {
                             if !matches!(a, Expr::Local(..)) {
-                                kinds_expr(a, kinds, bad, callees);
+                                kinds_expr(a, kinds, bad, callees, links, longest);
                             }
                         }
                         return;
                     }
                 }
             }
-            kinds_expr(f, kinds, bad, callees);
-            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees));
+            kinds_expr(f, kinds, bad, callees, links, longest);
+            args.iter().for_each(|a| kinds_expr(a, kinds, bad, callees, links, longest));
         }
-        Expr::Array(items) => items.iter().for_each(|i| kinds_expr(i, kinds, bad, callees)),
+        Expr::Array(items) => items.iter().for_each(|i| kinds_expr(i, kinds, bad, callees, links, longest)),
         Expr::Map(items) => items.iter().for_each(|(k, v)| {
-            kinds_expr(k, kinds, bad, callees);
-            kinds_expr(v, kinds, bad, callees);
+            kinds_expr(k, kinds, bad, callees, links, longest);
+            kinds_expr(v, kinds, bad, callees, links, longest);
         }),
         Expr::If(arms, els) => {
             for (c, b) in arms {
-                kinds_expr(c, kinds, bad, callees);
-                kinds_block(b, kinds, bad, callees);
+                kinds_expr(c, kinds, bad, callees, links, longest);
+                kinds_block(b, kinds, bad, callees, links, longest);
             }
             if let Some(b) = els {
-                kinds_block(b, kinds, bad, callees);
+                kinds_block(b, kinds, bad, callees, links, longest);
             }
         }
         Expr::Match(subject, arms) => {
-            kinds_expr(subject, kinds, bad, callees);
+            kinds_expr(subject, kinds, bad, callees, links, longest);
             for arm in arms {
                 for p in &arm.patterns {
                     match p {
-                        Pattern::Lit(e) => kinds_expr(e, kinds, bad, callees),
+                        Pattern::Lit(e) => kinds_expr(e, kinds, bad, callees, links, longest),
                         Pattern::Bind(_, Some(b)) => note(b.slot, Kind::Num, kinds, bad),
                         _ => {}
                     }
                 }
                 if let Some(g) = &arm.guard {
-                    kinds_expr(g, kinds, bad, callees);
+                    kinds_expr(g, kinds, bad, callees, links, longest);
                 }
-                kinds_block(&arm.body, kinds, bad, callees);
+                kinds_block(&arm.body, kinds, bad, callees, links, longest);
             }
         }
-        Expr::Do(b) => kinds_block(b, kinds, bad, callees),
+        Expr::Do(b) => kinds_block(b, kinds, bad, callees, links, longest),
         Expr::Func(_) | Expr::Upval(..) | Expr::Global(..) | Expr::Var(_) | Expr::Nil
         | Expr::Bool(_) | Expr::Num(_) | Expr::Str(_) => {}
     }
@@ -1208,6 +1348,7 @@ fn preamble() -> TokenStream {
             pub span: usize,
             pub push: usize,
             pub set: usize,
+            pub inner: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1262,6 +1403,29 @@ fn preamble() -> TokenStream {
         }
 
         /// # Safety
+        /// `t` is a live table of tables and `i` an index inside it. The
+        /// element's view stays valid for the same reason a top level one
+        /// does: nothing reshapes it while this code runs.
+        #[inline(always)]
+        unsafe fn rua_inner(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            i: f64,
+            ptr: *mut *const f64,
+            len: *mut usize,
+            ok: *mut i32,
+        ) -> *mut c_void {
+            let f: unsafe extern "C" fn(
+                *mut c_void,
+                f64,
+                *mut *const f64,
+                *mut usize,
+                *mut i32,
+            ) -> *mut c_void = std::mem::transmute((*rt).inner as *const ());
+            f(t, i, ptr, len, ok)
+        }
+
+        /// # Safety
         /// As `rua_len`. The view a read table hands out stays valid as long as
         /// nothing writes to *that* table, which the runtime checks before it
         /// uses this code.
@@ -1282,6 +1446,13 @@ fn preamble() -> TokenStream {
 /// Lowering context: which frame slots are in scope as plain f64 locals.
 struct Ctx {
     known: HashSet<u16>,
+    /// Slots bound by `let b = t[i]` where the elements are tables, and the
+    /// array they came from. Their view is fetched where they are bound rather
+    /// than on entry.
+    inner_of: HashMap<u16, u16>,
+    /// Locals bound once to `t.len()` and never written: the table they
+    /// measure. A loop bounded by one of those is bounded by the table.
+    len_of: HashMap<u16, u16>,
     self_symbol: String,
     /// How this function refers to itself, if it does.
     self_ref: SelfRef,
@@ -1615,10 +1786,10 @@ impl Ctx {
                 let v = self.expr(e)?;
                 quote! { #v }
             }
-            (Some(e), false) => {
-                let v = self.expr(e)?;
-                quote! { let _ = #v; }
-            }
+            // A block's last expression is its value, but in statement
+            // position there is no value to want: `for j in .. { if c { .. } }`
+            // ends in an `if` that produces nothing, and that is fine.
+            (Some(e), false) => self.value_or_unit(e)?,
             (None, true) => {
                 // no tail: the block must end in `return <expr>`, which types as `!`
                 match b.stats.last() {
@@ -1634,6 +1805,41 @@ impl Ctx {
 
     fn stat(&mut self, st: &Stat) -> Lower<TokenStream> {
         Ok(match st {
+            // `let b = t[i]` where the elements of `t` are tables: fetch the
+            // element's address and the view of its numbers here, once, rather
+            // than at every access through it
+            Stat::LetSlots(bindings, exprs)
+                if bindings.len() == 1 && self.inner_of.contains_key(&bindings[0].slot) =>
+            {
+                let b = bindings[0];
+                if b.cell {
+                    return Err("an element of an array captured by a closure".into());
+                }
+                let Some(Expr::Index(obj, key)) = exprs.first() else {
+                    return Err("an element binding with no index".into());
+                };
+                let outer = self.table_slot(obj)?;
+                if !self.proven_in_range(key, outer) {
+                    return Err("an unproven index into an array of arrays".into());
+                }
+                let outer_id = ident(outer);
+                let id = ident(b.slot);
+                let (ptr, len) = span_idents(b.slot);
+                let i = self.expr(key)?;
+                let trap = self.on_trap.clone();
+                self.known.insert(b.slot);
+                // The runtime checked on the way in that every element is a
+                // table of numbers, and the index is proven, so this cannot
+                // fail; the check is what makes that a wrong answer rather
+                // than a wild pointer if it ever did.
+                quote! {
+                    let mut #len: usize = 0;
+                    let mut #ptr: *const f64 = std::ptr::null();
+                    let #id: *mut c_void =
+                        unsafe { rua_inner(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
+                    if unsafe { *ok } == 0 { #trap }
+                }
+            }
             Stat::LetSlots(bindings, exprs) => {
                 if exprs.len() > bindings.len() {
                     return Err("extra values in a `let`".into());
@@ -2061,8 +2267,9 @@ impl Ctx {
                 let slot = self.table_slot(obj)?;
                 match (&**name, args.len()) {
                     ("len", 0) => match self.kind_of(slot) {
-                        // a read table already knows its length from the view
-                        Kind::Table => {
+                        // a read table already knows its length from the view,
+                        // and an array of arrays read its length on entry
+                        Kind::Table | Kind::Tables(_) => {
                             let (_, len) = span_idents(slot);
                             quote! { (#len as f64) }
                         }
@@ -2120,7 +2327,10 @@ impl Ctx {
     /// Is this expression a local the inference decided holds a table?
     fn is_table(&self, e: &Expr) -> bool {
         matches!(e, Expr::Local(b, _)
-            if matches!(self.kinds.get(&b.slot), Some(Kind::Table) | Some(Kind::TableOut)))
+            if matches!(
+                self.kinds.get(&b.slot),
+                Some(Kind::Table) | Some(Kind::TableOut) | Some(Kind::Tables(_))
+            ))
     }
 
     fn kind_of(&self, slot: u16) -> Kind {
@@ -2129,6 +2339,26 @@ impl Ctx {
 
     /// Is `key` a loop variable we know indexes `table` safely?
     fn proven_in_range(&mut self, key: &Expr, table: u16) -> bool {
+        // A constant index is settled before the body runs. Inside an element
+        // of an array of arrays the runtime checked every element's length on
+        // the way in; on a flat table one length check at entry does it, and
+        // entry is before any write, so trapping there is safe.
+        if let Expr::Num(n) = key {
+            if !(*n >= 0.0 && n.fract() == 0.0 && *n < u32::MAX as f64) {
+                return false;
+            }
+            let need = *n as u32 + 1;
+            if let Some(outer) = self.inner_of.get(&table).copied() {
+                return matches!(self.kind_of(outer), Kind::Tables(min) if need <= min);
+            }
+            let bound = Literal::f64_suffixed(need as f64);
+            let bound = quote! { #bound };
+            if !self.hoisted.iter().any(|(t, b)| *t == table && b.to_string() == bound.to_string())
+            {
+                self.hoisted.push((table, bound));
+            }
+            return true;
+        }
         let Expr::Local(b, _) = key else { return false };
         if self.in_range.iter().any(|(v, t)| *v == b.slot && *t == table) {
             return true;
@@ -2173,6 +2403,19 @@ impl Ctx {
         match end {
             Expr::Num(_) => self.expr(end).ok(),
             Expr::Local(b, _) if self.stable_params.contains(&b.slot) => self.expr(end).ok(),
+            // `let n = t.len()` and then `for i in 0..n`: the bound is the
+            // table's length, which entry can name without the local being in
+            // scope there
+            Expr::Local(b, _) => {
+                let t = *self.len_of.get(&b.slot)?;
+                match self.kind_of(t) {
+                    Kind::Table | Kind::Tables(_) => {
+                        let (_, len) = span_idents(t);
+                        Some(quote! { (#len as f64) })
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -2220,6 +2463,19 @@ impl Ctx {
     }
 
     fn call(&mut self, f: &Expr, args: &[Expr]) -> Lower<TokenStream> {
+        // `math::sqrt(x)` is an f64 intrinsic, not a call: it cannot trap, so
+        // it is allowed even where a real call is not.
+        if let Expr::Index(obj, key) = f {
+            if let (Expr::Global(o, _), Expr::Str(k)) = (&**obj, &**key) {
+                if &**o == "math" {
+                    let a: Vec<_> = args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
+                    if a.is_empty() {
+                        return Err(format!("math::{k} with no arguments"));
+                    }
+                    return math_method(k, &a[0], &a[1..]);
+                }
+            }
+        }
         // A callee can trap — on its own depth check, or on a table that is not
         // dense numbers — and a trap unwinds to the interpreter, which re-runs
         // the whole call. That is only safe while nothing has been written yet.
@@ -2274,6 +2530,22 @@ impl Ctx {
                             Kind::Table => match a {
                                 Expr::Local(b, _)
                                     if self.kind_of(b.slot) == Kind::Table
+                                        && self.known.contains(&b.slot) =>
+                                {
+                                    let id = ident(b.slot);
+                                    cells.push(quote! { RtArg { num: 0.0, table: #id } });
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            // an array of arrays passes the same way a flat
+                            // table does: the address, and the callee checks
+                            // its own requirements on the way in
+                            Kind::Tables(_) => match a {
+                                Expr::Local(b, _)
+                                    if self.kind_of(b.slot) == *kind
                                         && self.known.contains(&b.slot) =>
                                 {
                                     let id = ident(b.slot);

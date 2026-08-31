@@ -88,6 +88,7 @@ impl RtCtxHolder {
             span: hooks.span,
             push: hooks.push,
             set: hooks.set,
+            inner: hooks.inner,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -1162,6 +1163,47 @@ pub unsafe extern "C" fn rua_rt_set(t: *mut std::ffi::c_void, i: f64, v: f64, ok
     }
 }
 
+/// `t[i]` when the elements are themselves tables: the element's address, and
+/// a view of its numbers.
+///
+/// The caller checked on the way in that every element is a table of numbers
+/// long enough for the constant indexes the compiled body uses, and the index
+/// is one the compiler proved, so this does not fail in practice. It still
+/// reports rather than assumes: a wrong answer that the interpreter re-runs
+/// beats handing compiled code a null pointer.
+///
+/// # Safety
+/// `t` is a live table pointer, and `ptr`/`len`/`ok` are writable.
+pub unsafe extern "C" fn rua_rt_inner(
+    t: *mut std::ffi::c_void,
+    i: f64,
+    ptr: *mut *const f64,
+    len: *mut usize,
+    ok: *mut i32,
+) -> *mut std::ffi::c_void {
+    if t.is_null() {
+        *ok = 0;
+        return std::ptr::null_mut();
+    }
+    let table = &*(t as *const RefCell<Table>);
+    let Some(Value::Table(elem)) = (*table.as_ptr()).get_num(i) else {
+        *ok = 0;
+        return std::ptr::null_mut();
+    };
+    let addr = Rc::as_ptr(elem) as *mut std::ffi::c_void;
+    match (*elem.as_ptr()).nums_span() {
+        Some((p, n)) => {
+            *ptr = p;
+            *len = n;
+            addr
+        }
+        None => {
+            *ok = 0;
+            std::ptr::null_mut()
+        }
+    }
+}
+
 fn hooks() -> RtHooks {
     RtHooks {
         len: rua_rt_len as *const () as usize,
@@ -1169,6 +1211,7 @@ fn hooks() -> RtHooks {
         span: rua_rt_span as *const () as usize,
         push: rua_rt_push as *const () as usize,
         set: rua_rt_set as *const () as usize,
+        inner: rua_rt_inner as *const () as usize,
     }
 }
 
@@ -1192,6 +1235,26 @@ fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
         out.push(match (v, kind) {
             (Value::Num(n), Kind::Num) => RtArg::num(*n),
             (Value::Table(t), Kind::Table | Kind::TableOut) => {
+                RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
+            }
+            // An array of arrays: compiled code reads `b[3]` inside it with no
+            // test of its own, so the shape is checked once, here, where
+            // refusing is still free. Every element has to be a table whose
+            // array part is all numbers and long enough.
+            (Value::Table(t), Kind::Tables(min)) => {
+                let outer = t.try_borrow().ok()?;
+                for k in 0..outer.len() {
+                    let elem = match outer.get_num(k as f64) {
+                        Some(Value::Table(e)) => e.clone(),
+                        _ => return None,
+                    };
+                    let mut inner = elem.try_borrow_mut().ok()?;
+                    match inner.nums_span() {
+                        Some((_, n)) if n >= *min as usize => {}
+                        _ => return None,
+                    }
+                }
+                drop(outer);
                 RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
             }
             _ => return None,
