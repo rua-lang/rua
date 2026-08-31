@@ -663,6 +663,45 @@ impl Vm {
                         pc = to as usize;
                     }
                 }
+                Op::ForLoop { counter, limit, to, id, hint, le } => {
+                    // step and test in one, and falling through is the exit
+                    let step = match (at!(counter), at!(limit)) {
+                        (Value::Num(i), Value::Num(l)) => {
+                            let next = i + 1.0;
+                            Some((next, if le { next <= *l } else { next < *l }))
+                        }
+                        _ => None,
+                    };
+                    let going = match step {
+                        Some((next, going)) => {
+                            set!(counter, Value::Num(next));
+                            going
+                        }
+                        // a loop variable the body turned into something that
+                        // is not a number: let the ordinary paths say so
+                        None => {
+                            let kind = if le { BinKind::Le } else { BinKind::Lt };
+                            let next = arith(BinKind::Add, get!(counter), Value::Num(1.0))
+                                .map_err(|e| self.at(proto, pc, e))?;
+                            let going = arith(kind, next.clone(), get!(limit))
+                                .map_err(|e| self.at(proto, pc, e))?
+                                .truthy();
+                            set!(counter, next);
+                            going
+                        }
+                    };
+                    if going {
+                        let hits = &proto.hints[hint as usize];
+                        let n = hits.get().wrapping_add(1);
+                        hits.set(n);
+                        // when the JIT takes the loop over it runs it out, and
+                        // the instruction after this one is where that ends
+                        if !(n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id)) {
+                            pc = to as usize;
+                        }
+                        resync!();
+                    }
+                }
                 Op::JumpBack { to, id, hint, exit } => {
                     let counter = &proto.hints[hint as usize];
                     let n = counter.get().wrapping_add(1);

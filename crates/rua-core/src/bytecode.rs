@@ -82,6 +82,11 @@ pub enum Op {
     /// A loop's back edge: count the iteration for the JIT and jump. `exit` is
     /// where to continue if the JIT takes the loop over.
     JumpBack { to: u32, id: u32, hint: u16, exit: u32 },
+    /// A counted loop's back edge: `i += 1`, test against the limit, and jump
+    /// back into the body if it still holds — the three instructions a `for i
+    /// in a..b` used to spend per iteration, which is twice what Lua spends.
+    /// Falling through is the loop's exit, so it needs no exit field.
+    ForLoop { counter: Reg, limit: Reg, to: u32, id: u32, hint: u16, le: bool },
 
     /// Callee at `base`, arguments at `base+1..base+1+nargs`. Results land at
     /// `base`; `nres` of them, or all of them when it is [`MULTI`].
@@ -169,3 +174,12 @@ impl std::fmt::Debug for Proto {
     }
 }
 
+#[cfg(test)]
+mod size {
+    #[test]
+    fn op_is_sixteen_bytes() {
+        // Every instruction is fetched through this, so a variant that pushes
+        // the enum wider makes the whole interpreter slower.
+        assert_eq!(std::mem::size_of::<super::Op>(), 16);
+    }
+}

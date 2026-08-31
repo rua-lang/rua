@@ -347,15 +347,15 @@ impl FnCompiler {
                 // what lets the JIT take the loop over mid-flight
                 let counter = if b.cell { self.alloc() } else { b.slot };
                 let limit = self.alloc();
-                let step = self.alloc();
                 self.expr(start, counter);
                 self.expr(end, limit);
-                let one = self.constant(Value::Num(1.0));
-                self.emit(Op::Const { dst: step, k: one }, 0);
 
-                let top = self.here();
+                // The entry test is its own instruction; every iteration after
+                // the first is tested by the back edge, which does the step and
+                // the jump in the same breath.
                 let kind = if *inclusive { BinKind::Le } else { BinKind::Lt };
                 let exit = self.emit(Op::JumpIfNot { kind, a: counter, b: limit, to: 0 }, 0);
+                let top = self.here();
                 if b.cell {
                     // a captured loop variable is fresh each turn, so a closure
                     // made in the body captures this iteration's value
@@ -369,13 +369,14 @@ impl FnCompiler {
                 for at in ctx.continues {
                     self.patch_to(at, cont);
                 }
-                self.emit(Op::Bin { kind: BinKind::Add, dst: counter, a: counter, b: step }, 0);
                 let hint = self.next_hint();
-                let back = self.emit(Op::JumpBack { to: top, id: *id, hint, exit: 0 }, 0);
+                self.emit(
+                    Op::ForLoop { counter, limit, to: top, id: *id, hint, le: *inclusive },
+                    0,
+                );
                 for at in ctx.breaks {
                     self.patch(at);
                 }
-                self.patch_hint(back);
                 self.release(mark);
             }
             Stat::ForIn { id, bindings, iter, body, .. } => {
