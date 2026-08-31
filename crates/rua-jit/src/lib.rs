@@ -329,6 +329,7 @@ impl Jit {
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
             self_params_numeric: true,
+            self_param_kinds: Vec::new(),
             writes,
             mutable_views,
             kinds,
@@ -622,6 +623,7 @@ impl Jit {
             arity: def.params.len(),
             inlined: Vec::new(),
             self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
+            self_param_kinds: param_kinds.clone(),
             writes,
             mutable_views,
             kinds,
@@ -1568,6 +1570,8 @@ struct Ctx {
     /// Whether every parameter of this function is a number, which is what a
     /// direct self call is able to pass.
     self_params_numeric: bool,
+    /// What this function's own parameters are, for a recursive call.
+    self_param_kinds: Vec<Kind>,
     /// What each slot holds: a number, or a table reached through the hooks.
     kinds: HashMap<u16, Kind>,
     /// True when this code appends to a table. Once it has written something,
@@ -2670,15 +2674,34 @@ impl Ctx {
             _ => false,
         };
         if is_self && args.len() == self.arity {
-            if !self.self_params_numeric {
-                return Err("recursion in a function that takes a table".into());
-            }
             let sym = format_ident!("{}", self.self_symbol);
-            let a: Vec<_> = args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
+            // A table passes to the recursive call the way it does to any
+            // other compiled one: as the address this frame already holds.
+            // Handing it straight back is what lets a recursive function that
+            // works on arrays compile at all.
+            let kinds = self.self_param_kinds.clone();
+            let mut cells = Vec::with_capacity(args.len());
+            for (a, kind) in args.iter().zip(&kinds) {
+                match kind {
+                    Kind::Num => {
+                        let v = self.expr(a)?;
+                        cells.push(quote! { RtArg { num: #v, table: std::ptr::null_mut() } });
+                    }
+                    _ => match a {
+                        Expr::Local(b, _)
+                            if self.kind_of(b.slot) == *kind && self.known.contains(&b.slot) =>
+                        {
+                            let id = ident(b.slot);
+                            cells.push(quote! { RtArg { num: 0.0, table: #id } });
+                        }
+                        _ => return Err("a table argument that is not the one held here".into()),
+                    },
+                }
+            }
             let trap = self.on_trap.clone();
             return Ok(quote! {
                 {
-                    let __args = [#(RtArg { num: #a, table: std::ptr::null_mut() }),*];
+                    let __args = [#(#cells),*];
                     let __r = unsafe { #sym(__args.as_ptr(), rt, ok) };
                     if unsafe { *ok } == 0 { #trap }
                     __r
