@@ -519,14 +519,11 @@ impl Vm {
         let Some(compiled) = &entry.code else { return false };
         let mut regs = Vec::with_capacity(compiled.slots.len());
         for (slot, kind) in compiled.slots.iter().zip(&compiled.kinds) {
-            match (&self.stack[self.base + *slot as usize], kind) {
-                (Value::Num(n), Kind::Num) => regs.push(RtArg::num(*n)),
-                (Value::Table(t), Kind::Table | Kind::TableOut) => {
-                    regs.push(RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void))
-                }
-                // a local does not hold what the compiled code expects: stay
-                // interpreted this time round
-                _ => return false,
+            // a local that does not hold what the compiled code expects
+            // leaves this time round interpreted
+            match rt_arg(&self.stack[self.base + *slot as usize], kind) {
+                Some(a) => regs.push(a),
+                None => return false,
             }
         }
         // as in `compiled_args`: never read a view of a table this code writes
@@ -1226,39 +1223,47 @@ fn frame_name(p: *const crate::bytecode::Proto) -> Rc<str> {
 
 /// Turn call arguments into the shape compiled code expects, or `None` when
 /// they do not match what it was compiled for.
+/// One value, as the argument compiled code expects for that kind — or `None`,
+/// which sends the call back to the interpreter.
+fn rt_arg(v: &Value, kind: &Kind) -> Option<RtArg> {
+    Some(match (v, kind) {
+        (Value::Num(n), Kind::Num) => RtArg::num(*n),
+        (Value::Table(t), Kind::Table | Kind::TableOut) => {
+            RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
+        }
+        // An array of arrays: compiled code reads `b[3]` inside it with no test
+        // of its own, so the shape is checked once, here, where refusing is
+        // still free. Every element has to be a table whose array part is all
+        // numbers and long enough.
+        (Value::Table(t), Kind::Tables { checked: false, .. }) => {
+            RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
+        }
+        (Value::Table(t), Kind::Tables { checked: true, min }) => {
+            let outer = t.try_borrow().ok()?;
+            for k in 0..outer.len() {
+                let elem = match outer.get_num(k as f64) {
+                    Some(Value::Table(e)) => e.clone(),
+                    _ => return None,
+                };
+                let mut inner = elem.try_borrow_mut().ok()?;
+                match inner.nums_span() {
+                    Some((_, n)) if n >= *min as usize => {}
+                    _ => return None,
+                }
+            }
+            RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
+        }
+        _ => return None,
+    })
+}
+
 fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
     if args.len() != kinds.len() {
         return None;
     }
     let mut out = Vec::with_capacity(args.len());
     for (v, kind) in args.iter().zip(kinds) {
-        out.push(match (v, kind) {
-            (Value::Num(n), Kind::Num) => RtArg::num(*n),
-            (Value::Table(t), Kind::Table | Kind::TableOut) => {
-                RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
-            }
-            // An array of arrays: compiled code reads `b[3]` inside it with no
-            // test of its own, so the shape is checked once, here, where
-            // refusing is still free. Every element has to be a table whose
-            // array part is all numbers and long enough.
-            (Value::Table(t), Kind::Tables(min)) => {
-                let outer = t.try_borrow().ok()?;
-                for k in 0..outer.len() {
-                    let elem = match outer.get_num(k as f64) {
-                        Some(Value::Table(e)) => e.clone(),
-                        _ => return None,
-                    };
-                    let mut inner = elem.try_borrow_mut().ok()?;
-                    match inner.nums_span() {
-                        Some((_, n)) if n >= *min as usize => {}
-                        _ => return None,
-                    }
-                }
-                drop(outer);
-                RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
-            }
-            _ => return None,
-        });
+        out.push(rt_arg(v, kind)?);
     }
     // Compiled code reads one table through a view of its array part and
     // appends to another. If those are the same table, the view would go
