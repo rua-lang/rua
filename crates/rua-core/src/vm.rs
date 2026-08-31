@@ -443,11 +443,12 @@ impl Vm {
                 Op::Method { base, name, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
                     let recv = get!(base + 1);
-                    let name = match &proto.consts[name as usize] {
-                        Value::Str(s) => s.clone(),
-                        other => RStr::from(other.to_string()),
-                    };
-                    let m = self.method(&recv, &name).map_err(|e| self.at(proto, pc, e))?;
+                    // the name is a constant of this function: borrow it
+                    let m = match &proto.consts[name as usize] {
+                        Value::Str(s) => self.method(&recv, s),
+                        other => self.method(&recv, &RStr::from(other.to_string())),
+                    }
+                    .map_err(|e| self.at(proto, pc, e))?;
                     // the receiver is the first argument, as in Rust
                     self.dispatch(&m, base, nargs + 1, nres)
                         .map_err(|e| self.here(proto, pc, e))?;
@@ -462,11 +463,11 @@ impl Vm {
                         get!(base)
                     } else {
                         let recv = get!(base + 1);
-                        let name = match &proto.consts[method as usize] {
-                            Value::Str(s) => s.clone(),
-                            other => RStr::from(other.to_string()),
-                        };
-                        self.method(&recv, &name).map_err(|e| self.at(proto, pc, e))?
+                        match &proto.consts[method as usize] {
+                            Value::Str(s) => self.method(&recv, s),
+                            other => self.method(&recv, &RStr::from(other.to_string())),
+                        }
+                        .map_err(|e| self.at(proto, pc, e))?
                     };
                     // fixed arguments, then everything the last call produced
                     let mut args = self.take_args(base + 1, nargs);

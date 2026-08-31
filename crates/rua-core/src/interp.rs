@@ -820,8 +820,18 @@ impl Vm {
     pub fn index(&mut self, o: &Value, k: &Value) -> Res<Value> {
         match o {
             Value::Table(t) => Ok(t.borrow().get(&Key::from_value(k)?)),
-            Value::Str(_) => Ok(self.lib_member(MethodTable::Str, &Key::from_value(k)?)),
-            Value::Num(_) => Ok(self.lib_member(MethodTable::Math, &Key::from_value(k)?)),
+            // a library member is always reached by name
+            Value::Str(_) | Value::Num(_) => {
+                let kind = if matches!(o, Value::Str(_)) {
+                    MethodTable::Str
+                } else {
+                    MethodTable::Math
+                };
+                Ok(match k {
+                    Value::Str(name) => self.lib_member(kind, name),
+                    _ => Value::Nil,
+                })
+            }
             Value::Cell(c) => {
                 let inner = c.borrow().clone();
                 self.index(&inner, k)
@@ -830,9 +840,9 @@ impl Vm {
         }
     }
 
-    fn lib_member(&self, kind: MethodTable, key: &Key) -> Value {
+    fn lib_member(&self, kind: MethodTable, name: &RStr) -> Value {
         match self.lib(kind) {
-            Some(t) => t.borrow().get(key),
+            Some(t) => t.borrow().get_field(name).unwrap_or(Value::Nil),
             None => Value::Nil,
         }
     }
@@ -842,10 +852,7 @@ impl Vm {
     pub(crate) fn method(&mut self, o: &Value, name: &RStr) -> Res<Value> {
         let kind = match o {
             Value::Table(t) => {
-                let own = match t.borrow().get_field(name) {
-                    Some(v) => v,
-                    None => t.borrow().get(&Key::Str(name.clone())),
-                };
+                let own = t.borrow().get_field(name).unwrap_or(Value::Nil);
                 if !matches!(own, Value::Nil) {
                     return Ok(own);
                 }
@@ -857,8 +864,7 @@ impl Vm {
                 return err(format!("a {} value has no method `{name}`", other.type_name()))
             }
         };
-        let key = Key::Str(name.clone());
-        match self.lib_member(kind, &key) {
+        match self.lib_member(kind, name) {
             Value::Nil => err(format!("no method `{name}` on a {} value", o.type_name())),
             v => Ok(v),
         }
