@@ -98,6 +98,7 @@ impl RtCtxHolder {
             span_mut: hooks.span_mut,
             inner_mut: hooks.inner_mut,
             spans: hooks.spans,
+            spans_mut: hooks.spans_mut,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -1308,8 +1309,8 @@ unsafe fn settle_dirty(mark: (usize, usize), keep: bool) {
     // the element views this call was given die with it, and only those
     SPANS.with(|s| s.borrow_mut().truncate(mark.1));
     DIRTY.with(|d| {
-        let tail: Vec<Dirty> = d.borrow_mut().split_off(mark.0);
-        for e in tail {
+        let mut list = d.borrow_mut();
+        for e in list.drain(mark.0..) {
             let table = &*e.table;
             if keep {
                 (*table.as_ptr()).commit_nums();
@@ -1398,16 +1399,56 @@ thread_local! {
 /// # Safety
 /// `t` is a live table pointer; the array stays valid until the compiled call
 /// that asked for it ends, which is when the runtime drops it.
+pub unsafe extern "C" fn rua_rt_spans_mut(
+    t: *mut std::ffi::c_void,
+    len: *mut usize,
+    ok: *mut i32,
+) -> *const rua_jit::RtSpan {
+    spans_of(t, len, ok, true)
+}
+
+/// A view of every element of an array of arrays, built once.
+///
+/// # Safety
+/// As `rua_rt_spans`.
 pub unsafe extern "C" fn rua_rt_spans(
     t: *mut std::ffi::c_void,
     len: *mut usize,
     ok: *mut i32,
+) -> *const rua_jit::RtSpan {
+    spans_of(t, len, ok, false)
+}
+
+/// # Safety
+/// `t` is a live table pointer; the array stays valid until the compiled call
+/// that asked for it ends.
+unsafe fn spans_of(
+    t: *mut std::ffi::c_void,
+    len: *mut usize,
+    ok: *mut i32,
+    writable: bool,
 ) -> *const rua_jit::RtSpan {
     if t.is_null() {
         *ok = 0;
         return std::ptr::null();
     }
     let outer = &*(t as *const RefCell<Table>);
+    // Nothing about an array of arrays changes between calls that only read
+    // and write numbers in place, and rebuilding these views was a third of
+    // n-body. The epoch moves whenever any table's storage does.
+    if let Some(cached) = (*outer.as_ptr()).cached_spans(rua_core_shape_epoch()) {
+        *len = cached.1;
+        if writable {
+            // the views are still good, but this call has to say which tables
+            // it may write, so that they are committed or rolled back
+            for k in 0..cached.1 {
+                if let Some(Value::Table(e)) = (*outer.as_ptr()).get_num(k as f64) {
+                    note_dirty(Rc::as_ptr(e));
+                }
+            }
+        }
+        return cached.0;
+    }
     let n = (*outer.as_ptr()).len();
     let mut out: Vec<rua_jit::RtSpan> = Vec::with_capacity(n);
     for k in 0..n {
@@ -1418,7 +1459,13 @@ pub unsafe extern "C" fn rua_rt_spans(
                 return std::ptr::null();
             }
         };
-        match (*elem.as_ptr()).nums_span() {
+        let view = if writable {
+            note_dirty(Rc::as_ptr(&elem));
+            (*elem.as_ptr()).nums_span_mut()
+        } else {
+            (*elem.as_ptr()).nums_span().map(|(p, l)| (p as *mut f64, l))
+        };
+        match view {
             Some((p, l)) => out.push(rua_jit::RtSpan { ptr: p, len: l }),
             None => {
                 *ok = 0;
@@ -1429,8 +1476,16 @@ pub unsafe extern "C" fn rua_rt_spans(
     *len = n;
     let boxed = out.into_boxed_slice();
     let addr = boxed.as_ptr();
-    SPANS.with(|s| s.borrow_mut().push(boxed));
+    // keep the previous one alive: compiled code further up this call may
+    // still be reading through it
+    if let Some(old) = (*outer.as_ptr()).replace_spans(rua_core_shape_epoch(), boxed) {
+        SPANS.with(|s| s.borrow_mut().push(old));
+    }
     addr
+}
+
+fn rua_core_shape_epoch() -> u64 {
+    crate::value::shape_epoch()
 }
 
 fn hooks() -> RtHooks {
@@ -1444,6 +1499,7 @@ fn hooks() -> RtHooks {
         span_mut: rua_rt_span_mut as *const () as usize,
         inner_mut: rua_rt_inner_mut as *const () as usize,
         spans: rua_rt_spans as *const () as usize,
+        spans_mut: rua_rt_spans_mut as *const () as usize,
     }
 }
 

@@ -613,10 +613,29 @@ pub struct Table {
     pairs: Vec<(Key, Value)>,
     /// Key to index into `pairs`, built once `pairs` gets long.
     index: Option<Box<FxMap<Key, usize>>>,
+    /// The views of every element, for compiled code that walks an array of
+    /// arrays, with the shape epoch they were built at. Rebuilding them at
+    /// every call was a third of n-body.
+    spans: Option<(u64, Box<[rua_jit::RtSpan]>)>,
     /// A plain `f64` copy of the array part, built on demand for compiled code
     /// so that it can read elements without calling back into the runtime.
     /// Any mutation that could invalidate it throws it away.
     nums: Option<Vec<f64>>,
+}
+
+thread_local! {
+    /// Bumped whenever any table's storage moves or changes shape. Compiled
+    /// code holds raw views into tables; this is how anything cached about
+    /// them knows it is still true.
+    static SHAPE_EPOCH: Cell<u64> = const { Cell::new(1) };
+}
+
+pub fn shape_epoch() -> u64 {
+    SHAPE_EPOCH.with(|e| e.get())
+}
+
+pub fn bump_shape_epoch() {
+    SHAPE_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
 }
 
 /// Above this many keyed entries, a table builds a hash index.
@@ -794,6 +813,7 @@ impl Table {
     /// the cache away throws every compiled write away with it.
     pub fn nums_span_mut(&mut self) -> Option<(*mut f64, usize)> {
         self.nums_span()?;
+        // what is written through it no longer matches the array part
         let cache = self.nums.as_mut()?;
         Some((cache.as_mut_ptr(), cache.len()))
     }
@@ -807,9 +827,30 @@ impl Table {
         }
     }
 
+    /// The element views built earlier, if nothing has moved since.
+    pub fn cached_spans(&self, epoch: u64) -> Option<(*const rua_jit::RtSpan, usize)> {
+        match &self.spans {
+            Some((at, views)) if *at == epoch => Some((views.as_ptr(), views.len())),
+            _ => None,
+        }
+    }
+
+    /// Keep a freshly built set of views, handing back the old one so that
+    /// compiled code still reading through it is not left holding nothing.
+    pub fn replace_spans(
+        &mut self,
+        epoch: u64,
+        views: Box<[rua_jit::RtSpan]>,
+    ) -> Option<Box<[rua_jit::RtSpan]>> {
+        let old = self.spans.take().map(|(_, v)| v);
+        self.spans = Some((epoch, views));
+        old
+    }
+
     /// Compiled code bailed out: throw away what it wrote.
     pub fn discard_nums(&mut self) {
         self.nums = None;
+        bump_shape_epoch();
     }
 
     /// Is the array part all there is? An append then adds one slot and takes
@@ -838,6 +879,9 @@ impl Table {
                 }
             }
             self.nums = Some(out);
+            // the view is a fresh allocation, so anything holding the old one
+            // is looking at nothing
+            bump_shape_epoch();
         }
         let cache = self.nums.as_ref().expect("just filled in");
         Some((cache.as_ptr(), cache.len()))
@@ -875,6 +919,7 @@ impl Table {
                 while matches!(self.arr.last(), Some(Value::Nil)) {
                     self.arr.pop();
                     self.nums = None;
+                    bump_shape_epoch();
                 }
                 return;
             }
@@ -964,6 +1009,7 @@ impl Table {
     /// Append, including a nil: `[1, nil, 2]` keeps its three slots, so that
     /// `len()` and iteration agree with what was written.
     pub fn push(&mut self, v: Value) {
+        bump_shape_epoch();
         // Keep the numeric view in step rather than dropping it. Filling an
         // array and then reading it is the common shape, and rebuilding the
         // view on the next read costs more than the whole fill.

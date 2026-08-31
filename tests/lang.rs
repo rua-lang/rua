@@ -1120,3 +1120,44 @@ fn a_loop_taken_over_mid_flight_keeps_its_counter() {
         .unwrap();
     assert_eq!(out[0].as_num().unwrap(), 44999850000.0);
 }
+
+/// A nested function's own parameters are not captures. They shared a
+/// namespace with the enclosing frame's locals, so `fn advance(bodies, dt)`
+/// beside a `let bodies` put that array in a heap cell — which slows every
+/// read of it and stops the compiler taking any loop that touches it.
+#[test]
+fn a_parameter_is_not_a_capture_of_the_same_name() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let k = 2
+        fn scale(v) { v * k }          // this one really does capture k
+        fn first(a) { a[0] }           // `a` here is its own, not the outer one
+        let a = [scale(3), 2, 1]
+        let total = 0
+        for i in 0..200000 { total += first(a) }
+        return total;
+        "#,
+        )
+        .unwrap();
+    assert_eq!(out[0].as_num().unwrap(), 1200000.0);
+    assert!(
+        vm.jit.compiled >= 1,
+        "the loop reads a plain local and should compile: {:?}",
+        vm.jit.last_error
+    );
+}
+
+/// The scan that decides captures has to follow scope, not just names.
+#[test]
+fn a_name_read_before_it_is_shadowed_is_still_a_capture() {
+    assert_eq!(
+        s(r#"
+        let x = "outer"
+        fn f() { let y = x; let x = "inner"; y + "/" + x }
+        f()
+        "#),
+        "outer/inner"
+    );
+}

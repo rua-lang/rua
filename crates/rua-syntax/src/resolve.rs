@@ -26,109 +26,167 @@ pub fn resolve_chunk(block: &Block) -> (Block, usize) {
 
 fn captured_names(body: &Block) -> HashSet<Rc<str>> {
     let mut out = HashSet::new();
-    scan_block(body, &mut out, false);
+    let mut scan = Scan { out: &mut out, scopes: Vec::new() };
+    scan.block(body, false);
     out
 }
 
-fn scan_block(b: &Block, out: &mut HashSet<Rc<str>>, inside: bool) {
-    for st in &b.stats {
-        scan_stat(st, out, inside);
-    }
-    if let Some(t) = &b.tail {
-        scan_expr(t, out, inside);
-    }
+/// The walk that decides which names a nested function reads from outside
+/// itself.
+///
+/// It has to know what the nested function binds for itself, or a parameter
+/// named the same as an outer local marks that local as captured — which puts
+/// it in a heap cell, slows every read of it, and stops the compiler taking
+/// any loop that touches it. `fn advance(bodies, dt)` beside a `let bodies`
+/// was exactly that.
+struct Scan<'a> {
+    out: &'a mut HashSet<Rc<str>>,
+    /// Names bound inside the nested function, innermost scope last.
+    scopes: Vec<HashSet<Rc<str>>>,
 }
 
-fn scan_stat(st: &Stat, out: &mut HashSet<Rc<str>>, inside: bool) {
-    match st {
-        Stat::Let(_, exprs) | Stat::LetSlots(_, exprs) | Stat::Return(exprs) => {
-            exprs.iter().for_each(|e| scan_expr(e, out, inside))
-        }
-        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) => scan_expr(e, out, inside),
-        Stat::Assign(targets, exprs) => {
-            targets.iter().chain(exprs).for_each(|e| scan_expr(e, out, inside))
-        }
-        Stat::OpAssign(t, _, e) => {
-            scan_expr(t, out, inside);
-            scan_expr(e, out, inside);
-        }
-        Stat::Expr(e) => scan_expr(e, out, inside),
-        Stat::While(_, c, b) => {
-            scan_expr(c, out, inside);
-            scan_block(b, out, inside);
-        }
-        Stat::Loop(_, b) => scan_block(b, out, inside),
-        Stat::ForRange { start, end, body, .. } => {
-            scan_expr(start, out, inside);
-            scan_expr(end, out, inside);
-            scan_block(body, out, inside);
-        }
-        Stat::ForIn { iter, body, .. } => {
-            scan_expr(iter, out, inside);
-            scan_block(body, out, inside);
-        }
-        Stat::Break | Stat::Continue => {}
+impl Scan<'_> {
+    fn bound(&self, name: &Rc<str>) -> bool {
+        self.scopes.iter().any(|s| s.contains(name))
     }
-}
 
-fn scan_expr(e: &Expr, out: &mut HashSet<Rc<str>>, inside: bool) {
-    match e {
-        // a name read inside a nested function is a capture candidate
-        Expr::Var(n) if inside => {
-            out.insert(n.clone());
+    fn declare(&mut self, name: &Rc<str>) {
+        if let Some(s) = self.scopes.last_mut() {
+            s.insert(name.clone());
         }
-        Expr::Var(_)
-        | Expr::Nil
-        | Expr::Bool(_)
-        | Expr::Num(_)
-        | Expr::Str(_)
-        | Expr::Local(..)
-        | Expr::Upval(..)
-        | Expr::Global(..) => {}
-        Expr::Index(a, b) | Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
-            scan_expr(a, out, inside);
-            scan_expr(b, out, inside);
+    }
+
+    fn block(&mut self, b: &Block, inside: bool) {
+        if inside {
+            self.scopes.push(HashSet::new());
         }
-        Expr::Un(_, a) => scan_expr(a, out, inside),
-        Expr::Call(f, args) => {
-            scan_expr(f, out, inside);
-            args.iter().for_each(|a| scan_expr(a, out, inside));
+        for st in &b.stats {
+            self.stat(st, inside);
         }
-        Expr::Method(o, _, args) => {
-            scan_expr(o, out, inside);
-            args.iter().for_each(|a| scan_expr(a, out, inside));
+        if let Some(t) = &b.tail {
+            self.expr(t, inside);
         }
-        // everything a nested function reads counts as a capture
-        Expr::Func(def) => scan_block(&def.body, out, true),
-        Expr::Array(items) => items.iter().for_each(|i| scan_expr(i, out, inside)),
-        Expr::Map(items) => items.iter().for_each(|(k, v)| {
-            scan_expr(k, out, inside);
-            scan_expr(v, out, inside);
-        }),
-        Expr::If(arms, els) => {
-            for (c, b) in arms {
-                scan_expr(c, out, inside);
-                scan_block(b, out, inside);
+        if inside {
+            self.scopes.pop();
+        }
+    }
+
+    fn stat(&mut self, st: &Stat, inside: bool) {
+        match st {
+            // the values are read first; the names come into scope after
+            Stat::Let(names, exprs) => {
+                exprs.iter().for_each(|e| self.expr(e, inside));
+                for n in names {
+                    self.declare(n);
+                }
             }
-            if let Some(b) = els {
-                scan_block(b, out, inside);
+            Stat::LetSlots(_, exprs) | Stat::Return(exprs) => {
+                exprs.iter().for_each(|e| self.expr(e, inside))
             }
+            Stat::FnDecl(name, e) => {
+                self.declare(name);
+                self.expr(e, inside);
+            }
+            Stat::FnSlot(_, e) => self.expr(e, inside),
+            Stat::Assign(targets, exprs) => {
+                targets.iter().chain(exprs).for_each(|e| self.expr(e, inside))
+            }
+            Stat::OpAssign(t, _, e) => {
+                self.expr(t, inside);
+                self.expr(e, inside);
+            }
+            Stat::Expr(e) => self.expr(e, inside),
+            Stat::While(_, c, b) => {
+                self.expr(c, inside);
+                self.block(b, inside);
+            }
+            Stat::Loop(_, b) => self.block(b, inside),
+            Stat::ForRange { var, start, end, body, .. } => {
+                self.expr(start, inside);
+                self.expr(end, inside);
+                if inside {
+                    self.scopes.push(HashSet::from([var.clone()]));
+                }
+                self.block(body, inside);
+                if inside {
+                    self.scopes.pop();
+                }
+            }
+            Stat::ForIn { vars, iter, body, .. } => {
+                self.expr(iter, inside);
+                if inside {
+                    self.scopes.push(vars.iter().cloned().collect());
+                }
+                self.block(body, inside);
+                if inside {
+                    self.scopes.pop();
+                }
+            }
+            Stat::Break | Stat::Continue => {}
         }
-        Expr::Match(subject, arms) => {
-            scan_expr(subject, out, inside);
-            for arm in arms {
-                for p in &arm.patterns {
-                    if let Pattern::Lit(e) = p {
-                        scan_expr(e, out, inside);
+    }
+
+    fn expr(&mut self, e: &Expr, inside: bool) {
+        match e {
+            // a name read inside a nested function, and not bound by it, is
+            // read from the enclosing frame
+            Expr::Var(n) if inside && !self.bound(n) => {
+                self.out.insert(n.clone());
+            }
+            Expr::Var(_)
+            | Expr::Nil
+            | Expr::Bool(_)
+            | Expr::Num(_)
+            | Expr::Str(_)
+            | Expr::Local(..)
+            | Expr::Upval(..)
+            | Expr::Global(..) => {}
+            Expr::Index(a, b) | Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
+                self.expr(a, inside);
+                self.expr(b, inside);
+            }
+            Expr::Un(_, a) => self.expr(a, inside),
+            Expr::Call(f, args) => {
+                self.expr(f, inside);
+                args.iter().for_each(|a| self.expr(a, inside));
+            }
+            Expr::Method(o, _, args) => {
+                self.expr(o, inside);
+                args.iter().for_each(|a| self.expr(a, inside));
+            }
+            // everything a nested function reads from outside itself counts
+            Expr::Func(def) => {
+                self.scopes.push(def.params.iter().cloned().collect());
+                self.block(&def.body, true);
+                self.scopes.pop();
+            }
+            Expr::Array(items) => items.iter().for_each(|i| self.expr(i, inside)),
+            Expr::Map(items) => items.iter().for_each(|(k, v)| {
+                self.expr(k, inside);
+                self.expr(v, inside);
+            }),
+            Expr::If(arms, els) => {
+                for (c, b) in arms {
+                    self.expr(c, inside);
+                    self.block(b, inside);
+                }
+                if let Some(b) = els {
+                    self.block(b, inside);
+                }
+            }
+            Expr::Match(subject, arms) => {
+                self.expr(subject, inside);
+                for arm in arms {
+                    for p in &arm.patterns {
+                        if let Pattern::Lit(e) = p {
+                            self.expr(e, inside);
+                        }
                     }
+                    self.block(&arm.body, inside);
                 }
-                if let Some(g) = &arm.guard {
-                    scan_expr(g, out, inside);
-                }
-                scan_block(&arm.body, out, inside);
             }
+            Expr::Do(b) => self.block(b, inside),
         }
-        Expr::Do(b) => scan_block(b, out, inside),
     }
 }
 

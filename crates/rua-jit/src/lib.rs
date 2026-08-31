@@ -44,9 +44,9 @@ impl RtArg {
 /// access, which is the whole cost of a matrix multiply's inner loop. The
 /// runtime builds the array once when the compiled code starts.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct RtSpan {
-    pub ptr: *const f64,
+    pub ptr: *mut f64,
     pub len: usize,
 }
 
@@ -86,8 +86,9 @@ pub struct RtCtx {
     pub span_mut: usize,
     pub inner_mut: usize,
     /// `fn(table, len_out, ok) -> *const RtSpan` — a view of every element at
-    /// once.
+    /// once, and the same for code that writes through them.
     pub spans: usize,
+    pub spans_mut: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -108,6 +109,7 @@ pub struct RtHooks {
     pub span_mut: usize,
     pub inner_mut: usize,
     pub spans: usize,
+    pub spans_mut: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -462,9 +464,14 @@ impl Jit {
                     let (_, len) = span_idents(*slot);
                     let all = if spans_used.contains(slot) {
                         let (sp, spn) = spans_idents(*slot);
+                        let fetch = if mutable_views {
+                            quote! { rua_spans_mut(rt, #id, &mut #spn, ok) }
+                        } else {
+                            quote! { rua_spans(rt, #id, &mut #spn, ok) }
+                        };
                         quote! {
                             let mut #spn: usize = 0;
-                            let #sp: *const RtSpan = rua_spans(rt, #id, &mut #spn, ok);
+                            let #sp: *const RtSpan = #fetch;
                             if *ok == 0 { return; }
                         }
                     } else {
@@ -727,9 +734,14 @@ impl Jit {
                     let (_, len) = span_idents(b.slot);
                     let all = if cx.spans_used.contains(&b.slot) {
                         let (sp, spn) = spans_idents(b.slot);
+                        let fetch = if cx.mutable_views {
+                            quote! { rua_spans_mut(rt, #id, &mut #spn, ok) }
+                        } else {
+                            quote! { rua_spans(rt, #id, &mut #spn, ok) }
+                        };
                         quote! {
                             let mut #spn: usize = 0;
-                            let #sp: *const RtSpan = rua_spans(rt, #id, &mut #spn, ok);
+                            let #sp: *const RtSpan = #fetch;
                             if *ok == 0 { return 0.0; }
                         }
                     } else {
@@ -1060,10 +1072,7 @@ fn length_locals(body: &Block) -> HashMap<u16, u16> {
 /// A body that only reads can trap wherever it likes, so it checks the shape
 /// of an array of arrays as it goes rather than making the runtime walk it on
 /// every entry.
-fn relax_checks(kinds: &mut HashMap<u16, Kind>, writes: bool) {
-    if writes {
-        return;
-    }
+fn relax_checks(kinds: &mut HashMap<u16, Kind>, _writes: bool) {
     for kind in kinds.values_mut() {
         if let Kind::Tables { checked, .. } = kind {
             *checked = false;
@@ -1754,7 +1763,7 @@ fn preamble() -> TokenStream {
         #[repr(C)]
         #[derive(Clone, Copy)]
         pub struct RtSpan {
-            pub ptr: *const f64,
+            pub ptr: *mut f64,
             pub len: usize,
         }
 
@@ -1776,6 +1785,7 @@ fn preamble() -> TokenStream {
             pub span_mut: usize,
             pub inner_mut: usize,
             pub spans: usize,
+            pub spans_mut: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1841,6 +1851,20 @@ fn preamble() -> TokenStream {
         ) -> *const RtSpan {
             let f: unsafe extern "C" fn(*mut c_void, *mut usize, *mut i32) -> *const RtSpan =
                 std::mem::transmute((*rt).spans as *const ());
+            f(t, len, ok)
+        }
+
+        /// # Safety
+        /// As `rua_spans`, for code that writes through the views.
+        #[inline(always)]
+        unsafe fn rua_spans_mut(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            len: *mut usize,
+            ok: *mut i32,
+        ) -> *const RtSpan {
+            let f: unsafe extern "C" fn(*mut c_void, *mut usize, *mut i32) -> *const RtSpan =
+                std::mem::transmute((*rt).spans_mut as *const ());
             f(t, len, ok)
         }
 
@@ -2335,27 +2359,43 @@ impl Ctx {
                 let i = self.expr(key)?;
                 let trap = self.on_trap.clone();
                 self.known.insert(b.slot);
-                // The runtime checked on the way in that every element is a
-                // table of numbers, and the index is proven, so this cannot
-                // fail; the check is what makes that a wrong answer rather
-                // than a wild pointer if it ever did.
-                let fetch = if self.mutable_views {
-                    quote! {
-                        let mut #ptr: *mut f64 = std::ptr::null_mut();
-                        let #id: *mut c_void =
-                            unsafe { rua_inner_mut(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
+                // The element has to be a table of numbers, and long enough
+                // for the constant indexes the body reads out of it. Both are
+                // settled here, once per binding — the runtime used to walk
+                // the whole array on the way into every call to find that out,
+                // which for n-body was most of the call.
+                // Every element's view was fetched on the way in, so binding
+                // one is an index rather than a call back into the runtime.
+                // n-body binds thirty of them per call, which was most of it.
+                self.spans_used.insert(outer);
+                let (sp, spn) = spans_idents(outer);
+                let _ = &outer_id;
+                let fetch = quote! {
+                    let #id: *mut c_void = std::ptr::null_mut();
+                    let mut #ptr: *mut f64 = std::ptr::null_mut();
+                    {
+                        let __k = #i;
+                        let __u = __k as usize;
+                        if __k < 0.0 || __k.fract() != 0.0 || __u >= #spn {
+                            unsafe { *ok = 0; }
+                        } else {
+                            let __e = unsafe { *#sp.add(__u) };
+                            #ptr = __e.ptr;
+                            #len = __e.len;
+                        }
                     }
-                } else {
-                    quote! {
-                        let mut #ptr: *const f64 = std::ptr::null();
-                        let #id: *mut c_void =
-                            unsafe { rua_inner(rt, #outer_id, #i, &mut #ptr, &mut #len, ok) };
-                    }
+                };
+                let need = match self.kind_of(outer) {
+                    Kind::Tables { min, .. } => Literal::usize_suffixed(min as usize),
+                    _ => Literal::usize_suffixed(0),
                 };
                 quote! {
                     let mut #len: usize = 0;
                     #fetch
-                    if unsafe { *ok } == 0 { #trap }
+                    if unsafe { *ok } == 0 || #len < #need {
+                        unsafe { *ok = 0; }
+                        #trap
+                    }
                 }
             }
             Stat::LetSlots(bindings, exprs) => {
