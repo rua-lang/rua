@@ -45,6 +45,7 @@ rua [options] [script.rua] [args...]
   --no-jit      interpret everything
   --jit N       compile a function after N calls (default 50)
   --dump-jit    print the Rust the JIT generates
+  --dump-bytecode  print the bytecode the compiler generates
 ```
 
 ## The language
@@ -234,34 +235,46 @@ compiled, what didn't, and why.
 
 Compiled code is cached in `~/.cache/rua-jit` (or `$XDG_CACHE_HOME`), keyed by a
 hash of the generated Rust, so the second run of a script skips `rustc`
-entirely. `RUA_JIT_CACHE=0` turns that off, `RUA_JIT_DIR` moves it.
+entirely. The objects are stripped (about 300KB each rather than 4MB) and the
+directory is pruned oldest-first to 128MB. `RUA_JIT_CACHE=0` turns the cache
+off, `RUA_JIT_DIR` moves it, `RUA_JIT_CACHE_MB` resizes it.
 
 ## Speed
 
-`bench/` holds seven programs written twice, once in rua and once in Lua —
-n-body, binary trees, spectral norm, fannkuch, n-queens, matrix multiply and
-word frequency. `bench/run.sh` runs each under every engine and **refuses to
-print a timing until they all produce byte-identical output**: a fast wrong
-answer is not a benchmark. The JIT's disk cache is warmed first, so these
-numbers exclude `rustc`.
+`bench/` holds eight programs written twice, once in rua and once in Lua —
+n-body, binary trees, spectral norm, fannkuch, n-queens, matrix multiply, word
+frequency, and a Scheme interpreter. `bench/run.sh` runs each under every
+engine and **refuses to print a timing until they all produce byte-identical
+output**: a fast wrong answer is not a benchmark. The JIT's disk cache is
+warmed first, so these numbers exclude `rustc`.
+
+The Scheme is the one to look at hardest. The other seven are loops over
+numbers and arrays, which is the shape a JIT likes and an interpreter is least
+embarrassed by. `bench/lisp.rua` is a language: reader, evaluator with proper
+tail calls, closures and `set!`, thirty primitives, and a workload written in
+the Scheme it implements — Takeuchi, fib, merge sort, n-queens, an association
+list, the Y combinator. It spends its time on symbol lookup through chained
+environments, cons-cell allocation, string dispatch on special forms and deep
+recursion, and none of that is anything `rustc` can be handed.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit |
 |---|---|---|---|---|
-| spectral norm | 1.85s | **0.12s** | 0.62s | 0.03s |
-| n-queens | 0.17s | 0.17s | 0.06s | 0.02s |
-| matrix multiply | 0.44s | 0.45s | 0.18s | 0.02s |
-| fannkuch | 0.67s | 0.66s | 0.27s | 0.04s |
-| word frequency | 0.21s | 0.22s | 0.07s | 0.04s |
-| n-body | 1.51s | 1.54s | 0.49s | 0.04s |
-| binary trees | 5.30s | 5.30s | 3.29s | 1.42s |
+| spectral norm | 1.25s | **0.09s** | 0.63s | 0.03s |
+| n-queens | 0.14s | 0.14s | 0.07s | 0.02s |
+| matrix multiply | 0.41s | 0.43s | 0.17s | 0.02s |
+| fannkuch | 0.66s | 0.68s | 0.27s | 0.04s |
+| word frequency | 0.16s | 0.17s | 0.07s | 0.05s |
+| n-body | 1.29s | 1.28s | 0.49s | 0.04s |
+| binary trees | 4.35s | 4.36s | 3.25s | 1.43s |
+| Scheme interpreter | 3.79s | 3.73s | 1.38s | 0.55s |
 
 Read that honestly. **Where the JIT applies it is decisive** — spectral norm is
-5x faster than Lua 5.4 and 20x faster than rua's own interpreter, because its
+7x faster than Lua 5.4 and 14x faster than rua's own interpreter, because its
 kernels are exactly what the compiler accepts: numbers and flat arrays. **Where
-it does not apply, rua is its interpreter**, and that is 2–4x slower than Lua
-5.4 across the board.
+it does not apply, rua is its interpreter**, and that is 1.3–2.8x slower than
+Lua 5.4.
 
-What keeps the other six out of the compiler is worth being precise about:
+What keeps the other seven out of the compiler is worth being precise about:
 
 * **Nested tables.** `bodies[i][3]` and `b[k][j]` — n-body and matrix multiply
   are built on arrays of arrays, and compiled code only understands a flat one.
@@ -269,28 +282,54 @@ What keeps the other six out of the compiler is worth being precise about:
   that in range needs value-range analysis; a real JIT would emit a guard and
   deoptimise, which rua cannot do after a write (see the JIT section).
 * **Multiple return values**, which fannkuch's kernel uses.
-* **Strings, maps and allocation** — word frequency and binary trees are made of
-  exactly the things an f64-only compiler has nothing to say about.
+* **Strings, maps and allocation** — word frequency, binary trees and the
+  Scheme are made of exactly the things an f64-only compiler has nothing to say
+  about.
 
-The interpreter is 1.6–3.1x slower than Lua 5.4. An audit that prototyped and
-measured each candidate cause — rather than reasoning about them — found that
-most of the obvious suspects are not the problem:
+### What the interpreter's time actually goes on
+
+Every claim here was measured by making the change and running the suite, and
+several plausible ones were thrown away for measuring zero.
 
 * **Dispatch is not the problem.** The `match` costs 5.3% of cycles at a 0.010%
   branch-miss rate (Lua's own is 0.024%). Threaded dispatch with computed goto
   is not worth doing here, and an earlier version of this file said otherwise.
-* **String interning and cached hashes buy nothing** — both were implemented and
-  measured at zero. What string keys actually cost was the owned `Key`
-  temporary and its refcount round trip, which is now gone.
-* **Instruction count is not the problem either.** rua runs about 1.3x Lua's
-  bytecode operations, but 2.4x the machine instructions per operation.
+* **Values that are only compared should not be copied.** `==` and `!=` went
+  through the generic arithmetic path, which takes ownership: a reference count
+  up and back down on each side of every comparison that was not between two
+  numbers. `x != nil` and `op == "quote"` are the inner loop of anything that
+  inspects data. Worth 13% on the Scheme.
+* **Drop glue is not free.** Writing a register was `*slot = v`, which always
+  calls `Value`'s destructor out of line — too big for LLVM to inline into
+  every register write. Most values written over own nothing, so testing the
+  tag first is worth 10%.
+* **A call's results should stay in registers.** Returning from a call in tail
+  position went through a pooled vector: six vector operations and four clones
+  to move one number one frame down. In registers instead, that is a move.
+* **Operands should be addressed from a register, not from memory.** Reading
+  `self.stack[self.base + r]` reloads the vector's pointer and the frame's base
+  at every operand, because `self` is behind a mutable reference the handlers
+  write through. Holding both in locals cut 10% of instructions and 42% of
+  branch misses.
+* **Calling a builtin allocated twice** — once for a copy of the arguments,
+  once for the result — and freed both again. Both come from a pool now.
+* **String interning does pay**, by 6.5% on the Scheme and 17% on word
+  frequency. An earlier version of this file said it measured zero; that
+  measurement was taken against a binary that had not been rebuilt, because
+  `cargo build --release` in this workspace builds the library and not the CLI.
+  The lesson was cheap and the correction is the point of writing numbers down.
 
-What is left is the value representation. Every register write drops what was
+Since those changes the Scheme benchmark runs 21.1G instructions in 8.4G
+cycles, down from 28.0G and 12.6G. Lua runs the same program in 9.4G and 3.0G,
+so what is left is roughly 2.2x the instructions at a similar rate.
+
+Where they go is the value representation. Every register write drops what was
 there and every read of a heap value bumps a reference count; Lua's values are
-the same 16 bytes but garbage collected, so a copy is a plain move. Removing
-that — a POD value with a tracing GC — measured as a further 1.3x. It is a
-different interpreter, not a patch to this one. What this one does instead is
-hand the hot numeric parts to `rustc`.
+the same 16 bytes but garbage collected, so a copy is a plain move, and a call
+is 177 host instructions against rua's 545. Removing that — a POD value with a
+tracing GC — measured as a further 1.3x. It is a different interpreter, not a
+patch to this one. What this one does instead is hand the hot numeric parts to
+`rustc`.
 
 ## FFI: calling C
 
