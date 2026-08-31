@@ -34,6 +34,23 @@ where
     Value::Native(Rc::new(Native::unary(name, f)))
 }
 
+/// A builtin with a two-argument form, keeping its general one.
+fn native2<F, G>(name: &str, f: F, fast: G) -> Value
+where
+    F: Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
+    G: Fn(&Value, &Value) -> Res<Value> + 'static,
+{
+    Value::Native(Rc::new(Native::with_fast2(name, f, fast)))
+}
+
+/// A builtin of two arguments, in the same shape.
+fn binary<F>(name: &str, f: F) -> Value
+where
+    F: Fn(&Value, &Value) -> Res<Value> + Clone + 'static,
+{
+    Value::Native(Rc::new(Native::binary(name, f)))
+}
+
 /// Everything after the first argument, without panicking when there is none.
 fn rest(args: &[Value]) -> &[Value] {
     args.get(1..).unwrap_or(&[])
@@ -367,10 +384,10 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 }
                 one(Value::table(t))
             })),
-            ("byte", native("byte", |_vm, args| {
-                let s = str_arg(args, 0)?;
-                let i = num_arg(args, 1).unwrap_or(0.0).max(0.0) as usize;
-                one(match s.as_bytes().get(i) {
+            ("byte", binary("byte", |s, i| {
+                let s = s.as_str()?;
+                let i = i.as_num().unwrap_or(0.0).max(0.0) as usize;
+                Ok(match s.as_bytes().get(i) {
                     Some(b) => Value::Num(*b as f64),
                     None => Value::Nil,
                 })
@@ -475,13 +492,25 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
                 Value::Table(t) => Ok(Value::Num(t.borrow().len() as f64)),
                 other => err(format!("len: expected a table, got {}", other.type_name())),
             })),
-            ("push", native("push", |_vm, args| {
-                let t = table_arg(args, 0)?;
-                for v in rest(args) {
-                    t.borrow_mut().push(v.clone());
-                }
-                Ok(Vec::new())
-            })),
+            // `t.push(v)` is the shape that matters; the general form still
+            // takes as many values as it is given
+            ("push", native2(
+                "push",
+                |_vm, args| {
+                    let t = table_arg(args, 0)?;
+                    for v in rest(args) {
+                        t.borrow_mut().push(v.clone());
+                    }
+                    Ok(Vec::new())
+                },
+                |t, v| match t {
+                    Value::Table(t) => {
+                        t.borrow_mut().push(v.clone());
+                        Ok(Value::Nil)
+                    }
+                    other => err(format!("push: expected a table, got {}", other.type_name())),
+                },
+            )),
             ("pop", native("pop", |_vm, args| {
                 let t = table_arg(args, 0)?;
                 let n = t.borrow().len();

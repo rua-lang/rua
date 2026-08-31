@@ -772,15 +772,29 @@ impl Vm {
         if let Value::Native(n) = callee {
             // the common builtin: one argument in a register, one result into
             // another, and no vectors at either end
-            if nargs == 1 && nres <= 1 {
-                if let Some(fast) = &n.fast1 {
-                    let arg = self.stack[self.base + base as usize + 1].clone();
-                    let v = fast(&arg)?;
-                    if nres == 1 {
-                        self.set_reg(base, v);
+            if nres <= 1 {
+                let start = self.base + base as usize + 1;
+                if nargs == 1 {
+                    if let Some(fast) = &n.fast1 {
+                        let a = self.stack[start].clone();
+                        let v = fast(&a)?;
+                        if nres == 1 {
+                            self.set_reg(base, v);
+                        }
+                        self.multi_at = None;
+                        return Ok(());
                     }
-                    self.multi_at = None;
-                    return Ok(());
+                } else if nargs == 2 {
+                    if let Some(fast) = &n.fast2 {
+                        let a = self.stack[start].clone();
+                        let b = self.stack[start + 1].clone();
+                        let v = fast(&a, &b)?;
+                        if nres == 1 {
+                            self.set_reg(base, v);
+                        }
+                        self.multi_at = None;
+                        return Ok(());
+                    }
                 }
             }
             let n = n.clone();

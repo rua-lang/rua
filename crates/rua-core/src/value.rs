@@ -97,6 +97,10 @@ pub fn err<T>(msg: impl Into<String>) -> Res<T> {
 pub struct Native {
     pub name: String,
     pub f: Box<dyn Fn(&mut Vm, &[Value]) -> Res<Vec<Value>>>,
+    /// The same builtin as a plain function of two arguments, when it is one.
+    /// `t.push(v)` and `s.byte(i)` are this shape, and a method call counts
+    /// its receiver as the first.
+    pub fast2: Option<Box<dyn Fn(&Value, &Value) -> Res<Value>>>,
     /// The same builtin as a plain function of one argument, when it is one.
     ///
     /// The general shape — a slice in, a vector out — costs two pooled vectors
@@ -111,7 +115,7 @@ impl Native {
         name: impl Into<String>,
         f: impl Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
     ) -> Native {
-        Native { name: name.into(), f: Box::new(f), fast1: None }
+        Native { name: name.into(), f: Box::new(f), fast1: None, fast2: None }
     }
 
     /// A builtin of one argument, which needs nothing from the VM.
@@ -127,6 +131,41 @@ impl Native {
                 crate::interp::one_value(v)
             }),
             fast1: Some(Box::new(f)),
+            fast2: None,
+        }
+    }
+
+    /// A builtin that takes any number of arguments but has a two-argument
+    /// form worth taking directly, which is what `t.push(v)` is.
+    pub fn with_fast2(
+        name: impl Into<String>,
+        f: impl Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
+        fast: impl Fn(&Value, &Value) -> Res<Value> + 'static,
+    ) -> Native {
+        Native {
+            name: name.into(),
+            f: Box::new(f),
+            fast1: None,
+            fast2: Some(Box::new(fast)),
+        }
+    }
+
+    /// A builtin of two arguments, which needs nothing from the VM.
+    pub fn binary(
+        name: impl Into<String>,
+        f: impl Fn(&Value, &Value) -> Res<Value> + Clone + 'static,
+    ) -> Native {
+        let g = f.clone();
+        Native {
+            name: name.into(),
+            f: Box::new(move |_vm, args| {
+                let a = args.first().unwrap_or(&Value::Nil);
+                let b = args.get(1).unwrap_or(&Value::Nil);
+                let v = g(a, b)?;
+                crate::interp::one_value(v)
+            }),
+            fast1: None,
+            fast2: Some(Box::new(f)),
         }
     }
 }
