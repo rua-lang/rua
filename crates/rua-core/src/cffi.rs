@@ -57,5 +57,5 @@ pub fn make_callable(sig: Signature, addr: *mut c_void) -> Value {
         let out = unsafe { rua_ffi::call(&sig, addr, &prepared) }.map_err(Error)?;
         Ok(from_ret(out))
     };
-    Value::Native(Rc::new(Native { name, f: Box::new(f) }))
+    Value::Native(Rc::new(Native::new(name, f)))
 }

@@ -770,6 +770,19 @@ impl Vm {
     fn dispatch(&mut self, callee: &Value, base: Reg, nargs: u16, nres: u16) -> Eval<()> {
         // a builtin reads the arguments straight out of the registers
         if let Value::Native(n) = callee {
+            // the common builtin: one argument in a register, one result into
+            // another, and no vectors at either end
+            if nargs == 1 && nres <= 1 {
+                if let Some(fast) = &n.fast1 {
+                    let arg = self.stack[self.base + base as usize + 1].clone();
+                    let v = fast(&arg)?;
+                    if nres == 1 {
+                        self.set_reg(base, v);
+                    }
+                    self.multi_at = None;
+                    return Ok(());
+                }
+            }
             let n = n.clone();
             let start = self.base + base as usize + 1;
             // The native gets the argument window as a slice. The vector

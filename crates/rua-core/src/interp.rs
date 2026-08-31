@@ -320,7 +320,16 @@ impl Vm {
     where
         F: Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
     {
-        let v = Value::Native(Rc::new(Native { name: name.to_string(), f: Box::new(f) }));
+        let v = Value::Native(Rc::new(Native::new(name, f)));
+        self.set_global(name, v);
+    }
+
+    /// Expose a Rust function of one argument, which most builtins are.
+    pub fn register_unary<F>(&mut self, name: &str, f: F)
+    where
+        F: Fn(&Value) -> Res<Value> + Clone + 'static,
+    {
+        let v = Value::Native(Rc::new(Native::unary(name, f)));
         self.set_global(name, v);
     }
 

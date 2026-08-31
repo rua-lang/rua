@@ -97,6 +97,38 @@ pub fn err<T>(msg: impl Into<String>) -> Res<T> {
 pub struct Native {
     pub name: String,
     pub f: Box<dyn Fn(&mut Vm, &[Value]) -> Res<Vec<Value>>>,
+    /// The same builtin as a plain function of one argument, when it is one.
+    ///
+    /// The general shape — a slice in, a vector out — costs two pooled vectors
+    /// and a copy each way for what is usually `type(x)` or `t.len()`. This
+    /// form reads the argument out of the register and writes the result into
+    /// another, and it is what most calls to a builtin actually are.
+    pub fast1: Option<Box<dyn Fn(&Value) -> Res<Value>>>,
+}
+
+impl Native {
+    pub fn new(
+        name: impl Into<String>,
+        f: impl Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
+    ) -> Native {
+        Native { name: name.into(), f: Box::new(f), fast1: None }
+    }
+
+    /// A builtin of one argument, which needs nothing from the VM.
+    pub fn unary(
+        name: impl Into<String>,
+        f: impl Fn(&Value) -> Res<Value> + Clone + 'static,
+    ) -> Native {
+        let g = f.clone();
+        Native {
+            name: name.into(),
+            f: Box::new(move |_vm, args| {
+                let v = g(args.first().unwrap_or(&Value::Nil))?;
+                crate::interp::one_value(v)
+            }),
+            fast1: Some(Box::new(f)),
+        }
+    }
 }
 
 impl fmt::Debug for Native {

@@ -22,7 +22,16 @@ fn native<F>(name: &str, f: F) -> Value
 where
     F: Fn(&mut Vm, &[Value]) -> Res<Vec<Value>> + 'static,
 {
-    Value::Native(Rc::new(Native { name: name.to_string(), f: Box::new(f) }))
+    Value::Native(Rc::new(Native::new(name, f)))
+}
+
+/// A builtin of one argument: it reads a register and writes a register, with
+/// no vector at either end. Most of the standard library is this shape.
+fn unary<F>(name: &str, f: F) -> Value
+where
+    F: Fn(&Value) -> Res<Value> + Clone + 'static,
+{
+    Value::Native(Rc::new(Native::unary(name, f)))
 }
 
 /// Everything after the first argument, without panicking when there is none.
@@ -90,9 +99,7 @@ fn base(vm: &mut Vm) {
     // and a script that leans on it — an interpreter written in rua, say —
     // should not allocate and hash a fresh string every time it asks.
     let type_names: Vec<Value> = Value::TYPE_NAMES.iter().map(|n| Value::str(n)).collect();
-    vm.register("type", move |_vm, args| {
-        one(type_names[arg(args, 0).type_index()].clone())
-    });
+    vm.register_unary("type", move |v| Ok(type_names[v.type_index()].clone()));
     vm.register("str", |_vm, args| one(Value::str(arg(args, 0).to_string())));
     vm.register("num", |_vm, args| {
         one(match arg(args, 0).as_num() {
@@ -125,9 +132,9 @@ fn base(vm: &mut Vm) {
             Err(e) => Ok(vec![Value::Bool(false), Value::str(e.to_string())]),
         }
     });
-    vm.register("len", |_vm, args| match arg(args, 0) {
-        Value::Table(t) => one(Value::Num(t.borrow().len() as f64)),
-        Value::Str(s) => one(Value::Num(s.len() as f64)),
+    vm.register_unary("len", |v| match v {
+        Value::Table(t) => Ok(Value::Num(t.borrow().len() as f64)),
+        Value::Str(s) => Ok(Value::Num(s.len() as f64)),
         other => err(format!("len: unexpected {}", other.type_name())),
     });
     // dynamic access to the global namespace, since it is not a table
@@ -214,7 +221,7 @@ pub fn range_iterator(start: f64, end: f64, inclusive: bool) -> Value {
 
 fn math(vm: &mut Vm) -> Rc<RefCell<Table>> {
     let f1 = |name: &'static str, f: fn(f64) -> f64| {
-        native(name, move |_vm, args| one(Value::Num(f(num_arg(args, 0)?))))
+        unary(name, move |v| Ok(Value::Num(f(v.as_num()?))))
     };
     module(
         vm,
@@ -287,9 +294,7 @@ fn string(vm: &mut Vm) -> Rc<RefCell<Table>> {
         vm,
         "string",
         vec![
-            ("len", native("len", |_vm, args| {
-                one(Value::Num(str_arg(args, 0)?.len() as f64))
-            })),
+            ("len", unary("len", |v| Ok(Value::Num(v.as_str()?.len() as f64)))),
             // zero based, end exclusive: "hello".slice(1, 3) == "el"
             ("slice", native("slice", |_vm, args| {
                 let s = str_arg(args, 0)?;
@@ -466,8 +471,9 @@ fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
         vm,
         "table",
         vec![
-            ("len", native("len", |_vm, args| {
-                one(Value::Num(table_arg(args, 0)?.borrow().len() as f64))
+            ("len", unary("len", |v| match v {
+                Value::Table(t) => Ok(Value::Num(t.borrow().len() as f64)),
+                other => err(format!("len: expected a table, got {}", other.type_name())),
             })),
             ("push", native("push", |_vm, args| {
                 let t = table_arg(args, 0)?;

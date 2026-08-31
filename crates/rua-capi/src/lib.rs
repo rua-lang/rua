@@ -160,14 +160,11 @@ pub extern "C" fn rua_get_number(s: *mut RuaState, name: *const c_char) -> c_dou
 pub extern "C" fn rua_register(s: *mut RuaState, name: *const c_char, f: RuaNumFn) {
     let (Some(s), Some(name)) = (state(s), cstr(name)) else { return };
     let owned = name.to_string();
-    let native = Native {
-        name: owned.clone(),
-        f: Box::new(move |_vm, args| {
-            let nums: Res<Vec<c_double>> = args.iter().map(|a| a.as_num()).collect();
-            let nums = nums?;
-            Ok(vec![Value::Num(f(nums.as_ptr(), nums.len() as c_int))])
-        }),
-    };
+    let native = Native::new(owned.clone(), move |_vm, args| {
+        let nums: Res<Vec<c_double>> = args.iter().map(|a| a.as_num()).collect();
+        let nums = nums?;
+        Ok(vec![Value::Num(f(nums.as_ptr(), nums.len() as c_int))])
+    });
     s.vm.set_global(&owned, Value::Native(Rc::new(native)));
 }
 
