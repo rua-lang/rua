@@ -552,8 +552,16 @@ impl Vm {
             return false;
         }
         for (i, (slot, kind)) in compiled.slots.iter().zip(&compiled.kinds).enumerate() {
-            if *kind == Kind::Num {
-                self.stack[self.base + *slot as usize] = Value::Num(regs[i].num);
+            match kind {
+                Kind::Num | Kind::Dead => {
+                    self.stack[self.base + *slot as usize] = Value::Num(regs[i].num)
+                }
+                // a flag goes back as the boolean it is: in rua every number
+                // is true, so handing back 0.0 would not mean false
+                Kind::Bool => {
+                    self.stack[self.base + *slot as usize] = Value::Bool(regs[i].num != 0.0)
+                }
+                _ => {}
             }
         }
         true
@@ -1347,6 +1355,13 @@ fn frame_name(p: *const crate::bytecode::Proto) -> Rc<str> {
 fn rt_arg(v: &Value, kind: &Kind) -> Option<RtArg> {
     Some(match (v, kind) {
         (Value::Num(n), Kind::Num) => RtArg::num(*n),
+        // a flag travels as 0.0/1.0; an unassigned slot holds nil, and the
+        // compiled code writes to it before it reads it
+        (Value::Bool(b), Kind::Bool) => RtArg::num(if *b { 1.0 } else { 0.0 }),
+        (Value::Nil, Kind::Bool) => RtArg::num(0.0),
+        // the compiled code defines this slot before it reads it, so what the
+        // register holds now is nobody's business
+        (_, Kind::Dead) => RtArg::num(0.0),
         (Value::Table(t), Kind::Table | Kind::TableOut) => {
             RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
         }

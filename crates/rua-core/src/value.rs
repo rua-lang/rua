@@ -590,7 +590,7 @@ impl Table {
     /// and a 32-byte temporary with a destructor, on an operation that is
     /// otherwise a pointer comparison. Object-shaped tables are small, so the
     /// scan is short; a table big enough to have built an index falls back.
-    #[inline]
+    ///
     /// `t.name`, remembering where it was found.
     ///
     /// A field read is a scan or a hash probe; both are avoidable, because the

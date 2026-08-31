@@ -102,6 +102,11 @@ pub enum Kind {
     Table,
     /// A table compiled code only ever appends to.
     TableOut,
+    /// A local that only ever holds a boolean, carried as 0.0/1.0.
+    Bool,
+    /// A slot the region defines before it reads: whatever it holds on the way
+    /// in is not looked at.
+    Dead,
     /// A table whose elements are themselves tables — an array of bodies, a
     /// matrix.
     ///
@@ -296,7 +301,13 @@ impl Jit {
                 self.bailed += 1;
                 self.last_error = Some(format!("loop: {why}"));
                 if self.dump {
-                    eprintln!("[rua-jit] skipped a hot loop: {why}");
+                    let what = match st {
+                        Stat::Loop(id, _) => format!("loop #{id}"),
+                        Stat::While(id, _, _) => format!("while #{id}"),
+                        Stat::ForRange { id, .. } => format!("for #{id}"),
+                        _ => "loop".to_string(),
+                    };
+                    eprintln!("[rua-jit] skipped a hot {what}: {why}");
                 }
             }
         }
@@ -314,24 +325,45 @@ impl Jit {
         let mut wrapper = Block::default();
         wrapper.stats.push(st.clone());
         let Kinds { mut kinds, inner_of } = infer_kinds(&wrapper, &self_ref.compiled_globals)?;
+        // A loop may take a flag from outside and hand it back: the runtime
+        // marshals those as booleans either way, so unlike a function's
+        // parameters they need not be excluded.
+        let bools = boolean_locals(&wrapper, &HashSet::new());
         let usage = table_usage(&wrapper);
         let writes = usage.traps_forbidden();
         let mutable_views = usage.writes_tables();
         relax_checks(&mut kinds, writes);
         // in a loop there are no parameters, so nothing is stable by that route
         let stable: HashSet<u16> = HashSet::new();
-        let kind_list: Vec<Kind> =
-            slots.iter().map(|s| kinds.get(s).copied().unwrap_or(Kind::Num)).collect();
+        let mut dead = dead_on_entry(&wrapper);
+        // The loop being compiled is entered at its back edge, not at its
+        // head, so its own counter is live there however the body reads it.
+        // Nested loops inside the region do start from the top, and theirs
+        // really is dead.
+        if let Stat::ForRange { binding: Some(b), .. } = st {
+            dead.remove(&b.slot);
+        }
+        let kind_list: Vec<Kind> = slots
+            .iter()
+            .map(|s| match kinds.get(s).copied() {
+                // a slot defined before it is read, or one that only ever
+                // holds a flag, is not the plain number the walk called it
+                Some(Kind::Num) | None if dead.contains(s) => Kind::Dead,
+                Some(Kind::Num) | None if bools.contains(s) => Kind::Bool,
+                Some(k) => k,
+                None => Kind::Num,
+            })
+            .collect();
         let mut cx = Ctx {
             known: slots.iter().copied().collect(),
             self_symbol: String::new(),
             self_ref,
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
-            self_params_numeric: true,
             self_param_kinds: Vec::new(),
             writes,
             mutable_views,
+            bools,
             kinds,
             inner_of,
             len_of: length_locals(&wrapper),
@@ -404,7 +436,9 @@ impl Jit {
             let id = ident(*slot);
             let idx = Literal::usize_suffixed(i);
             match kind {
-                Kind::Num => quote! { let mut #id: f64 = (*regs.add(#idx)).num; },
+                Kind::Num | Kind::Bool | Kind::Dead => {
+                    quote! { let mut #id: f64 = (*regs.add(#idx)).num; }
+                }
                 Kind::TableOut => quote! { let #id: *mut c_void = (*regs.add(#idx)).table; },
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(*slot);
@@ -437,7 +471,7 @@ impl Jit {
             // a table is mutated in place through the runtime, so only numbers
             // have to travel back into the registers
             match kind {
-                Kind::Num => {
+                Kind::Num | Kind::Bool | Kind::Dead => {
                     let id = ident(*slot);
                     let i = Literal::usize_suffixed(i);
                     Some(quote! { (*regs.add(#i)).num = #id; })
@@ -591,6 +625,10 @@ impl Jit {
             return Err("a parameter is captured by a closure".into());
         }
         let Kinds { mut kinds, inner_of } = infer_kinds(&def.body, &self_ref.compiled_globals)?;
+        let bools = boolean_locals(
+            &def.body,
+            &def.param_bindings.iter().map(|b| b.slot).collect(),
+        );
         let usage = table_usage(&def.body);
         let writes = usage.traps_forbidden();
         let mutable_views = usage.writes_tables();
@@ -622,10 +660,10 @@ impl Jit {
             self_ref,
             arity: def.params.len(),
             inlined: Vec::new(),
-            self_params_numeric: param_kinds.iter().all(|k| *k == Kind::Num),
             self_param_kinds: param_kinds.clone(),
             writes,
             mutable_views,
+            bools,
             kinds,
             inner_of,
             len_of: length_locals(&def.body),
@@ -648,7 +686,9 @@ impl Jit {
             let id = ident(b.slot);
             let idx = Literal::usize_suffixed(i);
             match cx.kinds.get(&b.slot).copied().unwrap_or(Kind::Num) {
-                Kind::Num => quote! { let mut #id: f64 = (*args.add(#idx)).num; },
+                Kind::Num | Kind::Bool | Kind::Dead => {
+                    quote! { let mut #id: f64 = (*args.add(#idx)).num; }
+                }
                 Kind::TableOut => quote! { let #id: *mut c_void = (*args.add(#idx)).table; },
                 // An array of arrays arrives as an address and a length: the
                 // views of its elements are fetched where they are bound,
@@ -987,6 +1027,275 @@ fn relax_checks(kinds: &mut HashMap<u16, Kind>, writes: bool) {
         if let Kind::Tables { checked, .. } = kind {
             *checked = false;
         }
+    }
+}
+
+/// Locals that only ever hold a boolean.
+///
+/// Compiled code has nothing but `f64`, and rua's `0` is true, so a boolean
+/// and the number encoding it are otherwise indistinguishable — which is why a
+/// condition has to be provably one. A local assigned nothing but conditions
+/// is an exception: it can be held as 0.0/1.0 and tested against zero, which
+/// is what a flag like `let done = false` needs. Every other use of it fails
+/// to compile, so nothing can read it as a number by mistake.
+/// Slots a region defines before it reads: their value on the way in cannot
+/// matter.
+///
+/// On-stack replacement enters a loop at the top of its body, so a local the
+/// body binds before using is dead at that moment — whatever the register
+/// happens to hold, a boolean left by the last iteration or nothing at all.
+/// Without this the loop is compiled and then refused at every entry, because
+/// the register does not hold the number the slot's kind promises.
+fn dead_on_entry(body: &Block) -> HashSet<u16> {
+    let mut first: Vec<(u16, bool)> = Vec::new();
+    dead_block(body, &mut first);
+    let mut seen = HashSet::new();
+    let mut dead = HashSet::new();
+    for (slot, is_bind) in first {
+        if seen.insert(slot) && is_bind {
+            dead.insert(slot);
+        }
+    }
+    dead
+}
+
+fn dead_note_reads(e: &Expr, out: &mut Vec<(u16, bool)>) {
+    match e {
+        Expr::Local(b, _) => out.push((b.slot, false)),
+        Expr::Do(b) => dead_block(b, out),
+        Expr::If(arms, els) => {
+            for (c, b) in arms {
+                dead_note_reads(c, out);
+                dead_block(b, out);
+            }
+            if let Some(b) = els {
+                dead_block(b, out);
+            }
+        }
+        Expr::Match(subject, arms) => {
+            dead_note_reads(subject, out);
+            for arm in arms {
+                dead_block(&arm.body, out);
+            }
+        }
+        Expr::Bin(_, a, b) | Expr::Range(a, b, _) | Expr::Index(a, b) => {
+            dead_note_reads(a, out);
+            dead_note_reads(b, out);
+        }
+        Expr::Un(_, a) => dead_note_reads(a, out),
+        Expr::Call(f, args) => {
+            dead_note_reads(f, out);
+            args.iter().for_each(|a| dead_note_reads(a, out));
+        }
+        Expr::Method(o, _, args) => {
+            dead_note_reads(o, out);
+            args.iter().for_each(|a| dead_note_reads(a, out));
+        }
+        _ => {}
+    }
+}
+
+fn dead_block(b: &Block, out: &mut Vec<(u16, bool)>) {
+    for st in &b.stats {
+        dead_stat(st, out);
+    }
+    if let Some(t) = &b.tail {
+        dead_note_reads(t, out);
+    }
+}
+
+fn dead_stat(st: &Stat, out: &mut Vec<(u16, bool)>) {
+    match st {
+        // the value is read first, and only then does the name come into being
+        Stat::LetSlots(bs, es) => {
+            es.iter().for_each(|e| dead_note_reads(e, out));
+            bs.iter().for_each(|b| out.push((b.slot, true)));
+        }
+        Stat::Assign(ts, es) => {
+            es.iter().for_each(|e| dead_note_reads(e, out));
+            // an assignment is not a binding: the name was already there
+            ts.iter().for_each(|t| dead_note_reads(t, out));
+        }
+        Stat::OpAssign(t, _, e) => {
+            dead_note_reads(t, out);
+            dead_note_reads(e, out);
+        }
+        Stat::While(_, c, b) => {
+            dead_note_reads(c, out);
+            dead_block(b, out);
+        }
+        Stat::Loop(_, b) => dead_block(b, out),
+        Stat::ForRange { binding, start, end, body, .. } => {
+            dead_note_reads(start, out);
+            dead_note_reads(end, out);
+            if let Some(b) = binding {
+                out.push((b.slot, true));
+            }
+            dead_block(body, out);
+        }
+        Stat::ForIn { bindings, iter, body, .. } => {
+            dead_note_reads(iter, out);
+            bindings.iter().for_each(|b| out.push((b.slot, true)));
+            dead_block(body, out);
+        }
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => dead_note_reads(e, out),
+        Stat::Let(_, es) | Stat::Return(es) => {
+            es.iter().for_each(|e| dead_note_reads(e, out))
+        }
+        Stat::Break | Stat::Continue => {}
+    }
+}
+
+fn boolean_locals(body: &Block, outside: &HashSet<u16>) -> HashSet<u16> {
+    let mut assigned: HashMap<u16, bool> = HashMap::new();
+    let mut spoiled: HashSet<u16> = HashSet::new();
+    let mut bound: HashSet<u16> = HashSet::new();
+    bool_block(body, &mut assigned, &mut spoiled, &mut bound);
+    assigned
+        .into_iter()
+        .filter(|(slot, all_bool)| {
+            // declared here, or not something that arrives from outside
+            *all_bool && !spoiled.contains(slot) && (bound.contains(slot) || !outside.contains(slot))
+        })
+        .map(|(slot, _)| slot)
+        .collect()
+}
+
+fn bool_note(slot: u16, e: &Expr, assigned: &mut HashMap<u16, bool>) {
+    let is_bool = bool_valued(e);
+    let at = assigned.entry(slot).or_insert(true);
+    *at &= is_bool;
+}
+
+/// Is this expression one the compiler can see is a boolean?
+fn bool_valued(e: &Expr) -> bool {
+    match e {
+        Expr::Bool(_) => true,
+        Expr::Bin(op, a, b) => {
+            cmp_op(*op).is_some()
+                || (matches!(op, BinOp::And | BinOp::Or) && bool_valued(a) && bool_valued(b))
+        }
+        Expr::Un(UnOp::Not, a) => bool_valued(a),
+        _ => false,
+    }
+}
+
+fn bool_block(b: &Block, assigned: &mut HashMap<u16, bool>, spoiled: &mut HashSet<u16>, bound: &mut HashSet<u16>) {
+    for st in &b.stats {
+        bool_stat(st, assigned, spoiled, bound);
+    }
+    if let Some(t) = &b.tail {
+        bool_expr(t, assigned, spoiled, bound);
+    }
+}
+
+fn bool_stat(st: &Stat, assigned: &mut HashMap<u16, bool>, spoiled: &mut HashSet<u16>, bound: &mut HashSet<u16>) {
+    match st {
+        Stat::LetSlots(bs, es) => {
+            for (i, b) in bs.iter().enumerate() {
+                bound.insert(b.slot);
+                match es.get(i) {
+                    Some(e) => bool_note(b.slot, e, assigned),
+                    None => {
+                        spoiled.insert(b.slot);
+                    }
+                }
+            }
+            for e in es {
+                bool_expr(e, assigned, spoiled, bound);
+            }
+        }
+        Stat::Assign(ts, es) => {
+            for (i, t) in ts.iter().enumerate() {
+                if let Expr::Local(b, _) = t {
+                    match es.get(i) {
+                        Some(e) => bool_note(b.slot, e, assigned),
+                        None => {
+                            spoiled.insert(b.slot);
+                        }
+                    }
+                }
+            }
+            for e in es {
+                bool_expr(e, assigned, spoiled, bound);
+            }
+        }
+        // arithmetic on it, or a loop counting through it, and it is a number
+        Stat::OpAssign(t, _, e) => {
+            if let Expr::Local(b, _) = t {
+                spoiled.insert(b.slot);
+            }
+            bool_expr(e, assigned, spoiled, bound);
+        }
+        Stat::ForRange { binding, body, .. } => {
+            if let Some(b) = binding {
+                spoiled.insert(b.slot);
+            }
+            bool_block(body, assigned, spoiled, bound);
+        }
+        Stat::ForIn { bindings, body, .. } => {
+            for b in bindings {
+                spoiled.insert(b.slot);
+            }
+            bool_block(body, assigned, spoiled, bound);
+        }
+        Stat::While(_, c, b) => {
+            bool_expr(c, assigned, spoiled, bound);
+            bool_block(b, assigned, spoiled, bound);
+        }
+        Stat::Loop(_, b) => bool_block(b, assigned, spoiled, bound),
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => {
+            bool_expr(e, assigned, spoiled, bound)
+        }
+        Stat::Let(_, es) | Stat::Return(es) => {
+            for e in es {
+                bool_expr(e, assigned, spoiled, bound);
+            }
+        }
+        Stat::Break | Stat::Continue => {}
+    }
+}
+
+fn bool_expr(e: &Expr, assigned: &mut HashMap<u16, bool>, spoiled: &mut HashSet<u16>, bound: &mut HashSet<u16>) {
+    match e {
+        Expr::Do(b) => bool_block(b, assigned, spoiled, bound),
+        Expr::If(arms, els) => {
+            for (c, b) in arms {
+                bool_expr(c, assigned, spoiled, bound);
+                bool_block(b, assigned, spoiled, bound);
+            }
+            if let Some(b) = els {
+                bool_block(b, assigned, spoiled, bound);
+            }
+        }
+        Expr::Match(subject, arms) => {
+            bool_expr(subject, assigned, spoiled, bound);
+            for arm in arms {
+                bool_block(&arm.body, assigned, spoiled, bound);
+            }
+        }
+        Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
+            bool_expr(a, assigned, spoiled, bound);
+            bool_expr(b, assigned, spoiled, bound);
+        }
+        Expr::Un(_, a) => bool_expr(a, assigned, spoiled, bound),
+        Expr::Index(a, b) => {
+            bool_expr(a, assigned, spoiled, bound);
+            bool_expr(b, assigned, spoiled, bound);
+        }
+        Expr::Call(f, args) => {
+            bool_expr(f, assigned, spoiled, bound);
+            for a in args {
+                bool_expr(a, assigned, spoiled, bound);
+            }
+        }
+        Expr::Method(o, _, args) => {
+            bool_expr(o, assigned, spoiled, bound);
+            for a in args {
+                bool_expr(a, assigned, spoiled, bound);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1551,6 +1860,8 @@ fn preamble() -> TokenStream {
 /// Lowering context: which frame slots are in scope as plain f64 locals.
 struct Ctx {
     known: HashSet<u16>,
+    /// Locals that only ever hold a boolean, held as 0.0/1.0.
+    bools: HashSet<u16>,
     /// Does this code write through its views? They are fetched writable if
     /// so, and the runtime keeps or discards what was written.
     mutable_views: bool,
@@ -1569,7 +1880,6 @@ struct Ctx {
     arity: usize,
     /// Whether every parameter of this function is a number, which is what a
     /// direct self call is able to pass.
-    self_params_numeric: bool,
     /// What this function's own parameters are, for a recursive call.
     self_param_kinds: Vec<Kind>,
     /// What each slot holds: a number, or a table reached through the hooks.
@@ -1897,6 +2207,10 @@ impl Ctx {
     /// block, or a `()` statement?
     fn block(&mut self, b: &Block, want_value: bool) -> Lower<TokenStream> {
         let saved = self.known.clone();
+        // Which locals are flags is a property of the scope, not of the
+        // register: the compiler reuses a register for a flag in one block and
+        // a number in another, and both are correct where they stand.
+        let saved_bools = self.bools.clone();
         let mut out = TokenStream::new();
         for st in &b.stats {
             out.extend(self.stat(st)?);
@@ -1920,6 +2234,7 @@ impl Ctx {
             (None, false) => TokenStream::new(),
         };
         self.known = saved;
+        self.bools = saved_bools;
         Ok(quote! { { #out #tail } })
     }
 
@@ -1983,7 +2298,13 @@ impl Ctx {
                 let mut out = TokenStream::new();
                 let mut tmps = Vec::new();
                 for (i, e) in exprs.iter().enumerate() {
-                    let v = self.expr(e)?;
+                    // a flag is held as 0.0/1.0, and read back as a condition
+                    let v = if bool_valued(e) {
+                        let c = self.truthy(e)?;
+                        quote! { rua_bool(#c) }
+                    } else {
+                        self.expr(e)?
+                    };
                     let t = format_ident!("__t{}", i);
                     out.extend(quote! { let #t: f64 = #v; });
                     tmps.push(t);
@@ -1995,6 +2316,11 @@ impl Ctx {
                     };
                     out.extend(quote! { let mut #id: f64 = #t; });
                     self.known.insert(b.slot);
+                    // this binding decides what the register means from here
+                    match exprs.get(i).map(bool_valued) {
+                        Some(true) => self.bools.insert(b.slot),
+                        _ => self.bools.remove(&b.slot),
+                    };
                 }
                 out
             }
@@ -2051,7 +2377,13 @@ impl Ctx {
                 let mut out = TokenStream::new();
                 let mut tmps = Vec::new();
                 for (i, e) in exprs.iter().enumerate() {
-                    let v = self.expr(e)?;
+                    let v = match targets.get(i) {
+                        Some(Expr::Local(b, _)) if self.bools.contains(&b.slot) => {
+                            let c = self.truthy(e)?;
+                            quote! { rua_bool(#c) }
+                        }
+                        _ => self.expr(e)?,
+                    };
                     let t = format_ident!("__a{}", i);
                     out.extend(quote! { let #t: f64 = #v; });
                     tmps.push(t);
@@ -2064,6 +2396,19 @@ impl Ctx {
                     out.extend(quote! { #id = #v; });
                 }
                 out
+            }
+            // `t[i] -= 1` is the read, the operation and the write. The index
+            // is evaluated twice, so it has to be something plain — which is
+            // what it is in practice, a counter or a literal.
+            Stat::OpAssign(target @ Expr::Index(_, key), op, e)
+                if self.is_table_write(target)
+                    && matches!(&**key, Expr::Local(..) | Expr::Num(_)) =>
+            {
+                let expanded = Stat::Assign(
+                    vec![target.clone()],
+                    vec![Expr::Bin(*op, Box::new(target.clone()), Box::new(e.clone()))],
+                );
+                return self.stat(&expanded);
             }
             Stat::OpAssign(target, op, e) => {
                 let id = self.local(target)?;
@@ -2320,6 +2665,11 @@ impl Ctx {
                 let v = self.truthy(a)?;
                 Ok(quote! { (!#v) })
             }
+            // a local that only ever held a condition
+            Expr::Local(b, _) if self.bools.contains(&b.slot) && self.known.contains(&b.slot) => {
+                let id = ident(b.slot);
+                Ok(quote! { (#id != 0.0) })
+            }
             _ => Err("a condition that is not provably a boolean".into()),
         }
     }
@@ -2336,6 +2686,9 @@ impl Ctx {
             Expr::Local(b, name) => {
                 if b.cell || !self.known.contains(&b.slot) {
                     return Err(format!("`{name}` is captured or declared outside this function"));
+                }
+                if self.bools.contains(&b.slot) {
+                    return Err(format!("`{name}` holds a boolean, used as a number"));
                 }
                 let id = ident(b.slot);
                 quote! { #id }
@@ -2777,7 +3130,9 @@ impl Ctx {
                                     break;
                                 }
                             },
-                            Kind::TableOut => {
+                            // a flag is never a parameter, so a call never
+                            // passes one
+                            Kind::Bool | Kind::Dead | Kind::TableOut => {
                                 ok = false;
                                 break;
                             }

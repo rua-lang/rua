@@ -1100,3 +1100,23 @@ fn a_trap_undoes_what_compiled_code_wrote() {
     assert!(vm.jit.compiled >= 1, "`step` should have been compiled");
     assert_eq!(out[0].as_num().unwrap(), 21.0, "t[0] counted once per call");
 }
+
+/// A loop hot enough to be compiled is taken over *at its back edge*, with the
+/// counter part way through — so the counter is live there, whatever an
+/// analysis of the body says about it being assigned before it is read. Get
+/// that wrong and the loop starts again from zero, which is a wrong answer
+/// rather than a crash: this counts what it should have counted.
+#[test]
+fn a_loop_taken_over_mid_flight_keeps_its_counter() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let total = 0
+        for i in 0..300000 { total += i }
+        return total;
+        "#,
+        )
+        .unwrap();
+    assert_eq!(out[0].as_num().unwrap(), 44999850000.0);
+}
