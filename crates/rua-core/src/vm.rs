@@ -33,6 +33,10 @@ pub(crate) struct CallFrame {
     line: u32,
     /// How many results the caller wants.
     nres: u16,
+    /// The end of the caller's frame. The callee's frame starts on top of the
+    /// arguments and may be shorter, so this is what says where the caller's
+    /// registers stop when it is time to release them.
+    top: u32,
 }
 
 impl Vm {
@@ -182,6 +186,7 @@ impl Vm {
             while let Some(fr) = frames.pop() {
                 self.close_frame(self.base);
                 self.base = fr.base as usize;
+                self.top = fr.top as usize;
                 self.leave_depth();
                 self.pop_frame();
             }
@@ -801,41 +806,59 @@ impl Vm {
             ret_to: ret_to as u32,
             line: self.line,
             nres,
+            top: self.top as u32,
         });
         self.push_frame(Rc::as_ptr(&f.proto), self.line);
-        let base = self.open_frame(f.proto.n_regs);
-        for (i, p) in f.proto.params.iter().enumerate() {
-            let v = if (i as u16) < nargs {
-                std::mem::take(&mut self.stack[arg_start + i])
-            } else {
-                Value::Nil
-            };
-            let slot = base + p.reg as usize;
-            let v = if p.cell {
-                Value::Cell(Rc::new(RefCell::new(v)))
-            } else {
-                v
-            };
-            Value::put(&mut self.stack[slot], v);
-        }
+        // The frame opens on the arguments, so an argument that is already in
+        // the right register — which every one of them is, since parameters
+        // take the first registers in order — needs no move at all.
+        let base = arg_start;
+        self.open_frame_at(base, f.proto.n_regs);
+        self.bind_params(&f.proto, base, nargs);
         self.base = base;
         Ok(true)
     }
 
+    /// Settle the parameters of a frame that opened on its arguments.
+    ///
+    /// Nothing to do for the common call: the arguments are already in the
+    /// registers the parameters name. What is left is the missing arguments,
+    /// which are nil, and the captured ones, which have to become cells.
+    #[inline]
+    fn bind_params(&mut self, proto: &Proto, base: usize, nargs: u16) {
+        for (i, p) in proto.params.iter().enumerate() {
+            debug_assert_eq!(
+                p.reg as usize, i,
+                "parameters take the first registers, in order"
+            );
+            let slot = base + p.reg as usize;
+            if (i as u16) >= nargs {
+                Value::put(&mut self.stack[slot], Value::Nil);
+            }
+            if p.cell {
+                let v = std::mem::take(&mut self.stack[slot]);
+                self.stack[slot] = Value::Cell(Rc::new(RefCell::new(v)));
+            }
+        }
+    }
+
     /// Move a returning function's values into its caller's registers.
     #[inline(never)]
-    fn return_values(&mut self, base: Reg, n: u16, ret_to: usize, nres: u16) {
+    fn return_values(&mut self, base: Reg, n: u16, ret_to: usize, nres: u16) -> usize {
         let start = self.base + base as usize;
         if n != MULTI && nres != MULTI {
+            // the frame these come from is about to be released, so they are
+            // moved rather than copied; the destination is always below the
+            // source, so nothing is overwritten before it is read
             for i in 0..nres as usize {
                 let v = if (i as u16) < n {
-                    self.stack[start + i].clone()
+                    std::mem::take(&mut self.stack[start + i])
                 } else {
                     Value::Nil
                 };
                 Value::put(&mut self.stack[ret_to + i], v);
             }
-            return;
+            return nres as usize;
         }
         // Whatever is being returned, find where it is: the returning
         // function's registers, or the results of the call it ended with,
@@ -871,7 +894,7 @@ impl Vm {
             } else {
                 self.multi_at = None;
             }
-            return;
+            return want as usize;
         }
 
         // The remaining cases need the values as a list: more results than the
@@ -890,6 +913,7 @@ impl Vm {
                 let first = vals.first().cloned().unwrap_or(Value::Nil);
                 Value::put(&mut self.stack[ret_to], first);
                 self.set_multi(vals);
+                1
             }
             want => {
                 for i in 0..want as usize {
@@ -898,6 +922,7 @@ impl Vm {
                 }
                 vals.clear();
                 self.recycle_vec(vals);
+                want as usize
             }
         }
     }
@@ -906,9 +931,10 @@ impl Vm {
     /// where the caller left off.
     #[inline(never)]
     fn leave_frame(&mut self, base: Reg, n: u16, fr: CallFrame) -> (Rc<Function>, usize) {
-        self.return_values(base, n, fr.ret_to as usize, fr.nres);
-        self.close_frame(self.base);
+        let written = self.return_values(base, n, fr.ret_to as usize, fr.nres);
+        self.close_frame_from(self.base, fr.ret_to as usize + written);
         self.base = fr.base as usize;
+        self.top = fr.top as usize;
         self.leave_depth();
         self.pop_frame();
         self.line = fr.line;

@@ -604,12 +604,25 @@ impl Vm {
     /// without paying to fill them again.
     pub(crate) fn open_frame(&mut self, n_regs: usize) -> usize {
         let base = self.top;
+        self.open_frame_at(base, n_regs);
+        base
+    }
+
+    /// Open a frame at a chosen place on the stack, rather than above
+    /// everything.
+    ///
+    /// A call from inside the interpreter puts the callee's frame exactly on
+    /// top of the arguments the caller built, which is where the callee's
+    /// parameters live: the arguments are then already in place and the call
+    /// copies nothing. Everything above a call's base is dead by construction
+    /// — the compiler allocates it above every live local and temporary — so
+    /// the two frames may overlap.
+    pub(crate) fn open_frame_at(&mut self, base: usize, n_regs: usize) {
         let need = base + n_regs;
         if self.stack.len() < need {
             self.stack.resize(need, Value::Nil);
         }
         self.top = need;
-        base
     }
 
     /// Give a frame's registers back, dropping whatever they held.
@@ -619,7 +632,17 @@ impl Vm {
     /// is where this frame ends and the callee's register count need not be
     /// carried around to find it.
     pub(crate) fn close_frame(&mut self, base: usize) {
-        for slot in &mut self.stack[base..self.top] {
+        self.close_frame_from(base, base)
+    }
+
+    /// Release a frame, leaving the results already written into it alone.
+    ///
+    /// A callee's frame starts one register above where its results go, so
+    /// everything the caller asked for beyond the first value lands inside the
+    /// frame that is about to be released. Those registers belong to the
+    /// caller now.
+    pub(crate) fn close_frame_from(&mut self, base: usize, from: usize) {
+        for slot in &mut self.stack[from.max(base)..self.top] {
             Value::put(slot, Value::Nil);
         }
         self.top = base;
