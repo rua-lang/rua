@@ -44,22 +44,25 @@ colours.
 
 fresh highlights with [syntect], which reads `.sublime-syntax` and **not**
 TextMate `.tmLanguage.json` — so it cannot share the grammar VS Code uses.
-There is a syntect grammar for rua in `editors/fresh/rua/`, but fresh loads
-user grammars through its package manager rather than from a directory, and
-that path is not covered by `fresh --cmd help`. Until it is, borrow Rust's
-built-in grammar, which is close because rua was shaped after it:
+`editors/fresh/rua/` is a fresh language pack: a syntect grammar written from
+the same lexer, and a manifest that also tells fresh how to start the server.
+
+```sh
+cp -r editors/fresh/rua ~/.config/fresh/grammars/rua
+```
+
+Restart fresh; grammars are built once at startup. The pack declares the
+extension, so nothing else is needed for colours. The language server is
+configured separately, since a pack's `lsp` block and the `lsp` map in
+`config.json` are two ways to say the same thing and the map is the one that
+survives reinstalling the pack:
 
 ```jsonc
 // ~/.config/fresh/config.json
 {
   "lsp_enabled": true,
   "languages": {
-    "rua": {
-      "extensions": ["rua"],
-      "grammar": "Rust",
-      "comment_prefix": "//",
-      "auto_indent": true
-    }
+    "rua": { "extensions": ["rua"], "comment_prefix": "//", "auto_indent": true }
   },
   "lsp": {
     "rua": [
@@ -75,13 +78,13 @@ built-in grammar, which is close because rua was shaped after it:
 }
 ```
 
-What Rust's grammar gets wrong is `#{`, `::` on a module, and the `{}` inside
-strings; everything else — `fn`, `let`, `match`, comments, numbers, strings —
-lands. The language server is unaffected either way, and it is the half that
-knows what the names mean.
+Do not put a `"grammar"` key in `languages.rua`: naming a built-in there
+overrides the pack.
 
-`fresh --cmd config show` prints the merged configuration back, which is the
-quickest way to see that it took.
+When something does not work, fresh says why in
+`~/.local/state/fresh/logs/fresh-*.log`. The two lines worth grepping for are
+`grammar-build` and `Failed to load grammar`; a working server logs
+`LSP server 'rua' initialized for language: rua`.
 
 [syntect]: https://github.com/trishume/syntect
 
@@ -124,10 +127,11 @@ Rust for colours — the same trick `.gitattributes` uses for GitHub:
 
 The VS Code extension compiles and packages on this machine, and the `.vsix`
 carries its own `vscode-languageclient`. The `fresh` configuration above is
-the one running here — `fresh --cmd config show` reads it back — though
-whether its LSP client attaches has not been watched from the inside. Neovim
-and Zed are not installed on this machine, so those two are written from
-their documentation and not from a run.
+the one running here, and fresh's own log shows the server attaching:
+`LSP server 'rua' initialized for language: rua`. The grammar pack is
+installed but its colours have not been seen, since that needs a restart of
+somebody's editor. Neovim and Zed are not installed on this machine, so those
+two are written from their documentation and not from a run.
 
 ## Anything else
 
