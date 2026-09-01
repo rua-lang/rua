@@ -828,11 +828,40 @@ impl Table {
     }
 
     /// The element views built earlier, if nothing has moved since.
+    ///
+    /// Correctness rests on the epoch moving whenever any table's storage
+    /// does, which is a rule someone has to remember. A debug build checks it
+    /// instead: a stale view fails a test rather than reading freed memory.
     pub fn cached_spans(&self, epoch: u64) -> Option<(*const rua_jit::RtSpan, usize)> {
         match &self.spans {
-            Some((at, views)) if *at == epoch => Some((views.as_ptr(), views.len())),
+            Some((at, views)) if *at == epoch => {
+                debug_assert!(self.views_still_true(views), "a cached element view went stale");
+                Some((views.as_ptr(), views.len()))
+            }
             _ => None,
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn views_still_true(&self, views: &[rua_jit::RtSpan]) -> bool {
+        if views.len() != self.arr.len() {
+            return false;
+        }
+        self.arr.iter().zip(views).all(|(v, span)| match v {
+            Value::Table(t) => match t.try_borrow() {
+                Ok(inner) => match &inner.nums {
+                    Some(cache) => cache.as_ptr() == span.ptr && cache.len() == span.len,
+                    None => false,
+                },
+                Err(_) => false,
+            },
+            _ => false,
+        })
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn views_still_true(&self, _views: &[rua_jit::RtSpan]) -> bool {
+        true
     }
 
     /// Keep a freshly built set of views, handing back the old one so that
@@ -987,6 +1016,7 @@ impl Table {
                     self.arr.push(v);
                     self.index = None;
                     self.reindex();
+                    bump_shape_epoch();
                 }
                 None => return,
             }

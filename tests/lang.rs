@@ -1161,3 +1161,38 @@ fn a_name_read_before_it_is_shadowed_is_still_a_capture() {
         "outer/inner"
     );
 }
+
+/// Compiled code reads an array of arrays through views of every element,
+/// cached against an epoch that has to move whenever any table's storage does.
+/// Growing the outer array, and growing an element, both move something; a
+/// debug build checks the cached views against the tables on every hit, so
+/// this fails loudly rather than reading freed memory.
+#[test]
+fn cached_element_views_do_not_outlive_the_arrays_they_view() {
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm
+        .eval(
+            r#"
+        fn total(rows, n) {
+            let s = 0
+            for i in 0..n {
+                let r = rows[i]
+                s += r[0] + r[1]
+            }
+            s
+        }
+        let rows = [[1, 2], [3, 4]]
+        let acc = 0
+        for k in 0..40 { acc += total(rows, 2) }
+        rows.push([5, 6])                      // the outer array moves
+        for k in 0..40 { acc += total(rows, 3) }
+        let first = rows[0]
+        for k in 0..40 { first.push(k) }       // an element moves
+        for k in 0..40 { acc += total(rows, 3) }
+        return acc;
+        "#,
+        )
+        .unwrap();
+    assert_eq!(out[0].as_num().unwrap(), 40.0 * 10.0 + 80.0 * 21.0);
+}
