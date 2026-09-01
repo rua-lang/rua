@@ -61,7 +61,7 @@ impl World {
         let offset = index.offset(at);
         let (toks, _) = Lexer::tokenize_all(index.text());
         let i = toks.iter().position(|t| t.span.contains(offset))?;
-        self.describe(&toks, i)
+        self.describe_in(&toks, i, index.text())
     }
 
     /// The names in the outline, in order.
@@ -450,7 +450,7 @@ impl World {
         let at = index.offset(p.text_document_position_params.position);
         let (toks, _) = Lexer::tokenize_all(index.text());
         let i = toks.iter().position(|t| t.span.contains(at))?;
-        let text = self.describe(&toks, i)?;
+        let text = self.describe_in(&toks, i, index.text())?;
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -462,10 +462,22 @@ impl World {
 
     /// What to say about the token under the cursor.
     fn describe(&self, toks: &[Lexed], i: usize) -> Option<String> {
+        self.describe_in(toks, i, "")
+    }
+
+    /// The same, with the document's text so the types written in it can be
+    /// read. This is what makes a program document itself: the annotation is
+    /// the documentation, and hovering is how you read it.
+    fn describe_in(&self, toks: &[Lexed], i: usize, text: &str) -> Option<String> {
         if let Some(word) = keyword_doc(&toks[i].tok) {
             return Some(word.to_string());
         }
         let Tok::Name(name) = &toks[i].tok else { return None };
+        if !text.is_empty() {
+            if let Some(said) = self.what_the_file_says(name, toks, i, text) {
+                return Some(said);
+            }
+        }
         // `fs::read` — the module in front says which table to look in
         let qualified = i >= 2 && toks[i - 1].tok == Tok::ColonColon;
         if qualified {
@@ -491,6 +503,80 @@ impl World {
             return Some(format!("```rust\n{name}\n```\n\nA name the runtime provides."));
         }
         None
+    }
+
+    /// What this file itself says about a name: the type written beside it,
+    /// the signature it was declared with, or the shape it stands for.
+    fn what_the_file_says(
+        &self,
+        name: &str,
+        toks: &[Lexed],
+        i: usize,
+        text: &str,
+    ) -> Option<String> {
+        let (block, _) = rua_syntax::parser::parse_recover(text);
+        let types = crate::types::Types::read(&block);
+
+        // a type's own name: show what it stands for, with its parameters
+        if let Some(body) = types.alias(name) {
+            let params = types.type_params(name);
+            let head = if params.is_empty() {
+                name.to_string()
+            } else {
+                let ps: Vec<String> = params.iter().map(|p| p.to_string()).collect();
+                format!("{name}<{}>", ps.join(", "))
+            };
+            return Some(format!("```rust
+type {head} = {body}
+```"));
+        }
+
+        // a function written here: its whole signature, which is the whole
+        // of what a reader would have opened the file for
+        if let Some(sig) = types.function(name) {
+            let mut out = format!("```rust
+fn {}
+```", sig.label());
+            let described: Vec<String> = sig
+                .params
+                .iter()
+                .filter_map(|p| {
+                    let t = p.ty.as_ref()?;
+                    Some(format!("- `{p}` — {}", self.explain(&types, t)))
+                })
+                .collect();
+            if !described.is_empty() {
+                out.push_str("
+
+");
+                out.push_str(&described.join("
+"));
+            }
+            return Some(out);
+        }
+
+        // a name with a type written beside it, and what that type stands for
+        let decl = rua_syntax::resolve::occurrences(&block)
+            .into_iter()
+            .find(|o| o.span == toks[i].span)
+            .and_then(|o| o.decl)?;
+        let ty = types.at(decl)?;
+        Some(format!("```rust
+{name}: {ty}
+```
+
+{}", self.explain(&types, ty)))
+    }
+
+    /// A type, followed down to the shape it stands for when that says more
+    /// than the name does.
+    fn explain(&self, types: &crate::types::Types, ty: &rua_syntax::ast::Type) -> String {
+        let filled = types.instantiate(ty);
+        let shown = filled.to_string();
+        if shown == ty.to_string() {
+            return shown;
+        }
+        format!("`{ty}` is `{shown}`")
     }
 
     pub fn complete(&self, p: &CompletionParams) -> Option<CompletionResponse> {
@@ -548,7 +634,22 @@ impl World {
                 if let Some(sig) = types.function(&callee) {
                     if let Some(p) = sig.params.get(index_of) {
                         let detail = match &p.ty {
-                            Some(t) => format!("{} of {} — {t}", ordinal(index_of), sig.label()),
+                            // follow a generic down to what it stands for:
+                            // `Handler<Body, Reply>` says less than the
+                            // function it turns out to be
+                            Some(t) => {
+                                let filled = types.instantiate(t);
+                                let shown = filled.to_string();
+                                if shown == t.to_string() {
+                                    format!("{} of {} — {t}", ordinal(index_of), sig.label())
+                                } else {
+                                    format!(
+                                        "{} of {} — {t} = {shown}",
+                                        ordinal(index_of),
+                                        sig.label()
+                                    )
+                                }
+                            }
                             None => format!("{} of {}", ordinal(index_of), sig.label()),
                         };
                         let mut it = item(p, CompletionItemKind::VALUE, &detail);

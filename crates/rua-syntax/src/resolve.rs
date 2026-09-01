@@ -446,7 +446,9 @@ impl Resolver {
                 }
             }
             Stat::FnSlot(b, f) => Stat::FnSlot(*b, self.expr(f)),
-            Stat::TypeAlias(name, t) => Stat::TypeAlias(name.clone(), t.clone()),
+            Stat::TypeAlias(name, params, t) => {
+                Stat::TypeAlias(name.clone(), params.clone(), t.clone())
+            }
             Stat::Assign(targets, exprs) => Stat::Assign(
                 targets.iter().map(|t| self.expr(t)).collect(),
                 exprs.iter().map(|e| self.expr(e)).collect(),

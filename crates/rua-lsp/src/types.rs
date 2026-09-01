@@ -35,10 +35,36 @@ impl Signature {
     }
 }
 
+/// Put the arguments in place of the parameters, all the way down.
+fn substitute(ty: &Type, bound: &HashMap<&str, &Type>) -> Type {
+    match ty {
+        Type::Named(n, args, s) => match bound.get(&**n) {
+            Some(t) if args.is_empty() => (*t).clone(),
+            _ => Type::Named(
+                n.clone(),
+                args.iter().map(|a| substitute(a, bound)).collect(),
+                *s,
+            ),
+        },
+        Type::Array(inner, s) => Type::Array(Box::new(substitute(inner, bound)), *s),
+        Type::Record(fields, s) => Type::Record(
+            fields.iter().map(|(n, t)| (n.clone(), substitute(t, bound))).collect(),
+            *s,
+        ),
+        Type::Fn(args, ret, s) => Type::Fn(
+            args.iter().map(|(n, t)| (n.clone(), substitute(t, bound))).collect(),
+            ret.as_ref().map(|r| Box::new(substitute(r, bound))),
+            *s,
+        ),
+    }
+}
+
 #[derive(Default)]
 pub struct Types {
     /// `type Point = #{ .. }`
     aliases: HashMap<Rc<str>, Type>,
+    /// What each takes, for the ones that take anything.
+    params: HashMap<Rc<str>, Vec<Name>>,
     /// The type written beside a binding, by the name's own span.
     at_decl: HashMap<(u32, u32), Type>,
     /// Functions written in this file.
@@ -96,12 +122,39 @@ impl Types {
         self.aliases.get(name)
     }
 
+    /// The parameters a type takes: `type Handler<T, U> = ..` takes two.
+    pub fn type_params(&self, name: &str) -> &[Name] {
+        self.params.get(name).map(|v| &v[..]).unwrap_or(&[])
+    }
+
+    /// `Handler<Body, Reply>` with `T` and `U` filled in — following a
+    /// generic down to what it stands for is what makes an editor able to say
+    /// something concrete about it.
+    pub fn instantiate(&self, ty: &Type) -> Type {
+        let Type::Named(name, args, _) = ty else { return ty.clone() };
+        let Some(body) = self.aliases.get(name) else { return ty.clone() };
+        let params = self.type_params(name);
+        if params.is_empty() || args.len() != params.len() {
+            return body.clone();
+        }
+        let bound: HashMap<&str, &Type> =
+            params.iter().map(|p| &*p.text).zip(args.iter()).collect();
+        substitute(body, &bound)
+    }
+
     pub fn function(&self, name: &str) -> Option<&Signature> {
         self.functions.iter().find(|f| &*f.name == name)
     }
 
     pub fn functions(&self) -> &[Signature] {
         &self.functions
+    }
+
+    // ---- filling in a generic -------------------------------------------
+
+    /// Is this name a parameter of the type being written, rather than a type?
+    pub fn is_parameter(&self, of: &str, name: &str) -> bool {
+        self.type_params(of).iter().any(|p| &*p.text == name)
     }
 
     // ---- reading the tree ------------------------------------------------
@@ -123,7 +176,8 @@ impl Types {
 
     fn stat(&mut self, s: &Stat) {
         match s {
-            Stat::TypeAlias(name, t) => {
+            Stat::TypeAlias(name, params, t) => {
+                self.params.insert(name.text.clone(), params.clone());
                 self.aliases.insert(name.text.clone(), t.clone());
             }
             Stat::Let(names, es) => {

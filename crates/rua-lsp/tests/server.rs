@@ -467,7 +467,8 @@ fn an_argument_position_says_what_the_argument_is_for() {
     let d = detail(&world, &uri, at(2, 15), "spot");
     assert!(d.contains("first of"), "{d}");
     assert!(d.contains("place(spot: Point, label: string) -> boolean"), "{d}");
-    assert!(d.ends_with("Point"), "the type it wants: {d}");
+    assert!(d.contains("— Point"), "the type it wants: {d}");
+    assert!(d.contains("#{ x: number, y: number }"), "followed down to the shape: {d}");
 }
 
 /// The second argument is the second one, however long the first was.
@@ -540,4 +541,72 @@ fn names_are_offered_with_the_types_they_were_written_with() {
     );
     // one with no annotation still appears, just without a type to show
     assert_eq!(detail(&world, &uri, at(4, 0), "count"), "this file");
+}
+
+// ---- generics, and what they let the editor say ----------------------------
+
+const HANDLER: &str = "type Body = #{ path: string, bytes: number }\n\
+                       type Reply = #{ status: number }\n\
+                       type Handler<T, U> = fn(route: string, data: T) -> U\n\
+                       fn serve(on: string, handle: Handler<Body, Reply>, retries: number) -> boolean {\n\
+                       retries > 0\n\
+                       }\n\
+                       let listener: Handler<Body, Reply> = |r, d| { #{ status: 200 } }\n";
+
+/// The thing this is all for: typing a call and being told what goes there,
+/// at every argument, including part way through writing one.
+#[test]
+fn every_argument_of_a_call_says_what_it_is_for() {
+    let src = format!("{HANDLER}let a = serve(\"x\", listener, ret");
+    let (world, uri) = open(&src);
+    let line = 7;
+    for (col, want, kind) in [
+        (14u32, "on", "first"),
+        (19, "handle", "second"),
+        (29, "retries", "third"),
+        (32, "retries", "third"),
+    ] {
+        let got = labels(&world, &uri, at(line, col));
+        assert_eq!(got.first().map(String::as_str), Some(want), "at column {col}");
+        let d = detail(&world, &uri, at(line, col), want);
+        assert!(d.starts_with(kind), "{d}");
+    }
+}
+
+/// A generic is followed down to what it stands for, because the name says
+/// less than the shape does.
+#[test]
+fn a_generic_is_filled_in_where_it_is_used() {
+    let src = format!("{HANDLER}let a = serve(\"x\", ");
+    let (world, uri) = open(&src);
+    let d = detail(&world, &uri, at(7, 19), "handle");
+    assert!(d.contains("Handler<Body, Reply>"), "{d}");
+    assert!(
+        d.contains("fn(route: string, data: Body) -> Reply"),
+        "the parameters filled in: {d}"
+    );
+}
+
+/// Hover is the other half of the same answer.
+#[test]
+fn hover_says_what_a_name_and_a_type_and_a_function_are() {
+    let (world, uri) = open(HANDLER);
+    // a function: its whole signature, and a line per parameter
+    let f = world.hover_at(&uri, at(3, 4)).expect("hover on `serve`");
+    assert!(f.contains("fn serve(on: string, handle: Handler<Body, Reply>, retries: number) -> boolean"), "{f}");
+    assert!(f.contains("`handle`"), "{f}");
+    assert!(f.contains("fn(route: string, data: Body) -> Reply"), "filled in: {f}");
+
+    // a name: the type written beside it, and what that stands for
+    let n = world.hover_at(&uri, at(6, 5)).expect("hover on `listener`");
+    assert!(n.contains("listener: Handler<Body, Reply>"), "{n}");
+    assert!(n.contains("fn(route: string, data: Body) -> Reply"), "{n}");
+
+    // a generic type: its parameters and its body, as written
+    let t = world.hover_at(&uri, at(2, 6)).expect("hover on `Handler`");
+    assert!(t.contains("type Handler<T, U> = fn(route: string, data: T) -> U"), "{t}");
+
+    // a shape
+    let b = world.hover_at(&uri, at(0, 6)).expect("hover on `Body`");
+    assert!(b.contains("type Body = #{ path: string, bytes: number }"), "{b}");
 }

@@ -216,10 +216,21 @@ impl Parser {
             Tok::Type => {
                 self.bump();
                 let name = self.name()?;
+                // `type Handler<T, U> = ..` — the names its body may use
+                let mut params = Vec::new();
+                if self.accept(Tok::Lt) {
+                    while *self.peek() != Tok::Gt && *self.peek() != Tok::Eof {
+                        params.push(self.name()?);
+                        if !self.accept(Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::Gt)?;
+                }
                 self.expect(Tok::Assign)?;
                 let t = self.ty()?;
                 self.accept(Tok::Semi);
-                Ok(Item::Stat(Stat::TypeAlias(name, t)))
+                Ok(Item::Stat(Stat::TypeAlias(name, params, t)))
             }
             Tok::Fn => {
                 self.bump();
@@ -372,7 +383,18 @@ impl Parser {
                 self.expect(Tok::LParen)?;
                 let mut args = Vec::new();
                 while *self.peek() != Tok::RParen && *self.peek() != Tok::Eof {
-                    args.push(self.ty()?);
+                    // `route: string` names the argument; `string` alone does
+                    // not, and both are allowed
+                    let named = matches!(self.peek(), Tok::Name(_))
+                        && self.toks.get(self.pos + 1).map(|t| &t.tok) == Some(&Tok::Colon);
+                    let name = if named {
+                        let n = self.name()?;
+                        self.expect(Tok::Colon)?;
+                        Some(n)
+                    } else {
+                        None
+                    };
+                    args.push((name, self.ty()?));
                     if !self.accept(Tok::Comma) {
                         break;
                     }

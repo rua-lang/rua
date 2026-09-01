@@ -93,8 +93,10 @@ pub enum Type {
     Array(Box<Type>, Span),
     /// `#{ x: number, y: number }` — a shape, not a name for one.
     Record(Vec<(Name, Type)>, Span),
-    /// `fn(A, B) -> C`, and `-> nil` when it hands nothing back.
-    Fn(Vec<Type>, Option<Box<Type>>, Span),
+    /// `fn(A, B) -> C`, and `fn(route: string, data: T) -> U` when the
+    /// arguments are worth naming — which is most of the time, since what an
+    /// argument is for is the thing a reader goes to the source to find out.
+    Fn(Vec<(Option<Name>, Type)>, Option<Box<Type>>, Span),
 }
 
 impl Type {
@@ -133,11 +135,14 @@ impl std::fmt::Display for Type {
             }
             Type::Fn(args, ret, _) => {
                 write!(f, "fn(")?;
-                for (i, a) in args.iter().enumerate() {
+                for (i, (name, a)) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{a}")?;
+                    match name {
+                        Some(n) => write!(f, "{n}: {a}")?,
+                        None => write!(f, "{a}")?,
+                    }
                 }
                 write!(f, ")")?;
                 match ret {
@@ -276,9 +281,10 @@ pub enum Stat {
     FnDecl(Name, Expr),
     /// `fn` after resolution.
     FnSlot(Binding, Expr),
-    /// `type Name = T`. Nothing runs it; it is read by the checker and by the
+    /// `type Name = T`, and `type Handler<T, U> = ..` when it takes
+    /// parameters. Nothing runs it; it is read by the checker and by the
     /// editor, and the compiler steps over it.
-    TypeAlias(Name, Type),
+    TypeAlias(Name, Vec<Name>, Type),
     Assign(Vec<Expr>, Vec<Expr>),
     /// A compound assignment such as `x += 1`.
     OpAssign(Expr, BinOp, Expr),

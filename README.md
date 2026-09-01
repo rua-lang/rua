@@ -159,8 +159,21 @@ The names are the ones `typeof` answers with — `number`, `string`,
 and nothing else, and an annotation the runtime cannot keep is worth less
 than none.
 
-`Map<K, V>` parses and means nothing yet. The shape is there so that giving
-it a meaning is not a change to the grammar.
+A type may take parameters, and a function type may name its arguments —
+which is the point, since what an argument is *for* is what sends a reader to
+the source:
+
+```rust
+type Handler<T, U> = fn(route: string, data: T) -> U
+
+fn serve(on: string, handle: Handler<Body, Reply>, retries: number) -> boolean
+```
+
+The editor follows those down. Writing `serve("0.0.0.0:80", ` offers
+`handle` first, as *second of serve(..) — Handler<Body, Reply> =
+fn(route: string, data: Body) -> Reply*, and hovering `serve` gives the whole
+signature with a line per parameter. Nothing is checked yet; the annotation
+is the documentation, and the editor is how you read it.
 
 ## The standard library
 
