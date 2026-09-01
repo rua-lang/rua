@@ -104,6 +104,9 @@ pub struct Lexer<'a> {
     /// Record where the comments were, for a reader that cares.
     keep_comments: bool,
     comments: Vec<Span>,
+    /// The `#!` line, which is stepped over before lexing begins and is a
+    /// comment to everyone who reads the file afterwards.
+    shebang: Option<Span>,
 }
 
 /// A pass over the source, for somebody who wants all of it.
@@ -120,12 +123,14 @@ impl<'a> Lexer<'a> {
         let bytes = src.as_bytes();
         // a leading `#!` line belongs to the shell, not to us
         let mut pos = 0;
+        let mut shebang = None;
         if bytes.starts_with(b"#!") {
             while pos < bytes.len() && bytes[pos] != b'\n' {
                 pos += 1;
             }
+            shebang = Some(Span::new(0, pos as u32));
         }
-        Lexer { src: bytes, pos, line: 1, keep_comments: false, comments: Vec::new() }
+        Lexer { src: bytes, pos, line: 1, keep_comments: false, comments: Vec::new(), shebang }
     }
 
     /// Everything a reader of the source might want: the tokens, where the
@@ -138,8 +143,15 @@ impl<'a> Lexer<'a> {
     pub fn scan(src: &'a str) -> Scan {
         let mut lx = Lexer::new(src);
         lx.keep_comments = true;
+        // the `#!` line was stepped over in `new`, before anything could be
+        // recorded; it is the file's first comment
+        let shebang = lx.shebang;
         let (tokens, errors) = lx.run();
-        Scan { tokens, comments: lx.comments, errors }
+        let mut comments = lx.comments;
+        if let Some(s) = shebang {
+            comments.insert(0, s);
+        }
+        Scan { tokens, comments, errors }
     }
 
     /// Every token, and everything that went wrong getting them.

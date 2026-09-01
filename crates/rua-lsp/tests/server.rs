@@ -79,7 +79,12 @@ fn the_outline_lists_functions_even_when_the_file_does_not_parse() {
 #[test]
 fn semantic_tokens_tell_a_call_from_a_module_from_a_field() {
     let (world, uri) = open("fs::read(x.name)\n");
-    let kinds = world.token_kinds(&uri);
+    // the names only: punctuation's kind is not what this is about
+    let kinds: Vec<(String, SemanticTokenType)> = world
+        .token_kinds(&uri)
+        .into_iter()
+        .filter(|(t, _)| t.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .collect();
     // `fs` before `::` is a namespace; `read` before `(` is a function;
     // `name` after `.` is a property; `x` is a plain variable
     assert_eq!(
@@ -93,14 +98,47 @@ fn semantic_tokens_tell_a_call_from_a_module_from_a_field() {
     );
 }
 
-/// A string may run over a line break, and a token an editor colours may not.
+/// A token an editor colours may not straddle two lines, and a rua string or
+/// block comment may. Those are cut at the line ends rather than dropped.
 #[test]
-fn a_token_spanning_lines_is_left_to_the_grammar() {
-    let (world, uri) = open("let s = \"one\ntwo\"\nlet n = 1\n");
-    // the multi-line string is skipped rather than emitted with a length that
-    // runs off the end of its line
+fn a_token_spanning_lines_is_cut_at_the_line_ends() {
+    let (world, uri) = open("let s = \"one\ntwo\"\n/* a\n   b */\n");
     let kinds = world.token_kinds(&uri);
     assert!(!kinds.iter().any(|(t, _)| t.contains('\n')), "{kinds:?}");
+    // both halves of each survive
+    let text: Vec<&str> = kinds.iter().map(|(t, _)| t.as_str()).collect();
+    assert!(text.contains(&"\"one"), "{text:?}");
+    assert!(text.contains(&"two\""), "{text:?}");
+    assert!(text.contains(&"/* a"), "{text:?}");
+}
+
+/// A `#!` line is stepped over before the lexer starts, and it is still a
+/// comment to everyone who reads the file: it colours as one, and nothing is
+/// offered inside it.
+#[test]
+fn a_shebang_is_a_comment() {
+    let (world, uri) = open("#!/usr/bin/env rua\nlet a = 1\n");
+    let kinds = world.token_kinds(&uri);
+    assert_eq!(
+        kinds.first().map(|(t, k)| (t.as_str(), k.clone())),
+        Some(("#!/usr/bin/env rua", SemanticTokenType::COMMENT)),
+        "{kinds:?}"
+    );
+    assert!(labels(&world, &uri, at(0, 10)).is_empty(), "nothing to complete in a shebang");
+    // and the line under it is ordinary code
+    assert!(!labels(&world, &uri, at(1, 9)).is_empty());
+}
+
+/// Comments colour through the server too, so an editor with no grammar for
+/// rua still greys them.
+#[test]
+fn comments_are_coloured() {
+    let (world, uri) = open("let a = 1 // why\n");
+    let kinds = world.token_kinds(&uri);
+    assert!(
+        kinds.iter().any(|(t, k)| t == "// why" && *k == SemanticTokenType::COMMENT),
+        "{kinds:?}"
+    );
 }
 
 // ---- go to definition, references and rename -------------------------------

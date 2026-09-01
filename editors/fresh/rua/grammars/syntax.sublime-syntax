@@ -18,6 +18,7 @@ variables:
 
 contexts:
   main:
+    - include: shebang
     - include: comments
     - include: strings
     - include: numbers

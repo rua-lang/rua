@@ -14,6 +14,7 @@ use rua_syntax::lexer::{Lexed, Lexer, Tok};
 /// The token kinds this server colours, in the order the editor is told about
 /// them — the numbers on the wire are indices into this.
 pub const TOKEN_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::COMMENT,
     SemanticTokenType::KEYWORD,
     SemanticTokenType::STRING,
     SemanticTokenType::NUMBER,
@@ -24,14 +25,15 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::PROPERTY,
 ];
 
-const KEYWORD: u32 = 0;
-const STRING: u32 = 1;
-const NUMBER: u32 = 2;
-const OPERATOR: u32 = 3;
-const VARIABLE: u32 = 4;
-const FUNCTION: u32 = 5;
-const NAMESPACE: u32 = 6;
-const PROPERTY: u32 = 7;
+const COMMENT: u32 = 0;
+const KEYWORD: u32 = 1;
+const STRING: u32 = 2;
+const NUMBER: u32 = 3;
+const OPERATOR: u32 = 4;
+const VARIABLE: u32 = 5;
+const FUNCTION: u32 = 6;
+const NAMESPACE: u32 = 7;
+const PROPERTY: u32 = 8;
 
 pub struct World {
     docs: Docs,
@@ -78,19 +80,9 @@ impl World {
     /// wire format is deltas, which say nothing on their own.
     pub fn token_kinds(&self, uri: &Url) -> Vec<(String, SemanticTokenType)> {
         let Some(index) = self.docs.get(uri) else { return Vec::new() };
-        let (toks, _) = Lexer::tokenize_all(index.text());
         let mut out = Vec::new();
-        for (i, t) in toks.iter().enumerate() {
-            let Some(kind) = token_kind(&toks, i) else { continue };
-            if !index.one_line(t.span.lo, t.span.hi) || t.span.is_empty() {
-                continue;
-            }
-            // only the ones a reader would call a name: the rest are keywords
-            // and punctuation, and their text is their kind
-            if !matches!(t.tok, Tok::Name(_)) {
-                continue;
-            }
-            let text = index.text()[t.span.lo as usize..t.span.hi as usize].to_string();
+        for (span, kind) in self.coloured(index) {
+            let text = index.text()[span.lo as usize..span.hi as usize].to_string();
             out.push((text, TOKEN_TYPES[kind as usize].clone()));
         }
         out
@@ -363,18 +355,11 @@ impl World {
 
     pub fn semantic_tokens(&self, p: &SemanticTokensParams) -> Option<SemanticTokensResult> {
         let index = self.docs.get(&p.text_document.uri)?;
-        let (toks, _) = Lexer::tokenize_all(index.text());
         let mut data = Vec::new();
         let (mut last_line, mut last_start) = (0u32, 0u32);
-        for (i, t) in toks.iter().enumerate() {
-            let Some(kind) = token_kind(&toks, i) else { continue };
-            // a token the editor colours may not straddle two lines, and a rua
-            // string is allowed to
-            if !index.one_line(t.span.lo, t.span.hi) || t.span.is_empty() {
-                continue;
-            }
-            let at = index.position(t.span.lo);
-            let end = index.position(t.span.hi);
+        for (span, kind) in self.coloured(index) {
+            let at = index.position(span.lo);
+            let end = index.position(span.hi);
             let delta_line = at.line - last_line;
             let delta_start = if delta_line == 0 { at.character - last_start } else { at.character };
             data.push(SemanticToken {
@@ -384,13 +369,55 @@ impl World {
                 token_type: kind,
                 token_modifiers_bitset: 0,
             });
-            last_line = at.line;
-            last_start = at.character;
+            (last_line, last_start) = (at.line, at.character);
         }
         Some(SemanticTokensResult::Tokens(SemanticTokens { result_id: None, data }))
     }
 
-    /// The functions in a file, for the outline. Read from the tokens rather
+    /// Every stretch of the document worth colouring, in order.
+    ///
+    /// A token an editor colours may not straddle two lines and a rua string
+    /// or block comment may, so anything that does is cut at the line ends.
+    fn coloured(&self, index: &LineIndex) -> Vec<(rua_syntax::ast::Span, u32)> {
+        use rua_syntax::ast::Span;
+        let scan = Lexer::scan(index.text());
+        let mut out: Vec<(Span, u32)> = Vec::new();
+        for (i, t) in scan.tokens.iter().enumerate() {
+            if let Some(kind) = token_kind(&scan.tokens, i) {
+                out.push((t.span, kind));
+            }
+        }
+        // the `#!` line comes back among these, which is what makes it a
+        // comment to an editor as well as to a reader
+        for c in &scan.comments {
+            out.push((*c, COMMENT));
+        }
+        out.sort_by_key(|(s, _)| s.lo);
+        out.retain(|(s, _)| !s.is_empty());
+        // cut anything that crosses a line break into one piece per line
+        let mut split = Vec::with_capacity(out.len());
+        for (span, kind) in out {
+            if index.one_line(span.lo, span.hi) {
+                split.push((span, kind));
+                continue;
+            }
+            let text = index.text();
+            let mut lo = span.lo;
+            while lo < span.hi {
+                let nl = text[lo as usize..span.hi as usize]
+                    .find('\n')
+                    .map(|n| lo + n as u32)
+                    .unwrap_or(span.hi);
+                if nl > lo {
+                    split.push((Span::new(lo, nl), kind));
+                }
+                lo = nl + 1;
+            }
+        }
+        split
+    }
+
+    /// The functions in a file, for the outline.    /// The functions in a file, for the outline. Read from the tokens rather
     /// than the tree, so that a file which does not parse still has one.
     pub fn symbols(&self, p: &DocumentSymbolParams) -> Option<DocumentSymbolResponse> {
         let index = self.docs.get(&p.text_document.uri)?;

@@ -49,18 +49,10 @@ pub fn format(src: &str) -> Result<String, SyntaxError> {
     if let Some(e) = scan.errors.first() {
         return Err(e.clone());
     }
+    // the `#!` line comes back from the scan as the first comment, so it
+    // lays out like any other
     let pieces = interleave(src, &scan);
-    // The lexer steps over a `#!` line before it starts, so it is in neither
-    // the tokens nor the comments. It is still the first line of the file.
-    let shebang = match src.starts_with("#!") {
-        true => &src[..src.find('\n').unwrap_or(src.len())],
-        false => "",
-    };
-    let body = render(&pieces);
-    if shebang.is_empty() {
-        return Ok(body);
-    }
-    Ok(format!("{}\n{}", shebang.trim_end(), body))
+    Ok(render(&pieces))
 }
 
 /// Tokens and comments in the order they were written.
