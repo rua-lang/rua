@@ -1183,7 +1183,8 @@ fn walk_stat(st: &Stat, out: &mut Vec<String>) {
             walk_expr(iter, out);
             walk_block(body, out);
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -1373,7 +1374,8 @@ fn made_stat(st: &Stat, out: &mut HashSet<u16>) {
             made_expr(iter, out);
             made_block(body, out);
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -1453,7 +1455,8 @@ fn def_stat(st: &Stat, out: &mut HashMap<u16, usize>) {
             def_expr(iter, out);
             def_block(body, out);
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -1710,7 +1713,8 @@ fn dead_stat(st: &Stat, out: &mut Vec<(u16, bool)>) {
         Stat::Let(_, es) | Stat::Return(es) => {
             es.iter().for_each(|e| dead_note_reads(e, out))
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -1820,7 +1824,8 @@ fn bool_stat(st: &Stat, assigned: &mut HashMap<u16, bool>, spoiled: &mut HashSet
                 bool_expr(e, assigned, spoiled, bound);
             }
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -1984,7 +1989,8 @@ fn kinds_stat(
             kinds_expr(iter, kinds, bad, callees, links, longest);
             kinds_block(body, kinds, bad, callees, links, longest);
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -2162,7 +2168,8 @@ fn collect_slots_stat(st: &Stat, out: &mut Vec<u16>, bad: &mut Option<String>) {
             collect_slots_block(body, out, bad);
         }
         Stat::ForIn { .. } => *bad = Some("`for ... in` over an iterator".into()),
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -2827,7 +2834,8 @@ fn usage_stat(st: &Stat, u: &mut TableUse) {
             usage_expr(iter, u);
             usage_block(body, u);
         }
-        Stat::Break | Stat::Continue => {}
+        // a type says what something must be; nothing runs
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => {}
     }
 }
 
@@ -2926,7 +2934,7 @@ fn writes_slot_stat(st: &Stat, slot: u16) -> bool {
                 || writes_slot_expr(iter, slot)
                 || writes_slot(body, slot)
         }
-        Stat::Break | Stat::Continue => false,
+        Stat::Break | Stat::Continue | Stat::TypeAlias(..) => false,
     }
 }
 
@@ -3056,6 +3064,9 @@ impl Ctx {
 
     fn stat(&mut self, st: &Stat) -> Lower<TokenStream> {
         Ok(match st {
+            // a type is read by the checker and the editor; there is nothing
+            // here to generate
+            Stat::TypeAlias(..) => quote! {},
             // `let b = t[i]` where the elements of `t` are tables: fetch the
             // element's address and the view of its numbers here, once, rather
             // than at every access through it

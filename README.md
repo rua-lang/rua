@@ -136,6 +136,32 @@ Absent on purpose: static types, traits, borrow checking, destructuring
 patterns beyond `let (a, b)`, integer/float distinction, string patterns,
 coroutines. This is a scripting language that reads like Rust, not Rust.
 
+## Types
+
+Optional, and written where Rust would write them. Nothing checks them yet —
+they parse, they are kept, and the editor reads them; a program means the
+same with them as without.
+
+```rust
+type Point   = #{ x: number, y: number }
+type Ids     = [number]
+type Handler = fn(string) -> boolean
+
+fn dist2(p: Point, scale: number) -> number {
+    (p.x * p.x + p.y * p.y) * scale
+}
+let origin: Point = #{ x: 3, y: 4 }
+```
+
+The names are the ones `typeof` answers with — `number`, `string`,
+`boolean`, `nil`, `table`, `function` — so `typeof(x) == "number"` and
+`x: number` say the same thing. There is no `int`: a rua number is an `f64`
+and nothing else, and an annotation the runtime cannot keep is worth less
+than none.
+
+`Map<K, V>` parses and means nothing yet. The shape is there so that giving
+it a meaning is not a change to the grammar.
+
 ## The standard library
 
 Enough to write something real, and no more than that.

@@ -510,6 +510,8 @@ impl FnCompiler {
                     None => self.code[at] = Op::Nil { dst: 0 },
                 }
             }
+            // a type is checked, not run
+            Stat::TypeAlias(..) => {}
             Stat::Let(..) | Stat::FnDecl(..) => {
                 unreachable!("the resolver rewrites these")
             }

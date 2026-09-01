@@ -91,6 +91,9 @@ impl Scan<'_> {
             Stat::LetSlots(_, exprs) | Stat::Return(exprs) => {
                 exprs.iter().for_each(|e| self.expr(e, inside))
             }
+            // a type declares nothing that runs, so there is nothing here to
+            // capture and nothing to declare
+            Stat::TypeAlias(..) => {}
             Stat::FnDecl(name, e) => {
                 self.declare(&name.text);
                 self.expr(e, inside);
@@ -443,6 +446,7 @@ impl Resolver {
                 }
             }
             Stat::FnSlot(b, f) => Stat::FnSlot(*b, self.expr(f)),
+            Stat::TypeAlias(name, t) => Stat::TypeAlias(name.clone(), t.clone()),
             Stat::Assign(targets, exprs) => Stat::Assign(
                 targets.iter().map(|t| self.expr(t)).collect(),
                 exprs.iter().map(|e| self.expr(e)).collect(),
@@ -550,6 +554,7 @@ impl Resolver {
                 let scope = self.scopes.pop().expect("we pushed one");
                 Expr::Func(Rc::new(FuncDef {
                     id: def.id,
+                    ret: def.ret.clone(),
                     name: def.name.clone(),
                     params: def.params.clone(),
                     body,

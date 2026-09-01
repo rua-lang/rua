@@ -1767,6 +1767,84 @@ fn formatting_refuses_what_it_cannot_read() {
     assert!(out.unwrap_err().message.contains("unexpected character"));
 }
 
+/// Types are written and kept, and nothing runs them. A program with them in
+/// it behaves exactly as the same program without.
+#[test]
+fn types_are_written_down_and_do_not_run() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Point = #{ x: number, y: number }
+        type Ids = [number]
+        type Handler = fn(string) -> boolean
+
+        fn dist2(p: Point, scale: number) -> number {
+            (p.x * p.x + p.y * p.y) * scale
+        }
+        let origin: Point = #{ x: 3, y: 4 }
+        let ids: Ids = [1, 2, 3]
+        let ok: Handler = |s| { s.len() > 0 }
+        return dist2(origin, 2), ids.len(), ok("yes");
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 50.0);
+    assert_eq!(out[1].as_num().unwrap(), 3.0);
+    assert_eq!(out[2].to_string(), "true");
+}
+
+/// The same program with the annotations taken out has to mean the same
+/// thing, which is the whole promise of writing them down.
+#[test]
+fn a_program_means_the_same_with_the_types_removed() {
+    let typed = "fn add(a: number, b: number) -> number { a + b }\nlet n: number = add(2, 3)\nn";
+    let bare = "fn add(a, b) { a + b }\nlet n = add(2, 3)\nn";
+    let mut vm = Vm::new();
+    let a = vm.eval(typed).unwrap()[0].as_num().unwrap();
+    let mut vm = Vm::new();
+    let b = vm.eval(bare).unwrap()[0].as_num().unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a, 5.0);
+}
+
+/// The shapes the parser has to read, including the one nothing uses yet.
+#[test]
+fn every_written_type_parses() {
+    for src in [
+        "type A = number",
+        "type B = [string]",
+        "type C = [[number]]",
+        "type D = #{ a: number }",
+        "type E = #{ a: #{ b: [boolean] } }",
+        "type F = fn() -> nil",
+        "type G = fn(number, string) -> [number]",
+        "type H = fn(fn(number) -> number) -> number",
+        // generics have no meaning yet; the syntax is here so that giving
+        // them one is not a change to the grammar
+        "type I = Map<string, number>",
+        "type J = nil",
+    ] {
+        let out = rua_syntax::parser::parse(src);
+        assert!(out.is_ok(), "{src} did not parse: {:?}", out.err());
+    }
+    // and one that should not
+    assert!(rua_syntax::parser::parse("type K = ").is_err());
+}
+
+/// `type` is a keyword now, and `typeof` is the builtin that was called
+/// `type` before.
+#[test]
+fn typeof_answers_what_a_value_is() {
+    assert_eq!(s("typeof(1)"), "number");
+    assert_eq!(s("typeof(\"a\")"), "string");
+    assert_eq!(s("typeof(#{})"), "table");
+    assert_eq!(s("typeof([])"), "table", "one table type, two ways of writing one");
+    assert_eq!(s("typeof(nil)"), "nil");
+    // the annotation vocabulary is the same vocabulary
+    assert!(rua_syntax::parser::parse("let x: number = 1").is_ok());
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

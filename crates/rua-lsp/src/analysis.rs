@@ -781,7 +781,7 @@ fn token_kind(toks: &[Lexed], i: usize) -> Option<u32> {
         },
         Tok::Break | Tok::Continue | Tok::Else | Tok::False | Tok::Fn | Tok::For | Tok::If
         | Tok::In | Tok::Let | Tok::Loop | Tok::Match | Tok::Mut | Tok::Nil | Tok::Return
-        | Tok::True | Tok::While => KEYWORD,
+        | Tok::True | Tok::Type | Tok::While => KEYWORD,
         Tok::LParen | Tok::RParen | Tok::LBrace | Tok::RBrace | Tok::LBracket | Tok::RBracket
         | Tok::Semi | Tok::Comma | Tok::Hash => return None,
         _ => OPERATOR,
@@ -790,8 +790,12 @@ fn token_kind(toks: &[Lexed], i: usize) -> Option<u32> {
 
 const KEYWORDS: &[&str] = &[
     "break", "continue", "else", "false", "fn", "for", "if", "in", "let", "loop", "match", "mut",
-    "nil", "return", "true", "while",
+    "nil", "return", "true", "type", "while",
 ];
+
+/// The types that need no declaring, offered where a type is written.
+const BUILTIN_TYPES: &[&str] =
+    &["number", "string", "boolean", "nil", "table", "function", "any"];
 
 fn keyword_doc(t: &Tok) -> Option<&'static str> {
     Some(match t {
@@ -809,6 +813,7 @@ fn keyword_doc(t: &Tok) -> Option<&'static str> {
         Tok::Nil => "`nil` — the absence of a value.",
         Tok::In => "`in` — what a `for` walks.",
         Tok::Mut => "`mut` — allowed on a `let`, and means nothing: every binding is assignable.",
+        Tok::Type => "`type` — give a name to a shape: `type Point = #{ x: number, y: number }`.",
         Tok::True | Tok::False => "A boolean.",
         _ => return None,
     })

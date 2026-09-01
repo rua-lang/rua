@@ -212,6 +212,15 @@ impl Parser {
                 self.accept(Tok::Semi);
                 Ok(Item::Stat(Stat::Let(names, exprs)))
             }
+            // `type Point = #{ x: number, y: number }`
+            Tok::Type => {
+                self.bump();
+                let name = self.name()?;
+                self.expect(Tok::Assign)?;
+                let t = self.ty()?;
+                self.accept(Tok::Semi);
+                Ok(Item::Stat(Stat::TypeAlias(name, t)))
+            }
             Tok::Fn => {
                 self.bump();
                 let name = self.name()?;
@@ -327,13 +336,103 @@ impl Parser {
         matches!(self.peek(), Tok::RBrace | Tok::Eof)
     }
 
+    /// A type, as written. Everything here is optional in the grammar: a
+    /// program with no types in it parses exactly as it did.
+    fn ty(&mut self) -> PResult<Type> {
+        let start = self.span();
+        match self.peek().clone() {
+            // `[T]`
+            Tok::LBracket => {
+                self.bump();
+                let inner = self.ty()?;
+                let end = self.span();
+                self.expect(Tok::RBracket)?;
+                Ok(Type::Array(Box::new(inner), start.to(end)))
+            }
+            // `#{ x: number, y: number }`
+            Tok::Hash => {
+                self.bump();
+                self.expect(Tok::LBrace)?;
+                let mut fields = Vec::new();
+                while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+                    let name = self.name()?;
+                    self.expect(Tok::Colon)?;
+                    fields.push((name, self.ty()?));
+                    if !self.accept(Tok::Comma) {
+                        break;
+                    }
+                }
+                let end = self.span();
+                self.expect(Tok::RBrace)?;
+                Ok(Type::Record(fields, start.to(end)))
+            }
+            // `fn(A, B) -> C`
+            Tok::Fn => {
+                self.bump();
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                while *self.peek() != Tok::RParen && *self.peek() != Tok::Eof {
+                    args.push(self.ty()?);
+                    if !self.accept(Tok::Comma) {
+                        break;
+                    }
+                }
+                let mut end = self.span();
+                self.expect(Tok::RParen)?;
+                let ret = if self.accept(Tok::Arrow) {
+                    let r = self.ty()?;
+                    end = r.span();
+                    Some(Box::new(r))
+                } else {
+                    None
+                };
+                Ok(Type::Fn(args, ret, start.to(end)))
+            }
+            // `nil` is a type as well as a value
+            Tok::Nil => {
+                self.bump();
+                Ok(Type::Named("nil".into(), Vec::new(), start))
+            }
+            Tok::Name(n) => {
+                self.bump();
+                // `Map<K, V>` — nothing generic exists yet, and the shape is
+                // here so that adding it is not a change to this
+                let mut args = Vec::new();
+                let mut end = start;
+                if *self.peek() == Tok::Lt {
+                    self.bump();
+                    while *self.peek() != Tok::Gt && *self.peek() != Tok::Eof {
+                        args.push(self.ty()?);
+                        if !self.accept(Tok::Comma) {
+                            break;
+                        }
+                    }
+                    end = self.span();
+                    self.expect(Tok::Gt)?;
+                }
+                Ok(Type::Named(n.into(), args, start.to(end)))
+            }
+            other => self.err(format!("expected a type, found {other}")),
+        }
+    }
+
+    /// `: T` after a name, when one was written.
+    fn annotation(&mut self) -> PResult<Option<Type>> {
+        if self.accept(Tok::Colon) {
+            return Ok(Some(self.ty()?));
+        }
+        Ok(None)
+    }
+
     fn let_pattern(&mut self) -> PResult<Vec<Name>> {
         self.accept(Tok::Mut);
         if self.accept(Tok::LParen) {
             let mut names = Vec::new();
             loop {
                 self.accept(Tok::Mut);
-                names.push(self.name()?);
+                let mut n = self.name()?;
+                n.ty = self.annotation()?;
+                names.push(n);
                 if !self.accept(Tok::Comma) {
                     break;
                 }
@@ -341,7 +440,9 @@ impl Parser {
             self.expect(Tok::RParen)?;
             Ok(names)
         } else {
-            Ok(vec![self.name()?])
+            let mut n = self.name()?;
+            n.ty = self.annotation()?;
+            Ok(vec![n])
         }
     }
 
@@ -351,23 +452,22 @@ impl Parser {
         if !self.accept(Tok::RParen) {
             loop {
                 self.accept(Tok::Mut);
-                params.push(self.name()?);
+                let mut p = self.name()?;
+                p.ty = self.annotation()?;
+                params.push(p);
                 if !self.accept(Tok::Comma) {
                     break;
                 }
             }
             self.expect(Tok::RParen)?;
         }
-        // an optional `-> T` is accepted and ignored: rua is dynamically typed
-        if self.accept(Tok::Arrow) {
-            self.name()?;
-        }
+        let ret = if self.accept(Tok::Arrow) { Some(self.ty()?) } else { None };
         // `break` does not cross a function boundary
         let outer_loops = std::mem::take(&mut self.loops);
         let body = self.block();
         self.loops = outer_loops;
         let body = body?;
-        Ok(Expr::Func(Rc::new(FuncDef::new(name, params, body, line))))
+        Ok(Expr::Func(Rc::new(FuncDef::typed(name, params, body, ret, line))))
     }
 
     fn closure(&mut self) -> PResult<Expr> {

@@ -79,6 +79,76 @@ impl Span {
     }
 }
 
+/// A type, as it was written.
+///
+/// Written types are kept as written — `Named` carries whatever word stood
+/// there, and resolving it to something known is a later pass's business.
+/// The arguments beside it are empty today and are where `Map<K, V>` will go,
+/// so that adding generics is filling them in rather than reshaping this.
+#[derive(Debug, Clone)]
+pub enum Type {
+    /// `number`, `string`, a name declared with `type`, or a parameter of one.
+    Named(Rc<str>, Vec<Type>, Span),
+    /// `[T]`
+    Array(Box<Type>, Span),
+    /// `#{ x: number, y: number }` — a shape, not a name for one.
+    Record(Vec<(Name, Type)>, Span),
+    /// `fn(A, B) -> C`, and `-> nil` when it hands nothing back.
+    Fn(Vec<Type>, Option<Box<Type>>, Span),
+}
+
+impl Type {
+    pub fn span(&self) -> Span {
+        match self {
+            Type::Named(_, _, s) | Type::Array(_, s) | Type::Record(_, s) | Type::Fn(_, _, s) => *s,
+        }
+    }
+}
+
+impl std::fmt::Display for Type {
+    /// The way it was written, which is what an editor shows.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::Named(n, args, _) => {
+                write!(f, "{n}")?;
+                if let Some((first, rest)) = args.split_first() {
+                    write!(f, "<{first}")?;
+                    for a in rest {
+                        write!(f, ", {a}")?;
+                    }
+                    write!(f, ">")?;
+                }
+                Ok(())
+            }
+            Type::Array(t, _) => write!(f, "[{t}]"),
+            Type::Record(fields, _) => {
+                write!(f, "#{{ ")?;
+                for (i, (name, t)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{name}: {t}")?;
+                }
+                write!(f, " }}")
+            }
+            Type::Fn(args, ret, _) => {
+                write!(f, "fn(")?;
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{a}")?;
+                }
+                write!(f, ")")?;
+                match ret {
+                    Some(r) => write!(f, " -> {r}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
 /// A name as it was written, and where.
 ///
 /// Names are what an editor asks about — where is this declared, what else
@@ -89,11 +159,19 @@ impl Span {
 pub struct Name {
     pub text: Rc<str>,
     pub span: Span,
+    /// The type written beside it, if one was. It rides here because a name
+    /// is written wherever a binding is — a parameter, a `let`, a field — and
+    /// putting it anywhere else would mean reshaping all of those.
+    pub ty: Option<Type>,
 }
 
 impl Name {
     pub fn new(text: impl Into<Rc<str>>, span: Span) -> Name {
-        Name { text: text.into(), span }
+        Name { text: text.into(), span, ty: None }
+    }
+
+    pub fn typed(text: impl Into<Rc<str>>, span: Span, ty: Option<Type>) -> Name {
+        Name { text: text.into(), span, ty }
     }
 }
 
@@ -198,6 +276,9 @@ pub enum Stat {
     FnDecl(Name, Expr),
     /// `fn` after resolution.
     FnSlot(Binding, Expr),
+    /// `type Name = T`. Nothing runs it; it is read by the checker and by the
+    /// editor, and the compiler steps over it.
+    TypeAlias(Name, Type),
     Assign(Vec<Expr>, Vec<Expr>),
     /// A compound assignment such as `x += 1`.
     OpAssign(Expr, BinOp, Expr),
@@ -247,6 +328,8 @@ pub struct FuncDef {
     pub name: String,
     pub params: Vec<Name>,
     pub body: Block,
+    /// What it hands back, if that was written.
+    pub ret: Option<Type>,
     pub line: u32,
     /// Filled in by `resolve`: frame size, parameter bindings, and where each
     /// captured upvalue comes from.
@@ -265,11 +348,22 @@ pub fn next_loop_id() -> u32 {
 
 impl FuncDef {
     pub fn new(name: String, params: Vec<Name>, body: Block, line: u32) -> Self {
+        FuncDef::typed(name, params, body, None, line)
+    }
+
+    pub fn typed(
+        name: String,
+        params: Vec<Name>,
+        body: Block,
+        ret: Option<Type>,
+        line: u32,
+    ) -> Self {
         FuncDef {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             params,
             body,
+            ret,
             line,
             n_slots: 0,
             param_bindings: Vec::new(),
