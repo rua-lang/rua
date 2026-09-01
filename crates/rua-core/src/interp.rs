@@ -1557,20 +1557,29 @@ unsafe fn spans_of(
     if let Some(cached) = (*outer.as_ptr()).cached_spans(rua_core_shape_epoch()) {
         *len = cached.1;
         if writable {
-            // the views are still good, but this call has to say which tables
-            // it may write, so that they are committed or rolled back
-            for k in 0..cached.1 {
-                if let Some(Value::Table(e)) = (*outer.as_ptr()).get_num(k as f64) {
-                    note_dirty(Rc::as_ptr(e));
+            // The views are still good, but this call has to say which tables
+            // it may write, so that they are committed or rolled back. One
+            // borrow of the list for the whole array: reaching for the
+            // thread local once per element was most of what was left of
+            // n-body's call overhead.
+            DIRTY.with(|d| {
+                let mut d = d.borrow_mut();
+                for k in 0..cached.1 {
+                    if let Some(Value::Table(e)) = (*outer.as_ptr()).at(k) {
+                        let t = Rc::as_ptr(e);
+                        if !d.iter().any(|e| e.table == t) {
+                            d.push(Dirty { table: t, appended_from: None });
+                        }
+                    }
                 }
-            }
+            });
         }
         return cached.0;
     }
     let n = (*outer.as_ptr()).len();
     let mut out: Vec<rua_jit::RtSpan> = Vec::with_capacity(n);
     for k in 0..n {
-        let elem = match (*outer.as_ptr()).get_num(k as f64) {
+        let elem = match (*outer.as_ptr()).at(k) {
             Some(Value::Table(e)) => e.clone(),
             _ => {
                 *ok = 0;

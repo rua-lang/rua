@@ -779,7 +779,16 @@ impl Table {
     /// This is the hot path for every `t[i]` in the language, so it avoids
     /// building a `Key` and avoids `fract()` — the cast round trip is both the
     /// integer test and the index.
+
+    /// The element at a machine index in the array part. Callers that
+    /// already count in `usize` — walking an array of arrays, say — would
+    /// otherwise turn the count into an `f64` only for `get_num` to turn it
+    /// straight back, which is a dozen instructions per element.
     #[inline]
+    pub fn at(&self, i: usize) -> Option<&Value> {
+        self.arr.get(i)
+    }
+
     pub fn get_num(&self, n: f64) -> Option<&Value> {
         let i = n as usize;
         if i as f64 == n {

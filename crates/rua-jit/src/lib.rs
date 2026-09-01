@@ -386,10 +386,14 @@ impl Jit {
         let bools = boolean_locals(&wrapper, &HashSet::new());
         let usage = table_usage(&wrapper);
         let writes = usage.traps_forbidden();
-        let mutable_views = usage.writes_tables(&kinds);
+        let mutable_views = usage.mutable_slots(&inner_of, &kinds);
         relax_checks(&mut kinds, writes);
-        // in a loop there are no parameters, so nothing is stable by that route
-        let stable: HashSet<u16> = HashSet::new();
+        // A loop has no parameters, but its registers are loaded once on the
+        // way in, so any of them the region never assigns to is every bit as
+        // stable as one: `for k in 0..n` inside a compiled loop proves `t[k]`
+        // exactly the way it does inside a compiled function.
+        let stable: HashSet<u16> =
+            slots.iter().copied().filter(|s| !writes_slot(&wrapper, *s)).collect();
         let mut dead = dead_on_entry(&wrapper);
         // The loop being compiled is entered at its back edge, not at its
         // head, so its own counter is live there however the body reads it.
@@ -424,10 +428,11 @@ impl Jit {
             inlined: Vec::new(),
             self_param_kinds: Vec::new(),
             writes,
-            mutable_views,
+            mutable_views: mutable_views.clone(),
             bools,
             spans_used: HashSet::new(),
             to_inline: Vec::new(),
+            calls: false,
             kinds,
             inner_of,
             len_of: length_locals(&wrapper),
@@ -516,7 +521,7 @@ impl Jit {
                     let (_, len) = span_idents(*slot);
                     let all = if spans_used.contains(slot) {
                         let (sp, spn) = spans_idents(*slot);
-                        let fetch = if mutable_views {
+                        let fetch = if mutable_views.contains(slot) {
                             quote! { rua_spans_mut(rt, #id, &mut #spn, ok) }
                         } else {
                             quote! { rua_spans(rt, #id, &mut #spn, ok) }
@@ -541,7 +546,7 @@ impl Jit {
                 }
                 Kind::Table => {
                     let (ptr, len) = span_idents(*slot);
-                    let fetch = if mutable_views {
+                    let fetch = if mutable_views.contains(slot) {
                         quote! { let #ptr: *mut f64 = rua_span_mut(rt, #id, &mut #len, ok); }
                     } else {
                         quote! { let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok); }
@@ -555,6 +560,24 @@ impl Jit {
                 }
             }
         });
+        // One length check per (table, bound) pair, all before any body code.
+        // A loop collects these the same way a function does, and until it
+        // emitted them a constant index inside a compiled loop — `perm[0]` —
+        // read through the view without anything having said the view was
+        // that long.
+        let checks: Vec<TokenStream> = cx
+            .hoisted
+            .iter()
+            .map(|(slot, bound)| {
+                let len = proof_len(*slot, &cx.kinds, &spans_used);
+                quote! {
+                    if (#bound).ceil() > (#len as f64) {
+                        *ok = 0;
+                        return;
+                    }
+                }
+            })
+            .collect();
         let stores = slots.iter().zip(&kind_list).enumerate().filter_map(|(i, (slot, kind))| {
             // a table is mutated in place through the runtime, so only numbers
             // have to travel back into the registers
@@ -582,6 +605,7 @@ impl Jit {
                 ok: *mut i32,
             ) {
                 #(#loads)*
+                #(#checks)*
                 #body
                 #(#stores)*
             }
@@ -721,7 +745,7 @@ impl Jit {
         );
         let usage = table_usage(&def.body);
         let writes = usage.traps_forbidden();
-        let mutable_views = usage.writes_tables(&kinds);
+        let mutable_views = usage.mutable_slots(&inner_of, &kinds);
         relax_checks(&mut kinds, writes);
         // Only parameters may be tables — except an element of an array of
         // arrays, which is a local by construction: `let b = bodies[i]`.
@@ -776,10 +800,11 @@ impl Jit {
             inlined: Vec::new(),
             self_param_kinds: param_kinds.clone(),
             writes,
-            mutable_views,
+            mutable_views: mutable_views.clone(),
             bools,
             spans_used: HashSet::new(),
             to_inline: Vec::new(),
+            calls: false,
             kinds,
             inner_of,
             len_of: length_locals(&def.body),
@@ -820,7 +845,7 @@ impl Jit {
                     let (_, len) = span_idents(b.slot);
                     let all = if cx.spans_used.contains(&b.slot) {
                         let (sp, spn) = spans_idents(b.slot);
-                        let fetch = if cx.mutable_views {
+                        let fetch = if cx.mutable_views.contains(&b.slot) {
                             quote! { rua_spans_mut(rt, #id, &mut #spn, ok) }
                         } else {
                             quote! { rua_spans(rt, #id, &mut #spn, ok) }
@@ -845,7 +870,7 @@ impl Jit {
                 }
                 Kind::Table => {
                     let (ptr, len) = span_idents(b.slot);
-                    let fetch = if cx.mutable_views {
+                    let fetch = if cx.mutable_views.contains(&b.slot) {
                         quote! { let #ptr: *mut f64 = rua_span_mut(rt, #id, &mut #len, ok); }
                     } else {
                         quote! { let #ptr: *const f64 = rua_span(rt, #id, &mut #len, ok); }
@@ -885,7 +910,7 @@ impl Jit {
                         }
                     };
                 }
-                let (_, len) = span_idents(*slot);
+                let len = proof_len(*slot, &cx.kinds, &cx.spans_used);
                 quote! {
                     if (#bound).ceil() > (#len as f64) {
                         *ok = 0;
@@ -896,39 +921,65 @@ impl Jit {
             .collect();
         let name = format_ident!("{}", symbol);
         let preamble = preamble();
-        let file = quote! {
-            #preamble
+        // Recursion here is real machine recursion, so it has to respect the
+        // interpreter's limit rather than run the process out of stack.
+        // Tripping it before anything else happens keeps the trap safe:
+        // nothing has been written yet. A body that calls nothing cannot
+        // recurse, and then the counter is four memory operations per call
+        // spent proving that — spectral norm's kernel is called once per
+        // element, so it is the call.
+        let file = if cx.calls {
+            quote! {
+                #preamble
 
-            /// # Safety
-            /// `args` points at one `RtArg` per parameter, `rt` at the context
-            /// built for this function, `ok` at an `i32` that starts non-zero,
-            /// and `__ret` at a table pointer this code writes only if its
-            /// value is a table it made.
-            #[no_mangle]
-            pub unsafe extern "C" fn #name(
-                args: *const RtArg,
-                rt: *const RtCtx,
-                ok: *mut i32,
-                __ret: *mut *mut c_void,
-            ) -> f64 {
-                // Recursion here is real machine recursion, so it has to
-                // respect the interpreter's limit rather than run the process
-                // out of stack. Tripping it before anything else happens keeps
-                // the trap safe: nothing has been written yet.
-                let __depth = (*rt).depth;
-                *__depth += 1;
-                if *__depth > (*rt).max_depth {
+                /// # Safety
+                /// `args` points at one `RtArg` per parameter, `rt` at the
+                /// context built for this function, `ok` at an `i32` that
+                /// starts non-zero, and `__ret` at a table pointer this code
+                /// writes only if its value is a table it made.
+                #[no_mangle]
+                pub unsafe extern "C" fn #name(
+                    args: *const RtArg,
+                    rt: *const RtCtx,
+                    ok: *mut i32,
+                    __ret: *mut *mut c_void,
+                ) -> f64 {
+                    let __depth = (*rt).depth;
+                    *__depth += 1;
+                    if *__depth > (*rt).max_depth {
+                        *__depth -= 1;
+                        *ok = 0;
+                        return 0.0;
+                    }
+                    let __out = (|| -> f64 {
+                        #(#prologue)*
+                        #(#checks)*
+                        #body
+                    })();
                     *__depth -= 1;
-                    *ok = 0;
-                    return 0.0;
+                    __out
                 }
-                let __out = (|| -> f64 {
-                    #(#prologue)*
-                    #(#checks)*
-                    #body
-                })();
-                *__depth -= 1;
-                __out
+            }
+        } else {
+            quote! {
+                #preamble
+
+                /// # Safety
+                /// As above, for a function that calls nothing and so cannot
+                /// recurse.
+                #[no_mangle]
+                pub unsafe extern "C" fn #name(
+                    args: *const RtArg,
+                    rt: *const RtCtx,
+                    ok: *mut i32,
+                    __ret: *mut *mut c_void,
+                ) -> f64 {
+                    (|| -> f64 {
+                        #(#prologue)*
+                        #(#checks)*
+                        #body
+                    })()
+                }
             }
         };
         let parsed: syn::File =
@@ -2221,6 +2272,46 @@ fn preamble() -> TokenStream {
             if b { 1.0 } else { 0.0 }
         }
 
+        /// A float index whose range is already settled, turned into an
+        /// offset.
+        ///
+        /// `as usize` on an `f64` saturates, and saturating is ten
+        /// instructions of compare-and-move that the inner loop of every
+        /// benchmark paid on every element. Every caller here has just
+        /// proved — or just checked — that the value is a whole number in
+        /// `0..len`, so the plain truncation is all that is wanted.
+        ///
+        /// A float truncated towards zero, with whatever the machine says
+        /// for the values that do not fit.
+        ///
+        /// `as i64` in Rust saturates, which is six instructions of
+        /// compare-and-move around the one that does the work. Every caller
+        /// here goes on to reject the result unless it lands inside a view,
+        /// and `i64::MIN` — which is what x86 hands back for a NaN, an
+        /// infinity or anything too large — never does. So the raw
+        /// instruction answers the question the saturating cast was answering
+        /// more slowly.
+        #[cfg(target_arch = "x86_64")]
+        #[inline(always)]
+        fn rua_trunc(i: f64) -> i64 {
+            unsafe {
+                std::arch::x86_64::_mm_cvttsd_si64(std::arch::x86_64::_mm_set_sd(i))
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        #[inline(always)]
+        fn rua_trunc(i: f64) -> i64 {
+            i as i64
+        }
+
+        /// A float index whose range is already settled, turned into an
+        /// offset.
+        #[inline(always)]
+        fn rua_idx(i: f64) -> usize {
+            rua_trunc(i) as usize
+        }
+
         /// # Safety
         /// `t` is a live table pointer, and `rt` the context we were called
         /// with.
@@ -2408,7 +2499,7 @@ struct Ctx {
     to_inline: Vec<std::rc::Rc<FuncDef>>,
     /// Does this code write through its views? They are fetched writable if
     /// so, and the runtime keeps or discards what was written.
-    mutable_views: bool,
+    mutable_views: HashSet<u16>,
     /// Slots bound by `let b = t[i]` where the elements are tables, and the
     /// array they came from. Their view is fetched where they are bound rather
     /// than on entry.
@@ -2432,6 +2523,11 @@ struct Ctx {
     /// trapping back to the interpreter would run those writes twice, so every
     /// read has to be provably in range instead.
     writes: bool,
+    /// Did anything in this body turn into a machine call to other compiled
+    /// code? A body that makes none cannot recurse, so it need not keep the
+    /// interpreter's depth counter — which is a load, a store, a compare and
+    /// a second store on every call, and spectral norm makes one per element.
+    calls: bool,
     /// Loop variables known to be a valid index into a given table, from
     /// `for i in 0..t.len()`.
     in_range: Vec<(u16, u16)>,
@@ -2531,14 +2627,34 @@ impl TableUse {
         false
     }
 
-    /// Does this code write *through a view*? Only a table it reads that way
-    /// can be. One it appends to — an output, or one it made — is written
-    /// through the runtime, which is why filling a fresh table leaves the
-    /// tables this code reads alone.
-    fn writes_tables(&self, kinds: &HashMap<u16, Kind>) -> bool {
-        self.written
+    /// Which tables this code writes *through a view*. Only those are handed
+    /// to it as writable views: a writable view is committed back over the
+    /// table's array part when the call ends, and doing that for a table
+    /// nobody wrote is a copy of the whole array for nothing. `matmul` reads a
+    /// two hundred row matrix inside a loop it enters two hundred times, and
+    /// committing those rows on every exit was a third of the benchmark.
+    ///
+    /// Writing an element of an array of arrays writes the array too, so an
+    /// outer table joins the set when any element bound out of it is written.
+    /// A table this code appends to — an output, or one it made — is written
+    /// through the runtime rather than a view, and stays out.
+    fn mutable_slots(
+        &self,
+        inner_of: &HashMap<u16, u16>,
+        kinds: &HashMap<u16, Kind>,
+    ) -> HashSet<u16> {
+        let mut out: HashSet<u16> = self
+            .written
             .iter()
-            .any(|s| !matches!(kinds.get(s), Some(Kind::TableOut) | Some(Kind::New)))
+            .copied()
+            .filter(|s| !matches!(kinds.get(s), Some(Kind::TableOut) | Some(Kind::New)))
+            .collect();
+        for (inner, outer) in inner_of {
+            if self.written.contains(inner) {
+                out.insert(*outer);
+            }
+        }
+        out
     }
 }
 
@@ -2743,6 +2859,24 @@ fn writes_slot_expr(e: &Expr, slot: u16) -> bool {
 }
 
 /// The pointer and length holding a table slot's array view.
+/// What a hoisted length check compares against.
+///
+/// For a flat table that is the view's length. For an array of arrays it is
+/// the number of element views, which is what the body actually indexes —
+/// and which need not equal the table's own length, since a view survives an
+/// append that leaves the storage where it was.
+fn proof_len(
+    slot: u16,
+    kinds: &HashMap<u16, Kind>,
+    spans_used: &HashSet<u16>,
+) -> proc_macro2::Ident {
+    if matches!(kinds.get(&slot), Some(Kind::Tables { .. })) && spans_used.contains(&slot) {
+        spans_idents(slot).1
+    } else {
+        span_idents(slot).1
+    }
+}
+
 fn spans_idents(slot: u16) -> (proc_macro2::Ident, proc_macro2::Ident) {
     (format_ident!("__sp{}", slot), format_ident!("__spn{}", slot))
 }
@@ -2848,8 +2982,9 @@ impl Ctx {
                     let mut #ptr: *mut f64 = std::ptr::null_mut();
                     {
                         let __k = #i;
-                        let __u = __k as usize;
-                        if __k < 0.0 || __k.fract() != 0.0 || __u >= #spn {
+                        let __kk = rua_trunc(__k);
+                        let __u = __kk as usize;
+                        if __u >= #spn || (__kk as f64) != __k {
                             unsafe { *ok = 0; }
                         } else {
                             let __e = unsafe { *#sp.add(__u) };
@@ -2950,12 +3085,12 @@ impl Ctx {
                 if self.proven_in_range(key, slot) {
                     let (ptr, _) = span_idents(slot);
                     let _ = &id;
-                    quote! { unsafe { *#ptr.add((#i) as usize) = #v; } }
+                    quote! { unsafe { *#ptr.add(rua_idx(#i)) = #v; } }
                 } else if self.writes {
                     // this code may not bail out part way, so an index it
                     // cannot vouch for is not compilable
                     return Err("an unproven index in code that cannot trap".into());
-                } else if self.mutable_views {
+                } else if self.mutable_views.contains(&slot) {
                     // The index cannot be vouched for, so it is tested here:
                     // inside the array part the write is a store through the
                     // view, and anywhere else — growing the table, or landing
@@ -2966,9 +3101,10 @@ impl Ctx {
                     quote! {
                         {
                             let __i = #i;
-                            let __u = __i as usize;
+                            let __k = rua_trunc(__i);
+                            let __u = __k as usize;
                             let __v = #v;
-                            if __i < 0.0 || __i.fract() != 0.0 || __u >= #len {
+                            if __u >= #len || (__k as f64) != __i {
                                 unsafe { *ok = 0; }
                                 #trap
                             }
@@ -3393,23 +3529,36 @@ impl Ctx {
                         _ => return Err("an unproven index inside an array of arrays".into()),
                     }
                 }
+                // `for k in 0..n` indexing `t[k][j]` proves the outer index
+                // the same way it proves a flat one: one length check on the
+                // way in stands for every element the loop reaches.
+                let outer_proven = self.proven_in_range(&k, slot);
                 let ki = self.expr(&k)?;
                 let j = self.expr(key)?;
                 let _ = &outer;
                 self.spans_used.insert(slot);
                 let (sp, spn) = spans_idents(slot);
-                quote! {
-                    {
+                let pick = if outer_proven {
+                    quote! { let __e = unsafe { *#sp.add(rua_idx(#ki)) }; }
+                } else {
+                    quote! {
                         let __k = #ki;
-                        let __ku = __k as usize;
-                        if __k < 0.0 || __k.fract() != 0.0 || __ku >= #spn {
+                        let __kk = rua_trunc(__k);
+                        let __ku = __kk as usize;
+                        if __ku >= #spn || (__kk as f64) != __k {
                             unsafe { *ok = 0; }
                             #trap
                         }
                         let __e = unsafe { *#sp.add(__ku) };
+                    }
+                };
+                quote! {
+                    {
+                        #pick
                         let __j = #j;
-                        let __u = __j as usize;
-                        if __j < 0.0 || __j.fract() != 0.0 || __u >= __e.len {
+                        let __jk = rua_trunc(__j);
+                        let __u = __jk as usize;
+                        if __u >= __e.len || (__jk as f64) != __j {
                             unsafe { *ok = 0; }
                             #trap
                         }
@@ -3428,7 +3577,7 @@ impl Ctx {
                 // what lets a function that writes read at all
                 if self.proven_in_range(key, slot) {
                     let i = self.expr(key)?;
-                    quote! { unsafe { *#ptr.add((#i) as usize) } }
+                    quote! { unsafe { *#ptr.add(rua_idx(#i)) } }
                 } else {
                     if self.writes {
                         return Err("an unproven index in code that also writes".into());
@@ -3438,8 +3587,9 @@ impl Ctx {
                     quote! {
                         {
                             let __i = #i;
-                            let __u = __i as usize;
-                            if __i < 0.0 || __i.fract() != 0.0 || __u >= #len {
+                            let __k = rua_trunc(__i);
+                            let __u = __k as usize;
+                            if __u >= #len || (__k as f64) != __i {
                                 unsafe { *ok = 0; }
                                 #trap
                             }
@@ -3742,6 +3892,7 @@ impl Ctx {
                 }
             }
             let trap = self.on_trap.clone();
+            self.calls = true;
             return Ok(quote! {
                 {
                     let __args = [#(#cells),*];
@@ -3770,6 +3921,7 @@ impl Ctx {
                         let a: Vec<_> =
                             args.iter().map(|x| self.expr(x)).collect::<Lower<_>>()?;
                         let trap = self.on_trap.clone();
+                        self.calls = true;
                         return Ok(quote! {
                             {
                                 let __args = [
@@ -3848,6 +4000,7 @@ impl Ctx {
                     }
                     if ok {
                         let trap = self.on_trap.clone();
+                        self.calls = true;
                         let index = match self.inlined.iter().position(|n| n == &**name) {
                             Some(i) => i,
                             None => {

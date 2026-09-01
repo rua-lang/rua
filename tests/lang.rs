@@ -848,6 +848,60 @@ fn invalidation_reaches_indirect_callers() {
     }
 }
 
+/// A constant index inside a compiled loop is proved once, on the way in.
+/// Until the loop emitted that proof it indexed the view without it, and read
+/// past the end of a table that turned out to be shorter.
+#[test]
+fn a_hot_loop_proves_its_constant_indexes_on_entry() {
+    let src = r#"
+        let t = [7.0]
+        let s = 0.0
+        let i = 0
+        while i < 400 {
+            if i == 399 { s += t[3] } else { s += t[0] }
+            i += 1
+        }
+        s
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    assert!(interp.eval(src).is_err(), "the interpreter refuses a nil");
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    assert!(jitted.eval(src).is_err(), "and compiled code must refuse it too");
+}
+
+/// `for k in 0..n` indexing `m[k][0]` is proved against the number of element
+/// views, once, on entry — so a bound longer than the array traps there
+/// rather than walking off the end of it.
+#[test]
+fn a_proven_outer_index_is_checked_against_the_views_it_uses() {
+    let src = r#"
+        fn sum(m, n) {
+            let s = 0.0
+            for k in 0..n { s += m[k][0] }
+            s
+        }
+        let m = []
+        for i in 0..4 { let r = []; r.push(i + 1.0); r.push(0.0); m.push(r) }
+        let t = 0.0
+        for i in 0..400 { t += sum(m, 4) }
+        let (ok, why) = try(|| sum(m, 6))
+        return t, ok
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let want = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 5;
+    let got = jitted.eval(src).unwrap();
+    assert_eq!(want[1], Value::Bool(false), "the interpreter should refuse");
+    assert_eq!(got[0], want[0], "the sums agree");
+    assert_eq!(got[1], want[1], "and so does the refusal");
+}
+
 /// Compiled recursion is real machine recursion, so it has to stop where the
 /// interpreter stops instead of running the process out of stack.
 #[test]
