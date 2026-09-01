@@ -294,29 +294,28 @@ recursion, and none of that is anything `rustc` can be handed.
 
 | | rua interp | rua + JIT | lua 5.4 | luajit | vs luajit |
 |---|---|---|---|---|---|
-| n-body | 1.17s | **0.049s** | 0.474s | 0.042s | **1.17x** |
-| spectral norm | 1.19s | **0.053s** | 0.620s | 0.028s | 1.89x |
-| n-queens | 0.13s | **0.040s** | 0.073s | 0.020s | 2.00x |
-| fannkuch | 0.59s | **0.106s** | 0.278s | 0.052s | 2.04x |
-| matrix multiply | 0.35s | **0.068s** | 0.173s | 0.018s | 3.78x |
-| binary trees | 4.04s | 4.02s | 3.296s | 1.423s | 2.82x |
-| word frequency | 0.15s | 0.14s | 0.068s | 0.043s | 3.35x |
-| Scheme interpreter | 3.00s | 2.96s | 1.370s | 0.551s | 5.38x |
+| n-body | 1.04s | **0.034s** | 0.488s | 0.042s | **0.80x** |
+| n-queens | 0.14s | **0.022s** | 0.062s | 0.020s | **1.10x** |
+| fannkuch | 0.60s | **0.050s** | 0.271s | 0.042s | **1.19x** |
+| spectral norm | 1.15s | **0.035s** | 0.624s | 0.025s | 1.40x |
+| matrix multiply | 0.48s | **0.025s** | 0.168s | 0.017s | 1.47x |
+| binary trees | 2.61s | 2.59s | 3.281s | 1.430s | 1.81x |
+| word frequency | 0.11s | 0.11s | 0.059s | 0.035s | 3.11x |
+| Scheme interpreter | 1.99s | 2.01s | 1.376s | 0.564s | 3.52x |
 
-**Five of the eight are faster than Lua 5.4** — n-body and spectral norm by
-about 10x, the rest by 1.8x to 2.6x — and n-body is within 17% of LuaJIT.
+**Six of the eight beat Lua 5.4**, and n-body is faster than LuaJIT. The five
+the compiler takes are 0.80x to 1.47x of it; the three it cannot are 1.8x to
+3.5x, and those are the interpreter.
 
 Read that honestly. **Where the JIT applies it is decisive**, and **where it
-does not, rua is its interpreter** — 1.2x to 2.2x slower than Lua 5.4, and 2.8x
-to 5.4x off LuaJIT. That gap is the value representation, and it does not have
-an easy answer.
+does not, rua is its interpreter** — which now beats Lua 5.4 on binary trees
+and is within 1.5x on the other two.
 
-What keeps the last three out of the compiler is now one thing: **values that
-are not numbers or arrays of them.**
+What keeps the last three out of the compiler is one thing: **values that are
+not numbers or arrays of them.**
 
 * **Strings.** Word frequency builds an array of words and joins them; the
-  Scheme's reader walks a string a byte at a time. A compiled value is an
-  `f64`, so neither has anything the compiler can hold.
+  Scheme's reader walks a string a byte at a time.
 * **Maps.** Binary trees is made of `#{ left: .., right: .. }` — keyed
   entries, where the compiler understands the array part.
 * **Closures**, which the Scheme's evaluator is built on.
@@ -328,58 +327,47 @@ builds a matrix a row at a time and hands it back, and compiles.
 ### What the interpreter's time actually goes on
 
 Every claim here was measured by making the change and running the suite, and
-several plausible ones were thrown away for measuring zero.
+a good many plausible ones were thrown away for measuring zero or worse.
 
-* **Dispatch is not the problem.** The `match` costs 5.3% of cycles at a 0.010%
-  branch-miss rate (Lua's own is 0.024%). Threaded dispatch with computed goto
-  is not worth doing here, and an earlier version of this file said otherwise.
-* **Values that are only compared should not be copied.** `==` and `!=` went
-  through the generic arithmetic path, which takes ownership: a reference count
-  up and back down on each side of every comparison that was not between two
-  numbers. `x != nil` and `op == "quote"` are the inner loop of anything that
-  inspects data. Worth 13% on the Scheme.
-* **Drop glue is not free.** Writing a register was `*slot = v`, which always
-  calls `Value`'s destructor out of line — too big for LLVM to inline into
-  every register write. Most values written over own nothing, so testing the
-  tag first is worth 10%.
-* **A call's results should stay in registers.** Returning from a call in tail
-  position went through a pooled vector: six vector operations and four clones
-  to move one number one frame down. In registers instead, that is a move.
-* **Operands should be addressed from a register, not from memory.** Reading
-  `self.stack[self.base + r]` reloads the vector's pointer and the frame's base
-  at every operand, because `self` is behind a mutable reference the handlers
-  write through. Holding both in locals cut 10% of instructions and 42% of
-  branch misses.
-* **Calling a builtin allocated twice** — once for a copy of the arguments,
-  once for the result — and freed both again. Both come from a pool now.
-* **String interning does pay**, by 6.5% on the Scheme and 17% on word
-  frequency. An earlier version of this file said it measured zero; that
-  measurement was taken against a binary that had not been rebuilt, because
-  `cargo build --release` in this workspace builds the library and not the CLI.
-  The lesson was cheap and the correction is the point of writing numbers down.
-* **Instruction count beat instruction cost on counted loops.** `for i in 0..n`
-  spent three instructions an iteration where Lua spends one, because Lua fuses
-  the step, the test and the jump. Fusing it too took a counting loop from 1.91G
-  host instructions to 1.17G, against Lua's 0.69G.
-* **A call should not copy its arguments.** Lua's callee registers *are* the
-  caller's argument slots. rua opened a fresh window above everything and moved
-  each argument into it; now the frame opens on the arguments and the common
-  call binds nothing at all.
-* **Not clearing a returning frame's registers** would be worth about 2.5%, and
-  is not taken: reference counting makes a stale slot a leak rather than the
-  delayed collection it would be under a GC.
+* **Dispatch is not the problem.** The `match` costs about 8% of the
+  instructions at a 0.89% branch-miss rate, with an IPC of 2.5. It is
+  throughput bound, so the only lever is executing fewer instructions.
+* **Reference counting is worth 1.2x, not the 1.3x this file used to claim.**
+  A probe that removes it outright — leaking everything — measures the whole
+  remaining prize at 1.17x to 1.23x, and part of even that is `free`, which a
+  collector inherits rather than deletes. What was reachable without one was a
+  long list of handles the work never needed: receivers, index objects,
+  constant keys and arithmetic operands that were counted in and back out to be
+  looked at. Those are gone.
+* **A call is where an interpreted program lives.** Loading a callee from a
+  global into a register that the next instruction takes straight back out is
+  one instruction now; a call names the register its result belongs in; a
+  spread consumes the results where they already sit; binding parameters is
+  skipped when nothing is captured.
+* **Two allocations per object was one too many.** A table with fields paid for
+  an `Rc` and a `Vec` whose minimum capacity is four entries. The keyed part
+  keeps two inline, and the fields only a large or compiled-over table needs
+  moved behind one box: binary trees went from 1.51 mallocs per node to 1.01.
+* **The allocator itself was 15%** of binary trees. The `rua` binary brings its
+  own; the library crates do not, because an embedder's allocator is theirs.
+* **Values that are only compared should not be copied**, and **writing a
+  register should not call out to a destructor** — both were worth ~10% when
+  they were found, and both are still the shape of the remaining cost.
 
-Since those changes the Scheme benchmark runs 3.45s where it started at 5.65s.
-Lua runs the same program in 1.37s, and the remaining gap is about 2.2x the
-machine instructions at a slightly lower rate per cycle.
+Ideas that were implemented, measured, and reverted, because a list of those is
+worth as much as the other one: an inline cache on dynamic indexing (an
+environment lookup thrashes it, so the check is pure overhead); inlining string
+equality into the comparison handlers; splitting the return path into fast and
+slow halves; outlining call handling to shrink the dispatch loop; raising the
+threshold at which a table builds a hash index; a machine-integer twin for loop
+counters; and `-C target-cpu=native`, which one measurement liked and a careful
+one did not — it costs 16% on spectral norm here.
 
-Where they go is the value representation. Every register write drops what was
-there and every read of a heap value bumps a reference count; Lua's values are
-the same 16 bytes but garbage collected, so a copy is a plain move, and a call
-is 177 host instructions against rua's 570. Removing that — a POD value with a
-tracing GC — measured as a further 1.3x. It is a different interpreter, not a
-patch to this one. What this one does instead is hand the hot numeric parts to
-`rustc`.
+What is left is the value representation. Every register write releases a real
+handle and every read of a heap value takes one; removing that is a POD value
+with a tracing GC, which is a different interpreter rather than a patch to this
+one — and now worth 1.2x, most of it on the two benchmarks the compiler cannot
+take.
 
 ## FFI: calling C
 
