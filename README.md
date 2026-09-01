@@ -178,13 +178,19 @@ rather than as a type and a validator that drift apart:
 type Item  = #{ sku: string, qty: number }
 type Order = #{ id: number, items: [Item], note: string }
 
-let (ok, out) = try(|| check(json::parse(fs::read(path)), Order))
+let body = json::parse(fs::read(path))
+let (ok, why) = typeis(body, Order)
 // rejected — `items[0].qty`: expected number, found string
 ```
 
-`is(v, T)` answers yes or no; `check(v, T)` hands the value back or says what
-did not fit and where. Both follow a name when they reach one, so types may
-refer to each other, and a tree may contain itself.
+`typeis` answers the way `try` does: the yes or no first, so `if typeis(v, T)`
+reads plainly, and why not after it when that is wanted. It follows a name
+when it reaches one, so types may refer to each other and a tree may contain
+itself. A gate that throws is two lines of rua:
+
+```rust
+fn must(v, shape) { let (ok, why) = typeis(v, shape); if !ok { error(why) } v }
+```
 
 The editor follows those down. Writing `serve("0.0.0.0:80", ` offers
 `handle` first, as *second of serve(..) — Handler<Body, Reply> =

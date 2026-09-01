@@ -126,19 +126,21 @@ fn base(vm: &mut Vm) {
             Err(_) => Value::Nil,
         })
     });
-    // `is(value, Type)` and `check(value, Type)` — the same declaration that
-    // answers the editor also guards what comes in from outside it
-    vm.register("is", |vm, args| {
-        let (v, t) = (arg(args, 0), arg(args, 1));
-        one(Value::Bool(fits(vm, &v, &t, "", &mut String::new(), 0)))
-    });
-    vm.register("check", |vm, args| {
+    // `typeis(value, Type)` — the same declaration that answers the editor
+    // also guards what comes in from outside the program. It answers the way
+    // `try` does: the yes or no first, and why not after it, so that
+    // `if typeis(v, T)` reads plainly and the reason is there when it is
+    // wanted.
+    vm.register("typeis", |vm, args| {
         let (v, t) = (arg(args, 0), arg(args, 1));
         let mut why = String::new();
         if fits(vm, &v, &t, "", &mut why, 0) {
-            return one(v);
+            return Ok(vec![Value::Bool(true), Value::Nil]);
         }
-        err(if why.is_empty() { "check failed".to_string() } else { why })
+        Ok(vec![
+            Value::Bool(false),
+            Value::str(if why.is_empty() { "does not fit".to_string() } else { why }),
+        ])
     });
     vm.register("error", |_vm, args| Err(Error(arg(args, 0).to_string())));
     vm.register("assert", |_vm, args| {

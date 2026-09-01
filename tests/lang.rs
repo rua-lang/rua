@@ -1849,6 +1849,9 @@ fn typeof_answers_what_a_value_is() {
 /// editor also guards what comes in from outside the program. Go reflects
 /// over a struct to unmarshal; this is the same trade, with the shape written
 /// once rather than twice.
+///
+/// `typeis` answers the way `try` does — the yes or no first, and why not
+/// after it — so one function covers both asking and being told.
 #[test]
 fn a_type_can_guard_what_comes_in_from_outside() {
     let mut vm = Vm::new();
@@ -1863,10 +1866,10 @@ fn a_type_can_guard_what_comes_in_from_outside() {
         let short = #{ id: 1 }
         let flat = 7
 
-        let (_, why_deep) = try(|| check(deep, Order))
-        let (_, why_short) = try(|| check(short, Order))
-        let (_, why_flat) = try(|| check(flat, Order))
-        return is(good, Order), is(deep, Order), why_deep, why_short, why_flat, check(good, Order).id;
+        let (_, why_deep) = typeis(deep, Order)
+        let (_, why_short) = typeis(short, Order)
+        let (_, why_flat) = typeis(flat, Order)
+        return typeis(good, Order), typeis(deep, Order), why_deep, why_short, why_flat, good.id;
         "#,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1876,7 +1879,7 @@ fn a_type_can_guard_what_comes_in_from_outside() {
     assert!(out[2].to_string().contains("`items[0].qty`: expected number, found string"), "{}", out[2]);
     assert!(out[3].to_string().contains("`items`: expected an array, found nil"), "{}", out[3]);
     assert!(out[4].to_string().contains("expected a table, found number"), "{}", out[4]);
-    // `check` hands the value back, so it reads as a gate rather than a test
+    // and it answers the way `try` does, so `if typeis(..)` reads plainly
     assert_eq!(out[5].as_num().unwrap(), 1.0);
 }
 
@@ -1895,9 +1898,9 @@ fn a_guard_walks_arrays_names_and_types_that_refer_to_each_other() {
         let one = #{ leaf: #{ name: "a" }, kids: [] }
         let two = #{ leaf: #{ name: "a" }, kids: [#{ leaf: #{ name: "b" }, kids: [] }] }
         let bad = #{ leaf: #{ name: "a" }, kids: [#{ leaf: #{ name: 2 }, kids: [] }] }
-        let (_, why) = try(|| check(bad, Tree))
-        return is(one, Tree), is(two, Tree), why,
-               is(#{ v: 1 }, Anything), is(#{ v: "x" }, Anything), is(#{}, Anything);
+        let (_, why) = typeis(bad, Tree)
+        return typeis(one, Tree), typeis(two, Tree), why,
+               typeis(#{ v: 1 }, Anything), typeis(#{ v: "x" }, Anything), typeis(#{}, Anything);
         "#,
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -1918,7 +1921,7 @@ fn a_type_is_a_value_like_any_other() {
             r#"
         type Point = #{ x: number, y: number }
         type Points = [Point]
-        fn guard(shape) { |v| { is(v, shape) } }
+        fn guard(shape) { |v| { typeis(v, shape) } }
         let is_point = guard(Point)
         return Point.kind, Point.fields.x.kind, Points.kind, Points.of.name,
                typeof(Point), is_point(#{ x: 1, y: 2 }), is_point(3);
