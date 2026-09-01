@@ -1,0 +1,44 @@
+// Run the benchmark suite and write the result as JSON and as a table.
+//
+//   rua examples/bench_report.rua            # print the table
+//   rua examples/bench_report.rua out.json   # and save the numbers
+//
+// Uses os::run to drive the suite, the json library beside it to serialise,
+// and fs to save.
+let json = require("json")
+
+let (code, out, why) = os::run("sh bench/run.sh")
+if code != 0 {
+    print("the suite refused to report: " + why.trim())
+    os::exit(1)
+}
+
+let rows = []
+for line in out.trim().split("\n") {
+    let f = []
+    for word in line.split(" ") { if word != "" { f.push(word) } }
+    if f.len() != 5 || f[0] == "benchmark" { continue }
+    rows.push(#{
+        name: f[0],
+        interp: num(f[1]),
+        jit: num(f[2]),
+        lua: num(f[3]),
+        luajit: num(f[4]),
+    })
+}
+
+fn best(r) { if r.jit < r.interp { r.jit } else { r.interp } }
+
+print("{:<14} {:>8} {:>8} {:>8} {:>9}".format("benchmark", "rua", "lua5.4", "luajit", "vs luajit"))
+let wins = 0
+for r in rows {
+    let mine = best(r)
+    if mine < r.lua { wins += 1 }
+    print("{r.name:<14} {mine:>8.3f} {r.lua:>8.3f} {r.luajit:>8.3f} {mine / r.luajit:>8.2f}x")
+}
+print("{wins} of {rows.len()} faster than lua 5.4")
+
+if arg.len() > 0 {
+    fs::write(arg[0], json::write(#{ when: os::time(), rows: rows }))
+    print("wrote {arg[0]} ({fs::size(arg[0])} bytes)")
+}
