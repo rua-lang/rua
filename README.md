@@ -169,6 +169,23 @@ type Handler<T, U> = fn(route: string, data: T) -> U
 fn serve(on: string, handle: Handler<Body, Reply>, retries: number) -> boolean
 ```
 
+A type is also a value describing itself, so the declaration that answers the
+editor guards what comes in from outside the program — the trade Go makes
+when it reflects over a struct to unmarshal, with the shape written once
+rather than as a type and a validator that drift apart:
+
+```rust
+type Item  = #{ sku: string, qty: number }
+type Order = #{ id: number, items: [Item], note: string }
+
+let (ok, out) = try(|| check(json::parse(fs::read(path)), Order))
+// rejected — `items[0].qty`: expected number, found string
+```
+
+`is(v, T)` answers yes or no; `check(v, T)` hands the value back or says what
+did not fit and where. Both follow a name when they reach one, so types may
+refer to each other, and a tree may contain itself.
+
 The editor follows those down. Writing `serve("0.0.0.0:80", ` offers
 `handle` first, as *second of serve(..) — Handler<Body, Reply> =
 fn(route: string, data: Body) -> Reply*, and hovering `serve` gives the whole

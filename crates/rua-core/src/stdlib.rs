@@ -126,6 +126,20 @@ fn base(vm: &mut Vm) {
             Err(_) => Value::Nil,
         })
     });
+    // `is(value, Type)` and `check(value, Type)` — the same declaration that
+    // answers the editor also guards what comes in from outside it
+    vm.register("is", |vm, args| {
+        let (v, t) = (arg(args, 0), arg(args, 1));
+        one(Value::Bool(fits(vm, &v, &t, "", &mut String::new(), 0)))
+    });
+    vm.register("check", |vm, args| {
+        let (v, t) = (arg(args, 0), arg(args, 1));
+        let mut why = String::new();
+        if fits(vm, &v, &t, "", &mut why, 0) {
+            return one(v);
+        }
+        err(if why.is_empty() { "check failed".to_string() } else { why })
+    });
     vm.register("error", |_vm, args| Err(Error(arg(args, 0).to_string())));
     vm.register("assert", |_vm, args| {
         if arg(args, 0).truthy() {
@@ -226,6 +240,93 @@ where
         Some(vals) => Ok(vals),
         None => Ok(vec![Value::Nil]),
     })
+}
+
+/// Does a value fit the shape a type describes?
+///
+/// `why` is filled in with the first thing that did not fit, named by the
+/// whole path to it — `items[0].qty`, not `qty` — because a guard that only
+/// says no is a guard you end up debugging by hand.
+fn fits(vm: &Vm, v: &Value, ty: &Value, at: &str, why: &mut String, depth: usize) -> bool {
+    // a type that refers to itself would otherwise be followed forever
+    if depth > 64 {
+        return false;
+    }
+    let Value::Table(shape) = ty else { return false };
+    let kind = match &shape.borrow().get_field(&RStr::new("kind")) {
+        Value::Str(s) => s.to_string(),
+        _ => return false,
+    };
+    let name_it = |at: &str| {
+        if at.is_empty() {
+            "the value".to_string()
+        } else {
+            format!("`{at}`")
+        }
+    };
+    match kind.as_str() {
+        "any" => true,
+        // a name is followed where the check runs, so two types may refer to
+        // one another
+        "name" => {
+            let Value::Str(n) = shape.borrow().get_field(&RStr::new("name")) else {
+                return false;
+            };
+            let inner = vm.get_global(&n);
+            if matches!(inner, Value::Nil) {
+                *why = format!("`{n}` is not a type this program declares");
+                return false;
+            }
+            fits(vm, v, &inner, at, why, depth + 1)
+        }
+        "array" => {
+            let Value::Table(t) = v else {
+                *why = format!("{}: expected an array, found {}", name_it(at), v.type_name());
+                return false;
+            };
+            let of = shape.borrow().get_field(&RStr::new("of"));
+            let len = t.borrow().len();
+            for i in 0..len {
+                let Some(e) = t.borrow().get_num(i as f64).cloned() else { continue };
+                if !fits(vm, &e, &of, &format!("{at}[{i}]"), why, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        "record" => {
+            let Value::Table(t) = v else {
+                *why = format!("{}: expected a table, found {}", name_it(at), v.type_name());
+                return false;
+            };
+            let Value::Table(fields) = shape.borrow().get_field(&RStr::new("fields")) else {
+                return false;
+            };
+            let keys = fields.borrow().keys();
+            for k in keys {
+                let Value::Str(field) = k.to_value() else { continue };
+                let want = fields.borrow().get_field(&field);
+                let got = t.borrow().get_field(&field);
+                let path = if at.is_empty() {
+                    field.to_string()
+                } else {
+                    format!("{at}.{field}")
+                };
+                if !fits(vm, &got, &want, &path, why, depth + 1) {
+                    return false;
+                }
+            }
+            true
+        }
+        // `number`, `string`, `boolean`, `nil`, `table`, `function`
+        want => {
+            if v.type_name() == want {
+                return true;
+            }
+            *why = format!("{}: expected {want}, found {}", name_it(at), v.type_name());
+            false
+        }
+    }
 }
 
 /// `for v in t` walks a table's values, in key order.

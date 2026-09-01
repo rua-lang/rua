@@ -1845,6 +1845,95 @@ fn typeof_answers_what_a_value_is() {
     assert!(rua_syntax::parser::parse("let x: number = 1").is_ok());
 }
 
+/// A type is a value describing itself, so the declaration that answers the
+/// editor also guards what comes in from outside the program. Go reflects
+/// over a struct to unmarshal; this is the same trade, with the shape written
+/// once rather than twice.
+#[test]
+fn a_type_can_guard_what_comes_in_from_outside() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Item  = #{ sku: string, qty: number }
+        type Order = #{ id: number, items: [Item] }
+
+        let good = #{ id: 1, items: [#{ sku: "a", qty: 2 }] }
+        let deep = #{ id: 1, items: [#{ sku: "a", qty: "two" }] }
+        let short = #{ id: 1 }
+        let flat = 7
+
+        let (_, why_deep) = try(|| check(deep, Order))
+        let (_, why_short) = try(|| check(short, Order))
+        let (_, why_flat) = try(|| check(flat, Order))
+        return is(good, Order), is(deep, Order), why_deep, why_short, why_flat, check(good, Order).id;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "true");
+    assert_eq!(out[1].to_string(), "false");
+    // the whole path to what did not fit, not just its last name
+    assert!(out[2].to_string().contains("`items[0].qty`: expected number, found string"), "{}", out[2]);
+    assert!(out[3].to_string().contains("`items`: expected an array, found nil"), "{}", out[3]);
+    assert!(out[4].to_string().contains("expected a table, found number"), "{}", out[4]);
+    // `check` hands the value back, so it reads as a gate rather than a test
+    assert_eq!(out[5].as_num().unwrap(), 1.0);
+}
+
+/// The shapes a guard has to walk, including the ones that would not
+/// terminate if it followed them naively.
+#[test]
+fn a_guard_walks_arrays_names_and_types_that_refer_to_each_other() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Leaf = #{ name: string }
+        type Tree = #{ leaf: Leaf, kids: [Tree] }
+        type Anything = #{ v: any }
+
+        let one = #{ leaf: #{ name: "a" }, kids: [] }
+        let two = #{ leaf: #{ name: "a" }, kids: [#{ leaf: #{ name: "b" }, kids: [] }] }
+        let bad = #{ leaf: #{ name: "a" }, kids: [#{ leaf: #{ name: 2 }, kids: [] }] }
+        let (_, why) = try(|| check(bad, Tree))
+        return is(one, Tree), is(two, Tree), why,
+               is(#{ v: 1 }, Anything), is(#{ v: "x" }, Anything), is(#{}, Anything);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "true", "a tree with no children");
+    assert_eq!(out[1].to_string(), "true", "one that refers to itself");
+    assert!(out[2].to_string().contains("`kids[0].leaf.name`"), "{}", out[2]);
+    assert_eq!(out[3].to_string(), "true", "`any` takes a number");
+    assert_eq!(out[4].to_string(), "true", "and a string");
+    assert_eq!(out[5].to_string(), "true", "and nothing at all");
+}
+
+/// A type is an ordinary value: it can be read, passed and stored.
+#[test]
+fn a_type_is_a_value_like_any_other() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Point = #{ x: number, y: number }
+        type Points = [Point]
+        fn guard(shape) { |v| { is(v, shape) } }
+        let is_point = guard(Point)
+        return Point.kind, Point.fields.x.kind, Points.kind, Points.of.name,
+               typeof(Point), is_point(#{ x: 1, y: 2 }), is_point(3);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "record");
+    assert_eq!(out[1].to_string(), "number");
+    assert_eq!(out[2].to_string(), "array");
+    assert_eq!(out[3].to_string(), "Point", "a name stays a name until the check runs");
+    assert_eq!(out[4].to_string(), "table", "a type is a table");
+    assert_eq!(out[5].to_string(), "true", "and can be handed to a function");
+    assert_eq!(out[6].to_string(), "false");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

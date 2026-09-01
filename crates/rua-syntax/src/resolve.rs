@@ -201,6 +201,56 @@ impl Scan<'_> {
     }
 }
 
+/// A type, as a value that describes it.
+///
+/// The shapes are ordinary tables, so nothing new is needed to build them,
+/// pass them around or read them: `#{ kind: "record", fields: #{ .. } }`. A
+/// name inside one stays a name and is followed when the check runs, so that
+/// two types may refer to each other.
+fn describe(t: &Type) -> Expr {
+    fn field(k: &str, v: Expr) -> (Expr, Expr) {
+        (Expr::Str(k.into()), v)
+    }
+    fn word(s: &str) -> Expr {
+        Expr::Str(s.into())
+    }
+    match t {
+        Type::Named(n, args, _) => {
+            let known = matches!(
+                &**n,
+                "number" | "string" | "boolean" | "nil" | "table" | "function" | "any"
+            );
+            if known && args.is_empty() {
+                return Expr::Map(vec![field("kind", word(n))]);
+            }
+            let mut entries = vec![field("kind", word("name")), field("name", word(n))];
+            if !args.is_empty() {
+                entries.push(field("args", Expr::Array(args.iter().map(describe).collect())));
+            }
+            Expr::Map(entries)
+        }
+        Type::Array(inner, _) => Expr::Map(vec![
+            field("kind", word("array")),
+            field("of", describe(inner)),
+        ]),
+        Type::Record(fields, _) => Expr::Map(vec![
+            field("kind", word("record")),
+            field(
+                "fields",
+                Expr::Map(
+                    fields
+                        .iter()
+                        .map(|(n, ft)| (Expr::Str(n.text.clone()), describe(ft)))
+                        .collect(),
+                ),
+            ),
+        ]),
+        // what a function takes cannot be seen from the outside, so a check
+        // can only ask whether it is one
+        Type::Fn(..) => Expr::Map(vec![field("kind", word("function"))]),
+    }
+}
+
 // ---- what the resolver saw ------------------------------------------------
 
 /// One place a name is written, and what it turned out to mean.
@@ -446,8 +496,21 @@ impl Resolver {
                 }
             }
             Stat::FnSlot(b, f) => Stat::FnSlot(*b, self.expr(f)),
+            // A type becomes a value describing itself, bound to its own
+            // name. That is what lets the same declaration guard a marshall
+            // at run time as well as answer the editor — one shape written
+            // once, rather than a type and a validator that drift apart.
             Stat::TypeAlias(name, params, t) => {
-                Stat::TypeAlias(name.clone(), params.clone(), t.clone())
+                if params.is_empty() {
+                    Stat::Assign(
+                        vec![Expr::Global(name.text.clone(), GlobalCache::new())],
+                        vec![describe(t)],
+                    )
+                } else {
+                    // one that takes parameters describes nothing on its own;
+                    // it is a shape with holes until they are filled
+                    Stat::TypeAlias(name.clone(), params.clone(), t.clone())
+                }
             }
             Stat::Assign(targets, exprs) => Stat::Assign(
                 targets.iter().map(|t| self.expr(t)).collect(),
