@@ -1,2 +1,5 @@
 /target
 demo/*.so
+
+# agent worktrees
+.claude/worktrees/
