@@ -1283,3 +1283,35 @@ fn appending_to_an_element_of_an_array_it_reads_stays_interpreted() {
         .unwrap();
     assert_eq!(out[0].as_num().unwrap(), 40.0 * 2.0 + 82.0);
 }
+
+/// The index check compiled code uses on an unproven index is one comparison
+/// against the length and one round trip through the machine integer. That has
+/// to say the same thing as the interpreter about every awkward float: not a
+/// number, negative, fractional, larger than the integers, and negative zero —
+/// which is a real index, being equal to zero.
+#[test]
+fn a_compiled_index_check_agrees_with_the_interpreter() {
+    let src = r#"
+        fn read(t, i) { let s = 0; for k in 0..3 { s += t[i] } s }
+        let t = [10, 20, 30]
+        for k in 0..40 { read(t, 0) }
+        let out = []
+        out.push(if try(|| read(t, 0 / 0)) { 1 } else { 0 })
+        out.push(if try(|| read(t, 0 - 1)) { 1 } else { 0 })
+        out.push(if try(|| read(t, 1.5)) { 1 } else { 0 })
+        out.push(if try(|| read(t, 1e30)) { 1 } else { 0 })
+        out.push(read(t, -0.0))
+        out.push(read(t, 2))
+        out.join(",")
+    "#;
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    let with = jitted.eval(src).unwrap()[0].to_string();
+
+    let mut plain = Vm::new();
+    plain.jit.enabled = false;
+    let without = plain.eval(src).unwrap()[0].to_string();
+
+    assert_eq!(with, "0,0,0,0,30,90");
+    assert_eq!(with, without, "the compiler and the interpreter must agree");
+}
