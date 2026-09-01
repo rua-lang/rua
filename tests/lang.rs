@@ -1422,6 +1422,19 @@ fn an_open_file_writes_through_one_buffered_handle() {
     assert_eq!(out[5].to_string(), "false", "an unknown mode is an error");
 }
 
+/// An interpolation is a chain of `+`, and the compiler joins the whole chain
+/// in one allocation. Only the left spine: the right hand side of a `+` is its
+/// own expression, and `"x" + (1 + 2)` still adds before it concatenates.
+#[test]
+fn interpolation_joins_in_one_pass_without_changing_what_it_means() {
+    assert_eq!(s(r#"let i = 42; "line {i} of {i} text""#), "line 42 of 42 text");
+    assert_eq!(s(r#""a" + 1 + 2"#), "a12", "left to right, still concatenation");
+    assert_eq!(s(r#"1 + 2 + 3"#), "6", "numbers are untouched");
+    assert_eq!(s(r#""x" + (1 + 2)"#), "x3", "the right hand side stays arithmetic");
+    assert_eq!(s(r#"let i = 7; "{i}{i}{i}{i}""#), "7777", "no literal at the front");
+    assert_eq!(s(r#""" + 1 + "" + 2"#), "12", "empty pieces");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

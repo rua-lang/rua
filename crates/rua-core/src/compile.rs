@@ -37,6 +37,27 @@ struct FnCompiler {
     line: u32,
 }
 
+/// The pieces of a string interpolation, if this is one: a left leaning chain
+/// of `+` rooted in a string literal, so every step of it concatenates.
+///
+/// Only the left spine is flattened. In `"a" + (b + c)` the right hand side is
+/// its own expression and may well be arithmetic, which it stays.
+fn concat_parts(e: &Expr) -> Option<Vec<&Expr>> {
+    let mut parts = Vec::new();
+    let mut cur = e;
+    while let Expr::Bin(BinOp::Add, a, b) = cur {
+        parts.push(&**b);
+        cur = a;
+    }
+    if !matches!(cur, Expr::Str(_)) {
+        return None;
+    }
+    parts.push(cur);
+    parts.reverse();
+    // two parts is one allocation either way, and `n` is a byte
+    (3..=255).contains(&parts.len()).then_some(parts)
+}
+
 impl FnCompiler {
     fn new(def: Rc<FuncDef>, n_slots: usize) -> FnCompiler {
         FnCompiler {
@@ -828,6 +849,18 @@ impl FnCompiler {
                 let skip = self.emit(Op::JumpIfTrue { cond: dst, to: 0 }, 0);
                 self.expr(b, dst);
                 self.patch(skip);
+            }
+            Expr::Bin(BinOp::Add, ..) if concat_parts(e).is_some() => {
+                let parts = concat_parts(e).unwrap();
+                let mark = self.mark();
+                let base = self.alloc();
+                self.expr(parts[0], base);
+                for p in &parts[1..] {
+                    let r = self.alloc();
+                    self.expr(p, r);
+                }
+                self.emit(Op::Concat { dst, base, n: parts.len() as u8 }, 0);
+                self.release(mark);
             }
             Expr::Bin(op, a, b) => {
                 let mark = self.mark();

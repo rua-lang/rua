@@ -390,6 +390,27 @@ impl Vm {
                     };
                     set!(dst, v);
                 }
+                Op::Concat { dst, base, n } => {
+                    use std::fmt::Write;
+                    // one buffer, sized from the pieces, so a long interpolation
+                    // doesn't copy its prefix again for every `{}` in it
+                    let parts = (0..n as u16).map(|i| at!(base + i));
+                    let mut out = String::with_capacity(
+                        parts.clone().map(|v| match v {
+                            Value::Str(s) => s.len(),
+                            _ => 8,
+                        }).sum(),
+                    );
+                    for v in parts {
+                        match v {
+                            Value::Str(s) => out.push_str(s),
+                            other => {
+                                let _ = write!(out, "{other}");
+                            }
+                        }
+                    }
+                    set!(dst, Value::str(out));
+                }
                 Op::Sub { dst, a, b } => {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),

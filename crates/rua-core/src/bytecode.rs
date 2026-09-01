@@ -61,6 +61,10 @@ pub enum Op {
     // and `BinK`; everything else keeps the generic form, because specialising
     // the whole table measured *worse* — the jump table stops fitting.
     Add { dst: Reg, a: Reg, b: Reg },
+    /// Join `n` registers from `base` into one string. An interpolation is a
+    /// chain of `+`, and each `+` allocated a string and interned it only for
+    /// the next `+` to throw it away; this allocates and interns once.
+    Concat { dst: Reg, base: Reg, n: u8 },
     Sub { dst: Reg, a: Reg, b: Reg },
     Mul { dst: Reg, a: Reg, b: Reg },
     Div { dst: Reg, a: Reg, b: Reg },
