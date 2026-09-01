@@ -412,8 +412,16 @@ environment lookup thrashes it, so the check is pure overhead); inlining string
 equality into the comparison handlers; splitting the return path into fast and
 slow halves; outlining call handling to shrink the dispatch loop; raising the
 threshold at which a table builds a hash index; a machine-integer twin for loop
-counters; and `-C target-cpu=native`, which one measurement liked and a careful
-one did not — it costs 16% on spectral norm here.
+counters; `-C target-cpu=native`, which one measurement liked and a careful
+one did not — it costs 16% on spectral norm here; and compiling fields that
+hold *numbers*, which is the natural completion of the fields the JIT does
+compile and was slower than the interpreter at it (0.55s to 0.77s on a loop
+over `#{ x, y }` points). A compiled field read is a call through a pointer
+where the interpreted one is a handler with an inline cache, and a table
+compiled code makes is recorded so a trap can drop it. Both are paid back by
+the recursion in binarytrees and not by four field reads in a small function.
+Fields that hold tables stayed, because those are what a walk over a tree is
+made of.
 
 What is left is the value representation. Every register write releases a real
 handle and every read of a heap value takes one; removing that is a POD value
