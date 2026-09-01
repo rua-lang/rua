@@ -509,6 +509,57 @@ impl World {
         let scan = Lexer::scan(index.text());
         let items = match self.where_is(&scan, index.text(), offset) {
             Where::Comment | Where::Text | Where::Naming => Vec::new(),
+            // where a type is written, only types make sense
+            Where::TypeName => {
+                let types = self.types_of(index.text());
+                let mut out: Vec<CompletionItem> = BUILTIN_TYPES
+                    .iter()
+                    .map(|t| item(t, CompletionItemKind::TYPE_PARAMETER, "built in"))
+                    .collect();
+                let mut names = types.alias_names();
+                names.sort();
+                for n in names {
+                    let detail = types.alias(&n).map(|t| t.to_string()).unwrap_or_default();
+                    out.push(item(&n, CompletionItemKind::STRUCT, &detail));
+                }
+                out
+            }
+            // `let o: Point = #{ ` — the fields Point says it has
+            Where::Field(shape) => {
+                let types = self.types_of(index.text());
+                let Some(alias) = types.alias(&shape) else { return Some(CompletionResponse::Array(Vec::new())) };
+                let Some(fields) = types.fields(alias) else {
+                    return Some(CompletionResponse::Array(Vec::new()))
+                };
+                fields
+                    .iter()
+                    .map(|(name, t)| {
+                        let mut it = item(name, CompletionItemKind::FIELD, &t.to_string());
+                        // writing the key is writing `name: `
+                        it.insert_text = Some(format!("{name}: "));
+                        it
+                    })
+                    .collect()
+            }
+            // inside a call: say what this argument is for, then the names
+            Where::Argument(callee, index_of) => {
+                let types = self.types_of(index.text());
+                let mut out = Vec::new();
+                if let Some(sig) = types.function(&callee) {
+                    if let Some(p) = sig.params.get(index_of) {
+                        let detail = match &p.ty {
+                            Some(t) => format!("{} of {} — {t}", ordinal(index_of), sig.label()),
+                            None => format!("{} of {}", ordinal(index_of), sig.label()),
+                        };
+                        let mut it = item(p, CompletionItemKind::VALUE, &detail);
+                        it.preselect = Some(true);
+                        it.sort_text = Some(format!("0{p}"));
+                        out.push(it);
+                    }
+                }
+                out.extend(self.in_scope(&scan, index.text()));
+                out
+            }
             Where::Member(module) => match self.members(&module) {
                 Some(mut names) => {
                     names.sort();
@@ -523,7 +574,7 @@ impl World {
             },
             Where::Method => self.methods(&scan),
             Where::Require(prefix) => self.modules_beside(uri, &prefix),
-            Where::Expression => self.in_scope(&scan),
+            Where::Expression => self.in_scope(&scan, index.text()),
         };
         Some(CompletionResponse::Array(items))
     }
@@ -593,8 +644,15 @@ impl World {
         out
     }
 
-    /// Keywords, what the runtime provides, and the names this file declares.
-    fn in_scope(&self, scan: &rua_syntax::lexer::Scan) -> Vec<CompletionItem> {
+    /// The types this file declares and the annotations it wrote down.
+    fn types_of(&self, text: &str) -> crate::types::Types {
+        let (block, _) = rua_syntax::parser::parse_recover(text);
+        crate::types::Types::read(&block)
+    }
+
+    /// Keywords, what the runtime provides, and the names this file declares
+    /// — each with the type it was given, when one was written.
+    fn in_scope(&self, scan: &rua_syntax::lexer::Scan, text: &str) -> Vec<CompletionItem> {
         let mut out: Vec<CompletionItem> = Vec::new();
         for k in KEYWORDS {
             out.push(item(k, CompletionItemKind::KEYWORD, "keyword"));
@@ -619,9 +677,28 @@ impl World {
             if let Tok::Name(n) = &t.tok {
                 if !seen.iter().any(|s| s == n) && !self.is_global(n) {
                     seen.push(n.clone());
-                    out.push(item(n, CompletionItemKind::VARIABLE, "this file"));
                 }
             }
+        }
+        // a name is worth more with the type it was given beside it, and a
+        // function is worth more as its signature
+        let (block, _) = rua_syntax::parser::parse_recover(text);
+        let types = crate::types::Types::read(&block);
+        let written: std::collections::HashMap<String, String> =
+            rua_syntax::resolve::occurrences(&block)
+                .into_iter()
+                .filter_map(|o| {
+                    let decl = o.decl?;
+                    Some((o.name.to_string(), types.at(decl)?.to_string()))
+                })
+                .collect();
+        for n in seen {
+            let (kind, detail) = match (types.function(&n), written.get(&n)) {
+                (Some(sig), _) => (CompletionItemKind::FUNCTION, sig.label()),
+                (_, Some(t)) => (CompletionItemKind::VARIABLE, t.clone()),
+                _ => (CompletionItemKind::VARIABLE, "this file".to_string()),
+            };
+            out.push(item(&n, kind, &detail));
         }
         out
     }
@@ -661,6 +738,13 @@ impl World {
             None => toks.iter().rposition(|t| t.span.hi <= at && t.tok != Tok::Eof),
         };
         let Some(b) = before else { return Where::Expression };
+        // a type is written after `:`, after `->`, and after `type X =`
+        if self.writing_a_type(toks, b) {
+            return Where::TypeName;
+        }
+        if let Some(w) = self.inside_a_call_or_record(toks, b, typing) {
+            return w;
+        }
         match &toks[b].tok {
             Tok::ColonColon => match b.checked_sub(1).map(|j| &toks[j].tok) {
                 Some(Tok::Name(module)) => Where::Member(module.clone()),
@@ -672,6 +756,133 @@ impl World {
             Tok::Mut if b > 0 && toks[b - 1].tok == Tok::Let => Where::Naming,
             _ => Where::Expression,
         }
+    }
+
+    /// Is the token after `b` a type rather than a value?
+    fn writing_a_type(&self, toks: &[Lexed], b: usize) -> bool {
+        match &toks[b].tok {
+            // `-> here`
+            Tok::Arrow => true,
+            // `type X = here`
+            Tok::Assign => {
+                b >= 2 && toks[b - 2].tok == Tok::Type
+            }
+            // `let x: here`, `fn f(a: here)`, `#{ x: here }` in a type — a
+            // `:` in a value is a map key, whose value is a value
+            Tok::Colon => self.colon_introduces_a_type(toks, b),
+            // part way into writing one
+            Tok::Comma | Tok::LBracket | Tok::Lt => {
+                b > 0 && self.writing_a_type(toks, b - 1)
+            }
+            _ => false,
+        }
+    }
+
+    /// A `:` writes a type in a binding and a value in a map literal. Which
+    /// one it is depends on what opened before it.
+    fn colon_introduces_a_type(&self, toks: &[Lexed], colon: usize) -> bool {
+        // walk out to whatever bracket this sits inside
+        let (mut depth, mut i) = (0i32, colon);
+        while i > 0 {
+            i -= 1;
+            match toks[i].tok {
+                Tok::RParen | Tok::RBrace | Tok::RBracket => depth += 1,
+                Tok::LParen if depth == 0 => {
+                    // `fn f(a: T)` — a parameter list, if a `fn` opened it
+                    return i > 0 && matches!(toks[i - 1].tok, Tok::Name(_))
+                        && i > 1
+                        && toks[i - 2].tok == Tok::Fn;
+                }
+                Tok::LBrace if depth == 0 => {
+                    // `#{ x: T }` inside a `type` is a shape; in a value it
+                    // is a map, and its values are values
+                    return i > 0
+                        && toks[i - 1].tok == Tok::Hash
+                        && self.in_a_type_declaration(toks, i);
+                }
+                Tok::LBracket if depth == 0 => return false,
+                Tok::LParen | Tok::LBrace | Tok::LBracket => depth -= 1,
+                // a `let x: T` never crosses a statement
+                Tok::Semi | Tok::Let | Tok::Type if depth == 0 => {
+                    return toks[i].tok != Tok::Semi;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Is this position inside a `type X = ...`?
+    fn in_a_type_declaration(&self, toks: &[Lexed], from: usize) -> bool {
+        for i in (0..from).rev() {
+            match toks[i].tok {
+                Tok::Type => return true,
+                Tok::Semi | Tok::Let | Tok::Fn | Tok::RBrace => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Inside a call's arguments, or inside a `#{ }` whose shape is known.
+    fn inside_a_call_or_record(
+        &self,
+        toks: &[Lexed],
+        b: usize,
+        typing: Option<usize>,
+    ) -> Option<Where> {
+        let from = typing.unwrap_or(b + 1);
+        let (mut depth, mut i) = (0i32, from);
+        while i > 0 {
+            i -= 1;
+            match &toks[i].tok {
+                Tok::RParen | Tok::RBrace | Tok::RBracket => depth += 1,
+                Tok::LBrace if depth == 0 && i > 0 && toks[i - 1].tok == Tok::Hash => {
+                    // `#{ ` — the shape comes from what it is being given to
+                    return self.shape_of_map_at(toks, i - 1).map(Where::Field);
+                }
+                Tok::LParen if depth == 0 => {
+                    let Some(Tok::Name(callee)) = i.checked_sub(1).map(|j| &toks[j].tok) else {
+                        return None;
+                    };
+                    // only the commas of this call: `pair(f(1, 2), ` is on
+                    // its second argument, not its fourth
+                    let (mut inner, mut commas) = (0i32, 0usize);
+                    for t in &toks[i + 1..from] {
+                        match t.tok {
+                            Tok::LParen | Tok::LBrace | Tok::LBracket => inner += 1,
+                            Tok::RParen | Tok::RBrace | Tok::RBracket => inner -= 1,
+                            Tok::Comma if inner == 0 => commas += 1,
+                            _ => {}
+                        }
+                    }
+                    return Some(Where::Argument(callee.clone(), commas));
+                }
+                Tok::LParen | Tok::LBrace | Tok::LBracket => depth -= 1,
+                Tok::Semi | Tok::Fn if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The name of the shape a `#{` is being written as: from the annotation
+    /// on the binding it is assigned to, or the parameter it is passed as.
+    fn shape_of_map_at(&self, toks: &[Lexed], hash: usize) -> Option<String> {
+        // `let o: Point = #{`
+        if hash >= 2 && toks[hash - 1].tok == Tok::Assign {
+            for i in (0..hash - 1).rev() {
+                match &toks[i].tok {
+                    Tok::Name(t) if i > 0 && toks[i - 1].tok == Tok::Colon => {
+                        return Some(t.clone())
+                    }
+                    Tok::Let => return None,
+                    Tok::Semi => return None,
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 
     fn is_global(&self, name: &str) -> bool {
@@ -707,8 +918,22 @@ enum Where {
     Method,
     /// Naming something that does not exist yet, after `fn` or `let`.
     Naming,
+    /// Where a type is written: after a `:`, after a `->`, or in a `type`.
+    TypeName,
+    /// Inside `#{ }` where the shape is known — the fields it should have.
+    Field(String),
+    /// An argument of a call: which function, and which parameter.
+    Argument(String, usize),
     /// Anywhere a value could be written.
     Expression,
+}
+
+/// `first`, `second`, `third` … for saying which argument is being written.
+fn ordinal(i: usize) -> &'static str {
+    const WORDS: &[&str] = &[
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+    ];
+    WORDS.get(i).copied().unwrap_or("later argument")
 }
 
 /// Is this something rua would lex as one name?

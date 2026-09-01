@@ -440,3 +440,104 @@ fn formatting_replaces_the_document_or_says_nothing() {
     let (world, uri) = open("let x = @\n");
     assert!(world.format(&uri).is_err(), "a file that does not lex is left alone");
 }
+
+// ---- completion reads the types that were written --------------------------
+
+fn detail(world: &rua_lsp::World, uri: &Url, at: Position, label: &str) -> String {
+    match world.complete_at(uri, at) {
+        Some(CompletionResponse::Array(items)) => items
+            .into_iter()
+            .find(|i| i.label == label)
+            .and_then(|i| i.detail)
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// The one that otherwise sends you to the source: what does this argument
+/// want? The parameter's name, its type, and where it sits in the call.
+#[test]
+fn an_argument_position_says_what_the_argument_is_for() {
+    let src = "type Point = #{ x: number, y: number }\n\
+               fn place(spot: Point, label: string) -> boolean { spot.x > 0 }\n\
+               let ok = place(";
+    let (world, uri) = open(src);
+    let got = labels(&world, &uri, at(2, 15));
+    assert_eq!(got.first().map(String::as_str), Some("spot"), "the parameter comes first");
+    let d = detail(&world, &uri, at(2, 15), "spot");
+    assert!(d.contains("first of"), "{d}");
+    assert!(d.contains("place(spot: Point, label: string) -> boolean"), "{d}");
+    assert!(d.ends_with("Point"), "the type it wants: {d}");
+}
+
+/// The second argument is the second one, however long the first was.
+#[test]
+fn the_argument_being_written_is_the_one_described() {
+    let src = "fn pair(left: number, right: string) -> nil { }\nlet x = pair(f(1, 2), ";
+    let (world, uri) = open(src);
+    let d = detail(&world, &uri, at(1, 22), "right");
+    assert!(d.contains("second of"), "{d}");
+    assert!(d.ends_with("string"), "{d}");
+}
+
+/// Filling in a shape offers the fields that shape says it has, and nothing
+/// else — no keywords, no globals, no guessing.
+#[test]
+fn a_typed_map_offers_the_fields_its_type_declares() {
+    let src = "type Colour = #{ red: number, green: number, blue: number }\nlet c: Colour = #{ ";
+    let (world, uri) = open(src);
+    let got = labels(&world, &uri, at(1, 19));
+    assert_eq!(got, vec!["red", "green", "blue"], "in the order they were declared");
+    assert_eq!(detail(&world, &uri, at(1, 19), "red"), "number");
+    // and it writes the key, not just the name
+    match world.complete_at(&uri, at(1, 19)) {
+        Some(CompletionResponse::Array(items)) => {
+            assert_eq!(items[0].insert_text.as_deref(), Some("red: "));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Where a type is written, only types are offered.
+#[test]
+fn a_type_position_offers_types_and_nothing_else() {
+    let (world, uri) = open("type Point = #{ x: number }\nlet p: ");
+    let got = labels(&world, &uri, at(1, 7));
+    assert!(got.contains(&"number".to_string()), "{got:?}");
+    assert!(got.contains(&"Point".to_string()), "a type this file declared");
+    assert!(!got.contains(&"let".to_string()), "a keyword is not a type");
+    assert!(!got.contains(&"print".to_string()), "a global is not a type");
+    assert_eq!(detail(&world, &uri, at(1, 7), "Point"), "#{ x: number }", "shown expanded");
+
+    // the same after `->`
+    let (world, uri) = open("type Point = #{ x: number }\nfn f() -> ");
+    assert!(labels(&world, &uri, at(1, 10)).contains(&"Point".to_string()));
+}
+
+/// A `:` writes a type in a binding and a value in a map literal, and the two
+/// must not be confused.
+#[test]
+fn a_colon_in_a_map_is_not_a_type_position() {
+    let (world, uri) = open("let total = 1\nlet m = #{ count: ");
+    let got = labels(&world, &uri, at(1, 18));
+    assert!(got.contains(&"total".to_string()), "a value goes here: {got:?}");
+    assert!(!got.contains(&"boolean".to_string()), "not a type position");
+}
+
+/// A name is worth more with the type it was given beside it.
+#[test]
+fn names_are_offered_with_the_types_they_were_written_with() {
+    let src = "type Point = #{ x: number }\n\
+               fn scale(p: Point, by: number) -> Point { p }\n\
+               let origin: Point = #{ x: 1 }\n\
+               let count = 2\n";
+    let (world, uri) = open(src);
+    assert_eq!(detail(&world, &uri, at(4, 0), "origin"), "Point");
+    assert_eq!(
+        detail(&world, &uri, at(4, 0), "scale"),
+        "scale(p: Point, by: number) -> Point",
+        "a function is offered as its signature"
+    );
+    // one with no annotation still appears, just without a type to show
+    assert_eq!(detail(&world, &uri, at(4, 0), "count"), "this file");
+}

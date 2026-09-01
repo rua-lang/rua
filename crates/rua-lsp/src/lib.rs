@@ -3,6 +3,7 @@
 
 pub mod analysis;
 pub mod log;
+pub mod types;
 pub mod docs;
 pub mod index;
 

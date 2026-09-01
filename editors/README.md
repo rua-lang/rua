@@ -22,7 +22,7 @@ there, which is correct.
 | References, highlight | every mention of *that* variable, not every mention of the spelling |
 | Rename | the same set, rewritten; refused on a name this file did not declare |
 | Hover | what a keyword does; what a module holds |
-| Completion | the module's real members after `fs::`, plus keywords, globals and names in the file |
+| Completion | reads the position *and* the types: the parameter a call wants, the fields a shape declares, only types where a type goes, and every name with the type it was written with |
 | Outline | the functions in the file, even while it does not parse |
 | Formatting | whitespace between tokens, and nothing else — it cannot lose a comment or change what a program says |
 | Semantic highlighting | a name coloured by whether it is a call, a module or a field |
