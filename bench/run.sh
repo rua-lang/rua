@@ -20,11 +20,14 @@ for b in $BENCHES; do
     # real cost but not the one this table is about
     $RUA bench/$b.rua $size > /dev/null
     out_j=$($RUA bench/$b.rua $size)
+    # and again with the compiler taking everything it can, which exercises
+    # paths the default threshold never reaches on a short run
+    out_a=$($RUA --jit 1 bench/$b.rua $size)
     out_l=$(lua5.4 bench/$b.lua $size 2>/dev/null || echo MISSING)
     out_L=$(luajit bench/$b.lua $size 2>/dev/null || echo MISSING)
 
     # correctness first: the answers have to match
-    for pair in "rua-jit:$out_j" "lua5.4:$out_l" "luajit:$out_L"; do
+    for pair in "rua-jit:$out_j" "rua-jit-all:$out_a" "lua5.4:$out_l" "luajit:$out_L"; do
         name=${pair%%:*}
         body=${pair#*:}
         [ "$body" = "MISSING" ] && continue
