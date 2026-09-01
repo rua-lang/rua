@@ -5,6 +5,12 @@ use miette::{Diagnostic, NamedSource, SourceSpan};
 use rua::{Value, Vm};
 use std::io::Write;
 
+/// rua allocates a small object per table and frees it again; the general
+/// purpose allocator's small-size path is a measurable share of any program
+/// that builds data structures, and this one's is much shorter.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "rua",
