@@ -1196,3 +1196,36 @@ fn cached_element_views_do_not_outlive_the_arrays_they_view() {
         .unwrap();
     assert_eq!(out[0].as_num().unwrap(), 40.0 * 10.0 + 80.0 * 21.0);
 }
+
+/// Compiled code reads an array of arrays through views of its elements, and
+/// appends to a table through the runtime. If the table it appends to *is* one
+/// of those elements, the append can move the storage the view points at — so
+/// that call has to stay with the interpreter. The answer is the same either
+/// way; what this pins is that it is still an answer.
+#[test]
+fn appending_to_an_element_of_an_array_it_reads_stays_interpreted() {
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm
+        .eval(
+            r#"
+        fn grow(rows, out, n) {
+            let s = 0
+            for i in 0..n {
+                out.push(1)          // this can move the element's storage
+                let r = rows[0]      // and this reads it again afterwards
+                s += r[0]
+            }
+            s
+        }
+        let rows = [[1, 2], [3, 4]]
+        let total = 0
+        // `out` is an element of `rows`, so the views the compiled code holds
+        // of the elements are exactly what the appends move
+        for k in 0..40 { total += grow(rows, rows[0], 2) }
+        return total + rows[0].len();
+        "#,
+        )
+        .unwrap();
+    assert_eq!(out[0].as_num().unwrap(), 40.0 * 2.0 + 82.0);
+}

@@ -1685,16 +1685,33 @@ fn compiled_args(args: &[Value], kinds: &[Kind]) -> Option<Vec<RtArg>> {
         out.push(rt_arg(v, kind)?);
     }
     // Compiled code reads one table through a view of its array part and
-    // appends to another. If those are the same table, the view would go
-    // stale as it is written, so this call stays with the interpreter.
+    // appends to another. If those are the same table — or if the one it
+    // appends to is an *element* of an array of arrays it reads — the view
+    // goes stale the moment the append moves the storage, so this call stays
+    // with the interpreter.
     if kinds.contains(&Kind::TableOut) {
         for (i, ki) in kinds.iter().enumerate() {
             if *ki != Kind::TableOut {
                 continue;
             }
             for (j, kj) in kinds.iter().enumerate() {
-                if *kj == Kind::Table && out[i].table == out[j].table {
-                    return None;
+                match kj {
+                    Kind::Table if out[i].table == out[j].table => return None,
+                    Kind::Tables { .. } => {
+                        if out[i].table == out[j].table {
+                            return None;
+                        }
+                        let Value::Table(outer) = &args[j] else { return None };
+                        let outer = outer.try_borrow().ok()?;
+                        for k in 0..outer.len() {
+                            if let Some(Value::Table(e)) = outer.get_num(k as f64) {
+                                if Rc::as_ptr(e) as *mut std::ffi::c_void == out[i].table {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
