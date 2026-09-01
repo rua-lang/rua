@@ -1676,6 +1676,9 @@ fn formatting_never_changes_what_a_program_says() {
             assert_eq!(tokens(&src), tokens(&once), "{} lexes differently", path.display());
             let twice = rua::fmt(&once).unwrap();
             assert_eq!(once, twice, "{} is not settled by one pass", path.display());
+            // and the stronger claim: the layout it produces is the one these
+            // files were already written in
+            assert_eq!(once, src, "{} is not laid out the way it is written", path.display());
             // a shebang is not a token and not a comment, and still has to survive
             if src.starts_with("#!") {
                 assert!(once.starts_with("#!"), "{} lost its shebang", path.display());
@@ -1709,6 +1712,14 @@ fn formatting_lays_out_the_shapes_that_are_easy_to_get_wrong() {
         ("fn f() {\nlet a = 1\nif a { a }\n}\n", "fn f() {\n    let a = 1\n    if a { a }\n}\n"),
         // one blank line survives, several become one
         ("let a = 1\n\n\n\nlet b = 2\n", "let a = 1\n\nlet b = 2\n"),
+        // two brackets opened on one line are one step in, not two: what a
+        // reader indents for is the line left open, not the brackets it took
+        (
+            "fn f() {\nrows.push(#{\nname: 1,\n})\n}\n",
+            "fn f() {\n    rows.push(#{\n        name: 1,\n    })\n}\n",
+        ),
+        // and a line that begins by closing belongs with the one that opened
+        ("if a {\nb\n} else {\nc\n}\n", "if a {\n    b\n} else {\n    c\n}\n"),
     ];
     for (input, want) in cases {
         assert_eq!(rua::fmt(input).unwrap(), want, "laying out {input:?}");
@@ -1728,6 +1739,24 @@ fn formatting_keeps_comments_where_they_were_put() {
     // a comment on its own line is indented with the code around it
     let inside = "fn f() {\n// why\nlet a = 1\n}\n";
     assert_eq!(rua::fmt(inside).unwrap(), "fn f() {\n    // why\n    let a = 1\n}\n");
+}
+
+/// Inside a call's arguments, a line further right than the block indent was
+/// lined up with something on purpose. A line further left was not.
+#[test]
+fn formatting_keeps_a_continuation_that_was_lined_up() {
+    // aligned under the bracket it belongs to: left as written
+    let aligned = "print(format(\"{}\",\n             a, b));\n";
+    assert_eq!(rua::fmt(aligned).unwrap(), aligned);
+
+    // further left than the block indent: given the block indent
+    let under = "print(g(1,\n2));\n";
+    assert_eq!(rua::fmt(under).unwrap(), "print(g(1,\n    2));\n");
+
+    // a block is a block, however it was written — there is nothing to line
+    // up with after a `{` that ends its line
+    let block = "fn f() {\n        let a = 1\n}\n";
+    assert_eq!(rua::fmt(block).unwrap(), "fn f() {\n    let a = 1\n}\n");
 }
 
 /// A file nobody can lex is left alone rather than half laid out.

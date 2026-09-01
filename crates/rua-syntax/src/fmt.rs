@@ -25,6 +25,8 @@ struct Piece {
     /// The spaces that stood before it on its own line. A comment aligned in
     /// a column with the ones above it was put there on purpose.
     gap: usize,
+    /// If it begins a line, the column it began at.
+    col: usize,
 }
 
 /// A `|` opens a closure's parameters, closes them, or separates the
@@ -85,6 +87,10 @@ fn interleave(src: &str, scan: &crate::lexer::Scan) -> Vec<Piece> {
             breaks: between.bytes().filter(|b| *b == b'\n').count(),
             bar: Bar::No,
             gap: between.len() - between.trim_end_matches(' ').len(),
+            col: match between.rfind('\n') {
+                Some(nl) => between[nl + 1..].chars().filter(|c| *c == ' ').count(),
+                None => 0,
+            },
         });
         prev_end = span.hi as usize;
     }
@@ -133,41 +139,74 @@ fn classify_bars(pieces: &mut [Piece]) {
 const INDENT: &str = "    ";
 
 fn render(pieces: &[Piece]) -> String {
+    // Indentation is a property of lines, not of brackets. `push(#{` opens
+    // two and still means one step in: what a reader indents for is the line
+    // that was left open, however many brackets it took to leave it open.
     let mut out = String::new();
-    let mut depth: usize = 0;
-    let mut at_line_start = true;
-    for (i, p) in pieces.iter().enumerate() {
-        let closes = matches!(p.tok, Some(Tok::RBrace | Tok::RBracket | Tok::RParen));
-        if closes {
-            depth = depth.saturating_sub(1);
-        }
-        if i == 0 {
-            // a file starts at the left margin whatever the source did
-        } else if p.breaks > 0 {
-            // one blank line is a paragraph break and worth keeping; more is
-            // the same paragraph break typed harder
-            let blanks = (p.breaks - 1).min(1);
+    let mut level: usize = 0;
+    // which brackets are open where a line begins: a block indents, an
+    // argument list may be lined up instead
+    let mut open: Vec<Tok> = Vec::new();
+    for line in lines(pieces) {
+        let first = &pieces[line.start];
+        if line.start > 0 {
+            let blanks = (first.breaks - 1).min(1);
             for _ in 0..=blanks {
                 out.push('\n');
             }
-            at_line_start = true;
-        } else if p.tok.is_none() && p.gap > 1 {
-            // a trailing comment keeps the column it was written in
-            for _ in 0..p.gap {
+        }
+        // a line that begins by closing what an earlier line opened belongs
+        // with the line that opened it
+        let closes_first = matches!(
+            first.tok,
+            Some(Tok::RBrace | Tok::RBracket | Tok::RParen)
+        );
+        let block = level.saturating_sub(closes_first as usize);
+        // Inside a call's arguments or an array, a line further right than
+        // the block would put it was lined up with something on purpose —
+        // under the bracket it belongs to, usually. A line further left was
+        // not, and gets the block indent.
+        let aligned = matches!(open.last(), Some(Tok::LParen | Tok::LBracket))
+            && !closes_first
+            && first.col > block * INDENT.len();
+        if aligned {
+            for _ in 0..first.col {
                 out.push(' ');
             }
-        } else if needs_space(pieces, i) {
-            out.push(' ');
-        }
-        if at_line_start {
-            for _ in 0..depth {
+        } else {
+            for _ in 0..block {
                 out.push_str(INDENT);
             }
-            at_line_start = false;
         }
-        out.push_str(&p.text);
-        if matches!(p.tok, Some(Tok::LBrace | Tok::LBracket | Tok::LParen)) {
-            depth += 1;
+        for i in line.start..line.end {
+            if i > line.start {
+                let p = &pieces[i];
+                if p.tok.is_none() && p.gap > 1 {
+                    // a trailing comment keeps the column it was written in
+                    for _ in 0..p.gap {
+                        out.push(' ');
+                    }
+                } else if needs_space(pieces, i) {
+                    out.push(' ');
+                }
+            }
+            out.push_str(&pieces[i].text);
+        }
+        for i in line.start..line.end {
+            match pieces[i].tok {
+                Some(Tok::LBrace) => open.push(Tok::LBrace),
+                Some(Tok::LParen) => open.push(Tok::LParen),
+                Some(Tok::LBracket) => open.push(Tok::LBracket),
+                Some(Tok::RBrace | Tok::RParen | Tok::RBracket) => {
+                    open.pop();
+                }
+                _ => {}
+            }
+        }
+        match line.net.cmp(&0) {
+            std::cmp::Ordering::Greater => level += 1,
+            std::cmp::Ordering::Less => level = level.saturating_sub(1),
+            std::cmp::Ordering::Equal => {}
         }
     }
     while out.ends_with('\n') || out.ends_with(' ') {
@@ -175,6 +214,39 @@ fn render(pieces: &[Piece]) -> String {
     }
     out.push('\n');
     out
+}
+
+/// One line of output: which pieces are on it, and whether it leaves more
+/// brackets open than it closes.
+struct Line {
+    start: usize,
+    end: usize,
+    net: i32,
+}
+
+fn lines(pieces: &[Piece]) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut start = 0;
+    for i in 0..pieces.len() {
+        if i > 0 && pieces[i].breaks > 0 {
+            out.push(Line { start, end: i, net: net_brackets(&pieces[start..i]) });
+            start = i;
+        }
+    }
+    if start < pieces.len() {
+        out.push(Line { start, end: pieces.len(), net: net_brackets(&pieces[start..]) });
+    }
+    out
+}
+
+fn net_brackets(line: &[Piece]) -> i32 {
+    line.iter()
+        .map(|p| match p.tok {
+            Some(Tok::LBrace | Tok::LBracket | Tok::LParen) => 1,
+            Some(Tok::RBrace | Tok::RBracket | Tok::RParen) => -1,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Does a space belong between these two?
