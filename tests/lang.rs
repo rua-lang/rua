@@ -1315,3 +1315,31 @@ fn a_compiled_index_check_agrees_with_the_interpreter() {
     assert_eq!(with, "0,0,0,0,30,90");
     assert_eq!(with, without, "the compiler and the interpreter must agree");
 }
+
+/// Compiled code can make an array and push it into one of its caller's. If
+/// the call then bails out, the interpreter runs the whole thing again — so
+/// the append has to have been undone, or the row is there twice.
+#[test]
+fn a_row_pushed_before_a_trap_is_not_pushed_twice() {
+    let mut vm = Vm::new();
+    vm.jit.threshold = 3;
+    let out = vm
+        .eval(
+            r#"
+        fn addrow(m, k, t) {
+            let r = []
+            r.push(k)
+            m.push(r)      // a table this code made, escaping into the caller's
+            t[k]           // and past the end of `t` on the later calls
+        }
+        let t = []
+        for i in 0..100 { t.push(i) }
+        let m = []
+        for i in 0..120 { try(|| addrow(m, i, t)) }
+        return m.len(), m[0][0], m[119][0];
+        "#,
+        )
+        .unwrap();
+    let got: Vec<f64> = out.iter().map(|v| v.as_num().unwrap()).collect();
+    assert_eq!(got, vec![120.0, 0.0, 119.0], "one row per call, in order");
+}
