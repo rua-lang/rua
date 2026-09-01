@@ -42,13 +42,12 @@ colours.
 
 ## fresh
 
-`fresh` reads TextMate grammars directly, so it uses the same one VS Code
-does. Put the grammar where it can find it and name it in `config.json`:
-
-```sh
-mkdir -p ~/.config/fresh/grammars
-cp editors/vscode/syntaxes/rua.tmLanguage.json ~/.config/fresh/grammars/
-```
+fresh highlights with [syntect], which reads `.sublime-syntax` and **not**
+TextMate `.tmLanguage.json` — so it cannot share the grammar VS Code uses.
+There is a syntect grammar for rua in `editors/fresh/rua/`, but fresh loads
+user grammars through its package manager rather than from a directory, and
+that path is not covered by `fresh --cmd help`. Until it is, borrow Rust's
+built-in grammar, which is close because rua was shaped after it:
 
 ```jsonc
 // ~/.config/fresh/config.json
@@ -57,9 +56,9 @@ cp editors/vscode/syntaxes/rua.tmLanguage.json ~/.config/fresh/grammars/
   "languages": {
     "rua": {
       "extensions": ["rua"],
+      "grammar": "Rust",
       "comment_prefix": "//",
-      "auto_indent": true,
-      "textmate_grammar": "/home/you/.config/fresh/grammars/rua.tmLanguage.json"
+      "auto_indent": true
     }
   },
   "lsp": {
@@ -76,8 +75,15 @@ cp editors/vscode/syntaxes/rua.tmLanguage.json ~/.config/fresh/grammars/
 }
 ```
 
+What Rust's grammar gets wrong is `#{`, `::` on a module, and the `{}` inside
+strings; everything else — `fn`, `let`, `match`, comments, numbers, strings —
+lands. The language server is unaffected either way, and it is the half that
+knows what the names mean.
+
 `fresh --cmd config show` prints the merged configuration back, which is the
 quickest way to see that it took.
+
+[syntect]: https://github.com/trishume/syntect
 
 ## Neovim
 
@@ -118,9 +124,10 @@ Rust for colours — the same trick `.gitattributes` uses for GitHub:
 
 The VS Code extension compiles and packages on this machine, and the `.vsix`
 carries its own `vscode-languageclient`. The `fresh` configuration above is
-the one running here — `fresh --cmd config show` reads it back. Neovim and
-Zed are not installed on this machine, so those two are written from their
-documentation and not from a run.
+the one running here — `fresh --cmd config show` reads it back — though
+whether its LSP client attaches has not been watched from the inside. Neovim
+and Zed are not installed on this machine, so those two are written from
+their documentation and not from a run.
 
 ## Anything else
 

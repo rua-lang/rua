@@ -1,0 +1,150 @@
+%YAML 1.2
+---
+# Syntax highlighting for rua, in the format syntect reads — which is what
+# Fresh uses. It is the same set of lexical facts as the TextMate grammar in
+# `editors/vscode`, written again because the two engines read different
+# files: syntect loads `.sublime-syntax` and nothing else.
+#
+# Everything here was taken from `crates/rua-syntax/src/lexer.rs`. Where the
+# lexer and this disagree, the lexer is right.
+name: rua
+scope: source.rua
+file_extensions:
+  - rua
+first_line_match: '^#!.*\brua\b'
+
+variables:
+  ident: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: keywords
+    - include: names
+    - include: operators
+
+  comments:
+    - match: '//'
+      scope: punctuation.definition.comment.rua
+      push:
+        - meta_scope: comment.line.double-slash.rua
+        - match: $\n?
+          pop: true
+    # `/* */` nests in rua: the lexer keeps a depth counter, so this pushes
+    # itself rather than stopping at the first `*/`
+    - match: '/\*'
+      scope: punctuation.definition.comment.begin.rua
+      push: block_comment
+
+  block_comment:
+    - meta_scope: comment.block.rua
+    - match: '/\*'
+      push: block_comment
+    - match: '\*/'
+      scope: punctuation.definition.comment.end.rua
+      pop: true
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.rua
+      push:
+        - meta_scope: string.quoted.double.rua
+        # `{{` and `}}` are how a literal brace is written, so neither opens
+        # an interpolation
+        - match: '\{\{|\}\}'
+          scope: constant.character.escape.rua
+        - match: '\\.'
+          scope: constant.character.escape.rua
+        # `{expr}` and `{expr:spec}` hold an expression, and it is highlighted
+        # as one
+        - match: '\{'
+          scope: punctuation.section.interpolation.begin.rua
+          push: interpolation
+        - match: '"'
+          scope: punctuation.definition.string.end.rua
+          pop: true
+
+  interpolation:
+    - meta_scope: meta.interpolation.rua
+    - clear_scopes: 1
+    # a format spec runs to the closing brace; `::` is a path, not a spec
+    - match: ':(?!:)[^}"]*(?=\})'
+      scope: constant.other.format-spec.rua
+    - match: '\}'
+      scope: punctuation.section.interpolation.end.rua
+      pop: true
+    - match: '(?=")'
+      pop: true
+    - include: numbers
+    - include: keywords
+    - include: names
+    - include: operators
+
+  numbers:
+    - match: '\b0[xX][0-9A-Fa-f_]+\b'
+      scope: constant.numeric.integer.hexadecimal.rua
+    # a `.` only continues a number when a digit follows it, so `0..10` is a
+    # range between two integers and not a malformed float
+    - match: '\b[0-9][0-9_]*(\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?\b'
+      scope: constant.numeric.rua
+
+  keywords:
+    - match: '\b(if|else|match|while|for|loop|in|return|break|continue)\b'
+      scope: keyword.control.rua
+    - match: '\b(let|mut|fn)\b'
+      scope: storage.type.rua
+    - match: '\b(true|false)\b'
+      scope: constant.language.boolean.rua
+    - match: '\bnil\b'
+      scope: constant.language.null.rua
+
+  names:
+    # `fn name` — the declaration
+    - match: '\b(fn)\s+({{ident}})'
+      captures:
+        1: storage.type.rua
+        2: entity.name.function.rua
+    # `mod::` — a module path
+    - match: '\b({{ident}})\s*(::)'
+      captures:
+        1: variable.other.namespace.rua
+        2: punctuation.accessor.rua
+    # `.field` and `.method(` — reached with a dot
+    - match: '(\.)({{ident}})\s*(?=\()'
+      captures:
+        1: punctuation.accessor.rua
+        2: variable.function.rua
+    - match: '(\.)({{ident}})'
+      captures:
+        1: punctuation.accessor.rua
+        2: variable.other.member.rua
+    # a call
+    - match: '\b({{ident}})\s*(?=\()'
+      scope: variable.function.rua
+    - match: '\b{{ident}}\b'
+      scope: variable.other.rua
+
+  operators:
+    # `#{` opens a map, and the `#` is part of it
+    - match: '#\{'
+      scope: punctuation.section.mapping.begin.rua
+    - match: '\.\.=|\.\.'
+      scope: keyword.operator.range.rua
+    - match: '->|=>'
+      scope: punctuation.separator.rua
+    - match: '\+=|-=|\*=|/=|%='
+      scope: keyword.operator.assignment.augmented.rua
+    - match: '==|!=|<=|>=|&&|\|\||[<>]'
+      scope: keyword.operator.comparison.rua
+    - match: '[+\-*/%!]'
+      scope: keyword.operator.arithmetic.rua
+    - match: '='
+      scope: keyword.operator.assignment.rua
+    - match: '[|]'
+      scope: keyword.operator.rua
+    - match: '[{}()\[\]]'
+      scope: punctuation.section.rua
+    - match: '[;,:]'
+      scope: punctuation.separator.rua
