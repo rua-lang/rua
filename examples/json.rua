@@ -117,7 +117,7 @@ fn escape(s) {
 fn write_value(v, indent) {
     let pad = " ".repeat(indent + 2)
     let close = " ".repeat(indent)
-    let t = type(v)
+    let t = typeof(v)
     if v == nil { return "null" }
     if t == "boolean" { return if v { "true" } else { "false" } }
     if t == "number" { return str(v) }

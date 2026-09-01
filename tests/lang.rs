@@ -280,7 +280,7 @@ fn a_tree_compiled_code_made_is_an_ordinary_table() {
         }
         let t = nil
         for i in 0..40 { t = make(3) }
-        return type(t), type(t.l), type(t.l.r), t.l.r.l.l, type(t.l.r.l);
+        return typeof(t), typeof(t.l), typeof(t.l.r), t.l.r.l.l, typeof(t.l.r.l);
     "#;
     let mut vm = Vm::new();
     vm.jit.threshold = 2;
@@ -330,7 +330,7 @@ fn jit_leaves_nil_returning_functions_alone() {
         }
         let last = 1;
         for i in 0..10 { last = maybe(i); }
-        type(last)
+        typeof(last)
     "#,
         )
         .unwrap();
@@ -390,7 +390,7 @@ fn top_level_functions_are_globals() {
 
     // a `fn` inside a block stays local
     let out = vm
-        .eval("let outer = { fn inner(x) { x * 2 } inner(21) }; return outer, type(inner);")
+        .eval("let outer = { fn inner(x) { x * 2 } inner(21) }; return outer, typeof(inner);")
         .unwrap();
     assert_eq!(out[0], Value::Num(42.0));
     assert_eq!(out[1].to_string(), "nil");
@@ -559,7 +559,7 @@ fn match_expressions() {
     assert_eq!(n("match 9 { x => x * 2 }"), 18.0);
     assert_eq!(s(r#"match "b" { "a" => "first", "b" => "second", _ => "?" }"#), "second");
     // no arm matches: the match is nil
-    assert_eq!(s("type(match 5 { 1 => 1 })"), "nil");
+    assert_eq!(s("typeof(match 5 { 1 => 1 })"), "nil");
     // patterns bind per arm and do not leak
     assert_eq!(n("let x = 1; let m = match 42 { x => x }; m + x"), 43.0);
     // a block-shaped expression in statement position is a statement, as in
@@ -636,7 +636,7 @@ fn semicolons_are_optional() {
     "#;
     assert_eq!(n(src), 3.0);
     // but a trailing `;` still discards the value, as in Rust
-    assert_eq!(s("fn f() { 1; } type(f())"), "nil");
+    assert_eq!(s("fn f() { 1; } typeof(f())"), "nil");
 }
 
 /// Compiled code reads tables through a cached view of their array part. That
@@ -726,7 +726,7 @@ fn compiled_index_bounds_are_checked() {
         let xs = [10, 20, 30]
         let warm = 0
         for k in 0..5 { warm = at(xs, 1) }
-        return at(xs, 1), type(at(xs, 9)), type(at(xs, 0.5))
+        return at(xs, 1), typeof(at(xs, 9)), typeof(at(xs, 0.5))
     "#;
     let mut interp = Vm::new();
     interp.jit.enabled = false;
@@ -1093,7 +1093,7 @@ fn object_keys_keep_their_identity() {
         let k = [1, 2]
         m[k] = "value"
         let back = m.keys()[0]
-        return type(back), m[k], m[back], back.len()
+        return typeof(back), m[k], m[back], back.len()
     "#,
         )
         .unwrap();

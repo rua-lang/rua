@@ -14,7 +14,7 @@ let NIL = #{ t: 3 }
 
 fn cons(a, d) { #{ t: 0, a: a, d: d } }
 
-fn is_pair(x) { type(x) == "table" && x.t == 0 }
+fn is_pair(x) { typeof(x) == "table" && x.t == 0 }
 
 // An array of values becomes a list, right to left.
 fn list_from(items, from) {
@@ -155,7 +155,7 @@ fn parse_all(src) {
 
 // -------------------------------------------------------------- printing
 fn write_str(x) {
-    let ty = type(x)
+    let ty = typeof(x)
     if ty == "number" { return str(x) }
     if ty == "string" { return x }
     if ty == "boolean" { return if x { "#t" } else { "#f" } }
@@ -185,13 +185,13 @@ fn truthy(v) { v != false }
 
 fn eval(x, env) {
     while true {
-        let tx = type(x)
+        let tx = typeof(x)
         if tx == "string" { return env_get(env, x) }
         if tx != "table" { return x }                  // numbers, booleans
         if x.t != 0 { return x }                       // (), closures, prims
         let op = x.a
 
-        if type(op) == "string" {
+        if typeof(op) == "string" {
             if op == "quote" { return x.d.a }
 
             if op == "if" {
@@ -292,7 +292,7 @@ fn eval(x, env) {
             p = p.d
         }
 
-        if type(f) != "table" { error("not a procedure: " + write_str(f)) }
+        if typeof(f) != "table" { error("not a procedure: " + write_str(f)) }
         if f.t == 2 {
             let prim = f.f
             return prim(args)
@@ -357,9 +357,9 @@ fn install(env) {
     prim(env, "length", |a| { list_len(a[0]) })
     prim(env, "null?", |a| { a[0] == NIL })
     prim(env, "pair?", |a| { is_pair(a[0]) })
-    prim(env, "number?", |a| { type(a[0]) == "number" })
-    prim(env, "symbol?", |a| { type(a[0]) == "string" })
-    prim(env, "procedure?", |a| { type(a[0]) == "table" && (a[0].t == 1 || a[0].t == 2) })
+    prim(env, "number?", |a| { typeof(a[0]) == "number" })
+    prim(env, "symbol?", |a| { typeof(a[0]) == "string" })
+    prim(env, "procedure?", |a| { typeof(a[0]) == "table" && (a[0].t == 1 || a[0].t == 2) })
     prim(env, "not", |a| { a[0] == false })
     prim(env, "eq?", |a| { a[0] == a[1] })
     prim(env, "reverse", |a| {
