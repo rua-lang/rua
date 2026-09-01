@@ -389,7 +389,7 @@ impl fmt::Debug for Function {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub enum Value {
     #[default]
     Nil,
@@ -404,6 +404,34 @@ pub enum Value {
     /// A captured local. Never visible to scripts: it only ever sits in a
     /// frame slot that the resolver marked as captured.
     Cell(CellRef),
+}
+
+/// Copying a value is the interpreter's most frequent single act — every
+/// register read is one — so it is written out rather than derived.
+///
+/// Every heap-backed variant is one pointer to one counted allocation, and
+/// every other variant is plain bits. Taking the count and then copying the
+/// sixteen bytes whole leaves a test, one increment and a pair of moves; the
+/// derived version rebuilds the enum separately inside each arm, and cannot
+/// share that work between them.
+impl Clone for Value {
+    #[inline(always)]
+    fn clone(&self) -> Value {
+        // SAFETY: the count is raised before the bytes are copied, so the copy
+        // is a second owner of the same allocation; the variants that own
+        // nothing are copied as they stand.
+        unsafe {
+            match self {
+                Value::Str(s) => Rc::increment_strong_count(Rc::as_ptr(&s.0)),
+                Value::Table(t) => Rc::increment_strong_count(Rc::as_ptr(t)),
+                Value::Func(f) => Rc::increment_strong_count(Rc::as_ptr(f)),
+                Value::Native(n) => Rc::increment_strong_count(Rc::as_ptr(n)),
+                Value::Cell(c) => Rc::increment_strong_count(Rc::as_ptr(c)),
+                Value::Nil | Value::Bool(_) | Value::Num(_) | Value::Ptr(_) => {}
+            }
+            std::ptr::read(self)
+        }
+    }
 }
 
 impl Value {
@@ -738,12 +766,17 @@ impl Table {
         }
     }
 
-    /// Write `t.field = v` in the same way. Returns whether it happened; a nil
-    /// value goes the long way round, since removing an entry moves the rest.
+    /// Write `t.field = v` in the same way. Returns whether it happened.
+    ///
+    /// A nil value means "remove", which moves the entries after it and so
+    /// goes the long way round — but only if there is anything there to
+    /// remove. There usually is not: `#{ l: nil, r: nil }` names its fields
+    /// into an empty table, and asking here costs a pointer comparison
+    /// instead of an owned key nobody keeps.
     #[inline]
     pub fn set_field(&mut self, name: &RStr, v: &Value) -> bool {
         if matches!(v, Value::Nil) {
-            return false;
+            return self.probe_str(name).is_none();
         }
         if let Some(i) = self.probe_str(name) {
             self.pairs[i].1 = v.clone();

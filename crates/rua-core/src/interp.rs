@@ -912,7 +912,7 @@ impl Vm {
     }
 
     /// `a[k]` and `a::k`: a plain lookup, no method fallback.
-    pub fn index(&mut self, o: &Value, k: &Value) -> Res<Value> {
+    pub fn index(&self, o: &Value, k: &Value) -> Res<Value> {
         match o {
             Value::Table(t) => Ok(t.borrow().get(&Key::from_value(k)?)),
             // a library member is always reached by name
@@ -944,7 +944,7 @@ impl Vm {
 
     /// `a.m(..)`: the receiver's own field first, then its type's library —
     /// this is what makes `[3,1,2].sort()` and `"ab".upper()` work.
-    pub(crate) fn method(&mut self, o: &Value, name: &RStr) -> Res<Value> {
+    pub(crate) fn method(&self, o: &Value, name: &RStr) -> Res<Value> {
         let kind = match o {
             Value::Table(t) => {
                 let own = t.borrow().get_field(name).unwrap_or(Value::Nil);
@@ -1109,11 +1109,18 @@ pub fn equality(op: crate::bytecode::BinKind, l: &Value, r: &Value) -> Option<bo
     }
 }
 
-pub fn arith(op: crate::bytecode::BinKind, l: Value, r: Value) -> Res<Value> {
+/// The general form of a binary operator: everything the specialised numeric
+/// paths in the interpreter loop decline to handle.
+///
+/// It borrows both operands. Nothing here keeps either of them — a comparison
+/// reads them, a concatenation copies the bytes out — and taking them by value
+/// meant the loop cloned two registers, and dropped them again, on every
+/// operation that was not two numbers.
+pub fn arith(op: crate::bytecode::BinKind, l: &Value, r: &Value) -> Res<Value> {
     use crate::bytecode::BinKind::*;
     Ok(match op {
         // `+` concatenates when either side is a string, as in Rust's String + &str
-        Add => match (&l, &r) {
+        Add => match (l, r) {
             (Value::Str(a), b) => Value::str(format!("{a}{b}")),
             (a, Value::Str(b)) => Value::str(format!("{a}{b}")),
             _ => Value::Num(l.as_num()? + r.as_num()?),
@@ -1128,7 +1135,7 @@ pub fn arith(op: crate::bytecode::BinKind, l: Value, r: Value) -> Res<Value> {
         Eq => Value::Bool(l == r),
         Ne => Value::Bool(l != r),
         Lt | Le | Gt | Ge => {
-            let ord = match (&l, &r) {
+            let ord = match (l, r) {
                 (Value::Str(a), Value::Str(b)) => a.cmp(b),
                 _ => l
                     .as_num()?

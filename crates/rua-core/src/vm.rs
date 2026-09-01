@@ -118,10 +118,12 @@ impl Vm {
             // routing every return through a pooled vector was costing about
             // 150 host instructions per call.
             Ok((rbase, n)) if n != MULTI && nres != MULTI => {
+                // this frame is about to be released, so its results are
+                // moved into the caller rather than copied
                 let start = self.base + rbase as usize;
                 for i in 0..nres as usize {
                     let v = if (i as u16) < n {
-                        self.stack[start + i].clone()
+                        std::mem::take(&mut self.stack[start + i])
                     } else {
                         Value::Nil
                     };
@@ -137,7 +139,7 @@ impl Vm {
                     let start = self.base + rbase as usize;
                     let mut v = self.take_vec(n as usize);
                     for i in 0..n as usize {
-                        v.push(self.stack[start + i].clone());
+                        v.push(std::mem::take(&mut self.stack[start + i]));
                     }
                     v
                 };
@@ -309,7 +311,6 @@ impl Vm {
                     } else if let Some(b) = crate::interp::equality(kind, x, y) {
                         Value::Bool(b)
                     } else {
-                        let (x, y) = (x.clone(), y.clone());
                         arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
                     };
                     set!(dst, v);
@@ -321,7 +322,6 @@ impl Vm {
                         (x, y) => match crate::interp::equality(kind, x, y) {
                             Some(b) => Value::Bool(b),
                             None => {
-                                let (x, y) = (x.clone(), y.clone());
                                 arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?
                             }
                         },
@@ -333,7 +333,6 @@ impl Vm {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -343,7 +342,6 @@ impl Vm {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -353,7 +351,6 @@ impl Vm {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -363,7 +360,6 @@ impl Vm {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x / y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Div, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -373,7 +369,6 @@ impl Vm {
                     let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -383,7 +378,6 @@ impl Vm {
                     let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -393,7 +387,6 @@ impl Vm {
                     let v = match (at!(a), &proto.consts[k as usize]) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
                         (x, y) => {
-                            let (x, y) = (x.clone(), y.clone());
                             arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
                         }
                     };
@@ -427,10 +420,10 @@ impl Vm {
                     // and none on the way out.
                     match unsafe { std::mem::take(&mut *regs.add(base as usize)) } {
                         Value::Func(f) => {
-                            match self.enter_frame(&f, base, nargs, nres, &current, pc, frames) {
+                            match self.enter_frame(f, base, nargs, nres, &mut current, pc, frames)
+                            {
                                 Err(e) => return Err(self.here(proto, pc, e)),
                                 Ok(true) => {
-                                    current = f;
                                     proto = unsafe { &*Rc::as_ptr(&current.proto) };
                                     pc = 0;
                                     resync!();
@@ -449,11 +442,14 @@ impl Vm {
                 }
                 Op::Method { base, name, nargs, nres } => {
                     self.set_line(proto.lines[pc - 1]);
-                    let recv = get!(base + 1);
+                    // The receiver stays in its register — it is the first
+                    // argument — and looking a method up only reads it, so it
+                    // is borrowed rather than counted in and out again.
+                    let recv = at!(base + 1);
                     // the name is a constant of this function: borrow it
                     let m = match &proto.consts[name as usize] {
-                        Value::Str(s) => self.method(&recv, s),
-                        other => self.method(&recv, &RStr::from(other.to_string())),
+                        Value::Str(s) => self.method(recv, s),
+                        other => self.method(recv, &RStr::from(other.to_string())),
                     }
                     .map_err(|e| self.at(proto, pc, e))?;
                     // the receiver is the first argument, as in Rust
@@ -504,14 +500,17 @@ impl Vm {
                         (Value::Table(t), Value::Num(n)) => {
                             t.borrow().get_num(*n).cloned()
                         }
+                        // `t[k]` with the name in a register, which is what a
+                        // table used as a map looks like: reach it by name,
+                        // rather than building an owned key to throw away
+                        (Value::Table(t), Value::Str(s)) => t.borrow().get_field(s),
                         _ => None,
                     };
                     let v = match fast {
                         Some(v) => v,
-                        None => {
-                            let (o, k) = (get!(obj), get!(key));
-                            self.index(&o, &k).map_err(|e| self.at(proto, pc, e))?
-                        }
+                        None => self
+                            .index(at!(obj), at!(key))
+                            .map_err(|e| self.at(proto, pc, e))?,
                     };
                     set!(dst, v);
                 }
@@ -527,18 +526,19 @@ impl Vm {
                     };
                     let v = match fast {
                         Some(v) => v,
-                        None => {
-                            let (o, key) = (get!(obj), key.clone());
-                            self.index(&o, &key).map_err(|e| self.at(proto, pc, e))?
-                        }
+                        None => self
+                            .index(at!(obj), key)
+                            .map_err(|e| self.at(proto, pc, e))?,
                     };
                     set!(dst, v);
                 }
                 Op::SetIndexK { obj, k, val } => {
-                    let key = proto.consts[k as usize].clone();
+                    // the key is a constant of this function, and nothing here
+                    // keeps it: borrow it out of the pool
+                    let key = &proto.consts[k as usize];
                     let done = match (
                         at!(obj),
-                        &key,
+                        key,
                         at!(val),
                     ) {
                         (Value::Table(t), Value::Num(n), v) => t.borrow_mut().set_num(*n, v),
@@ -552,7 +552,7 @@ impl Vm {
                     let v = get!(val);
                     match o {
                         Value::Table(t) => {
-                            let key = Key::from_value(&key).map_err(|e| self.at(proto, pc, e))?;
+                            let key = Key::from_value(key).map_err(|e| self.at(proto, pc, e))?;
                             t.borrow_mut().set(key, v);
                         }
                         other => {
@@ -593,17 +593,19 @@ impl Vm {
                     }
                 }
                 Op::Append { obj, val } => {
+                    // the table is only written through, not kept
                     let v = get!(val);
-                    if let Value::Table(t) = get!(obj) {
+                    if let Value::Table(t) = at!(obj) {
                         t.borrow_mut().push(v);
                     }
                 }
                 Op::AppendMulti { obj } => {
-                    let vals = self.take_multi();
-                    if let Value::Table(t) = get!(obj) {
+                    let mut vals = self.take_multi();
+                    if let Value::Table(t) = at!(obj) {
                         let mut b = t.borrow_mut();
-                        for v in &vals {
-                            b.push(v.clone());
+                        // the buffer is on its way to the pool: move
+                        for v in vals.drain(..) {
+                            b.push(v);
                         }
                     }
                     self.recycle_vec(vals);
@@ -629,15 +631,21 @@ impl Vm {
                 Op::IterNext { iter, base, count, exit } => {
                     let it = get!(iter);
                     let empty = self.take_vec(0);
-                    let vals =
+                    let mut vals =
                         self.call_value(&it, empty).map_err(|e| self.here(proto, pc, e))?;
                     resync!();
                     if matches!(vals.first(), None | Some(Value::Nil)) {
                         self.recycle_vec(vals);
                         pc = exit as usize;
                     } else {
+                        // the buffer is on its way back to the pool, so what
+                        // the iterator produced is moved into the loop
+                        // variables rather than copied
                         for i in 0..count {
-                            let v = vals.get(i as usize).cloned().unwrap_or(Value::Nil);
+                            let v = vals
+                                .get_mut(i as usize)
+                                .map(std::mem::take)
+                                .unwrap_or(Value::Nil);
                             set!(base + i, v);
                         }
                         self.recycle_vec(vals);
@@ -650,7 +658,6 @@ impl Vm {
                     } else if let Some(b) = crate::interp::equality(kind, x, y) {
                         b
                     } else {
-                        let (x, y) = (x.clone(), y.clone());
                         arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
                     };
                     if !taken {
@@ -664,7 +671,6 @@ impl Vm {
                         (x, y) => match crate::interp::equality(kind, x, y) {
                             Some(b) => b,
                             None => {
-                                let (x, y) = (x.clone(), y.clone());
                                 arith(kind, x, y).map_err(|e| self.at(proto, pc, e))?.truthy()
                             }
                         },
@@ -691,9 +697,9 @@ impl Vm {
                         // is not a number: let the ordinary paths say so
                         None => {
                             let kind = if le { BinKind::Le } else { BinKind::Lt };
-                            let next = arith(BinKind::Add, get!(counter), Value::Num(1.0))
+                            let next = arith(BinKind::Add, at!(counter), &Value::Num(1.0))
                                 .map_err(|e| self.at(proto, pc, e))?;
-                            let going = arith(kind, next.clone(), get!(limit))
+                            let going = arith(kind, &next, at!(limit))
                                 .map_err(|e| self.at(proto, pc, e))?
                                 .truthy();
                             set!(counter, next);
@@ -776,8 +782,10 @@ impl Vm {
                 let start = self.base + base as usize + 1;
                 if nargs == 1 {
                     if let Some(fast) = &n.fast1 {
-                        let a = self.stack[start].clone();
-                        let v = fast(&a)?;
+                        // the builtin only reads its argument, and it cannot
+                        // reach the stack to move it: borrow the register
+                        // rather than taking a reference count round trip
+                        let v = fast(&self.stack[start])?;
                         if nres == 1 {
                             self.set_reg(base, v);
                         }
@@ -786,9 +794,7 @@ impl Vm {
                     }
                 } else if nargs == 2 {
                     if let Some(fast) = &n.fast2 {
-                        let a = self.stack[start].clone();
-                        let b = self.stack[start + 1].clone();
-                        let v = fast(&a, &b)?;
+                        let v = fast(&self.stack[start], &self.stack[start + 1])?;
                         if nres == 1 {
                             self.set_reg(base, v);
                         }
@@ -838,11 +844,11 @@ impl Vm {
     #[inline(never)]
     fn enter_frame(
         &mut self,
-        f: &Rc<Function>,
+        f: Rc<Function>,
         base: Reg,
         nargs: u16,
         nres: u16,
-        current: &Rc<Function>,
+        current: &mut Rc<Function>,
         pc: usize,
         frames: &mut Vec<CallFrame>,
     ) -> Eval<bool> {
@@ -853,13 +859,17 @@ impl Vm {
         // that is not numeric, and every function at all when the JIT is off —
         // and asking about it is a flag read, not a call.
         if f.jit_state.get() != JitState::Blocked
-            && self.try_compiled_call(f, arg_start, nargs, ret_to, nres)
+            && self.try_compiled_call(&f, arg_start, nargs, ret_to, nres)
         {
             self.leave_depth();
             return Ok(false);
         }
+        // The caller's handle is not copied into the frame record and then
+        // dropped from the loop's variable: the two swap places, so entering
+        // a call touches no reference count at all. Nothing above may fail
+        // once this has happened.
         frames.push(CallFrame {
-            caller: current.clone(),
+            caller: std::mem::replace(current, f),
             base: self.base as u32,
             pc: pc as u32,
             ret_to: ret_to as u32,
@@ -867,13 +877,15 @@ impl Vm {
             nres,
             top: self.top as u32,
         });
+        let f = &*current;
         self.push_frame(Rc::as_ptr(&f.proto), self.line);
         // The frame opens on the arguments, so an argument that is already in
         // the right register — which every one of them is, since parameters
         // take the first registers in order — needs no move at all.
         let base = arg_start;
-        self.open_frame_at(base, f.proto.n_regs);
-        self.bind_params(&f.proto, base, nargs);
+        let n_regs = f.proto.n_regs;
+        self.open_frame_at(base, n_regs);
+        self.bind_params(&current.proto, base, nargs);
         self.base = base;
         Ok(true)
     }
@@ -938,11 +950,12 @@ impl Vm {
         let fits = from.is_some_and(|(_, count)| nres != MULTI || count <= 1);
         if let (true, Some((src, count))) = (fits, from) {
             // A register to register move: the source frame sits above the
-            // destination, so the two windows never overlap.
+            // destination, so the two windows never overlap — and it is about
+            // to be released, so the values are moved rather than copied.
             let want = if nres == MULTI { count } else { nres };
             for i in 0..want as usize {
                 let v = if (i as u16) < count {
-                    self.stack[src + i].clone()
+                    std::mem::take(&mut self.stack[src + i])
                 } else {
                     Value::Nil
                 };
@@ -963,7 +976,7 @@ impl Vm {
         } else {
             let mut v = self.take_vec(n as usize);
             for i in 0..n as usize {
-                v.push(self.stack[start + i].clone());
+                v.push(std::mem::take(&mut self.stack[start + i]));
             }
             v
         };
