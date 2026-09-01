@@ -1,0 +1,88 @@
+// HTTP over the sockets, in rua: a client that fetches a URL and a server
+// that hands out files from a directory.
+//
+// Plain HTTP only — there is no TLS in the runtime, so `https` is out. What
+// is here is enough to talk to a local service, which is what a script
+// usually wants.
+
+fn split_url(url) {
+    let rest = url
+    if rest.starts_with("http://") { rest = rest.slice(7, rest.len()) }
+    let slash = rest.find("/")
+    let host = if slash == nil { rest } else { rest.slice(0, slash) }
+    let path = if slash == nil { "/" } else { rest.slice(slash, rest.len()) }
+    if !host.contains(":") { host = host + ":80" }
+    return host, path
+}
+
+// Returns the status number, a map of headers, and the body.
+fn get(url) {
+    let (host, path) = split_url(url)
+    let name = host.split(":")[0]
+    let s = net::connect(host)
+    net::timeout(s, 10)
+    net::write(s, "GET {path} HTTP/1.0\r\nHost: {name}\r\nConnection: close\r\n\r\n")
+
+    let status = net::read_line(s)
+    if status == nil { error("no reply from {host}") }
+    let code = num(status.split(" ")[1])
+
+    let headers = #{}
+    while true {
+        let line = net::read_line(s)
+        if line == nil || line == "" { break }
+        let at = line.find(":")
+        if at != nil {
+            headers[line.slice(0, at).lower()] = line.slice(at + 1, line.len()).trim()
+        }
+    }
+    let body = net::read(s)
+    net::close(s)
+    return code, headers, body
+}
+
+fn kind_of(path) {
+    if path.ends_with(".html") { return "text/html" }
+    if path.ends_with(".json") { return "application/json" }
+    if path.ends_with(".css") { return "text/css" }
+    "text/plain; charset=utf-8"
+}
+
+// Serve `root` on `addr` until the process is stopped.
+fn serve(addr, root) {
+    let srv = net::listen(addr)
+    print("serving {root} on http://{net::address(srv)}")
+    while true {
+        let c = net::accept(srv)
+        net::timeout(c, 10)
+        let request = net::read_line(c)
+        if request == nil { net::close(c); continue }
+        // drain the headers: the body of a GET is not our business
+        while true {
+            let line = net::read_line(c)
+            if line == nil || line == "" { break }
+        }
+        let parts = request.split(" ")
+        let path = if parts.len() > 1 { parts[1] } else { "/" }
+        if path == "/" { path = "/index.html" }
+        // no `..`, ever: a path that climbs is a path we do not serve
+        let file = root + path
+        let (ok, body) = try(|| fs::read(file))
+        if path.contains("..") || !ok {
+            let msg = "not found: {path}"
+            net::write(c, "HTTP/1.0 404 Not Found\r\nContent-Length: {msg.len()}\r\n\r\n" + msg)
+        } else {
+            net::write(c, "HTTP/1.0 200 OK\r\nContent-Type: {kind_of(path)}\r\nContent-Length: {body.len()}\r\n\r\n" + body)
+        }
+        print("{parts[0]} {path} -> {if ok { 200 } else { 404 }}")
+        net::close(c)
+    }
+}
+
+if arg.len() > 1 && arg[0] == "serve" {
+    serve("127.0.0.1:8732", arg[1])
+} else if arg.len() > 0 {
+    let (code, headers, body) = get(arg[0])
+    print("status {code}, {headers.keys().len()} headers, {body.len()} bytes")
+    print(body)
+}

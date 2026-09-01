@@ -99,6 +99,7 @@ pub fn install(vm: &mut Vm) {
     vm.set_method_table(MethodTable::Table, t);
     os_io(vm);
     fs_lib(vm);
+    net_lib(vm);
     ffi_lib(vm);
     jit_lib(vm);
     vm.set_global("VERSION", Value::str("rua 0.1"));
@@ -832,6 +833,163 @@ fn fs_lib(vm: &mut Vm) {
                     t.push(Value::str(n));
                 }
                 Ok(Value::table(t))
+            })),
+        ],
+    );
+}
+
+thread_local! {
+    /// The sockets a script has open, by handle.
+    ///
+    /// A socket is a number rather than an object because rua has no type to
+    /// hang one on: the runtime owns it, closing is explicit, and dropping
+    /// the last reference to the script's number does not silently drop a
+    /// connection. A slot is emptied on close and never handed out again in
+    /// the same run, so a stale handle is an error rather than someone else's
+    /// connection.
+    static SOCKETS: RefCell<Vec<Option<Sock>>> = const { RefCell::new(Vec::new()) };
+}
+
+enum Sock {
+    /// Buffered, so that reading a line is a line and not a guess.
+    Stream(std::io::BufReader<std::net::TcpStream>),
+    Listener(std::net::TcpListener),
+}
+
+fn put_sock(s: Sock) -> Value {
+    SOCKETS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.push(Some(s));
+        Value::Num(all.len() as f64)
+    })
+}
+
+/// Do something with an open socket, by handle.
+fn with_sock<T>(h: &Value, what: &str, f: impl FnOnce(&mut Sock) -> Res<T>) -> Res<T> {
+    let i = h.as_num()? as usize;
+    SOCKETS.with(|all| {
+        let mut all = all.borrow_mut();
+        match all.get_mut(i.wrapping_sub(1)).and_then(|s| s.as_mut()) {
+            Some(sock) => f(sock),
+            None => err(format!("net::{what}: not an open socket")),
+        }
+    })
+}
+
+fn stream_of<'a>(s: &'a mut Sock, what: &str) -> Res<&'a mut std::io::BufReader<std::net::TcpStream>> {
+    match s {
+        Sock::Stream(s) => Ok(s),
+        Sock::Listener(_) => err(format!("net::{what}: that is a listener, not a connection")),
+    }
+}
+
+/// TCP, as much of it as a script needs: connect, listen, accept, read,
+/// write, close.
+fn net_lib(vm: &mut Vm) {
+    use std::io::{BufRead, Read, Write};
+    module(
+        vm,
+        "net",
+        vec![
+            ("connect", unary("connect", |addr| {
+                let addr = addr.as_str()?;
+                match std::net::TcpStream::connect(&*addr) {
+                    Ok(s) => Ok(put_sock(Sock::Stream(std::io::BufReader::new(s)))),
+                    Err(e) => err(format!("net::connect {addr}: {e}")),
+                }
+            })),
+            ("listen", unary("listen", |addr| {
+                let addr = addr.as_str()?;
+                match std::net::TcpListener::bind(&*addr) {
+                    Ok(l) => Ok(put_sock(Sock::Listener(l))),
+                    Err(e) => err(format!("net::listen {addr}: {e}")),
+                }
+            })),
+            // blocks until someone connects
+            ("accept", unary("accept", |h| {
+                let stream = with_sock(h, "accept", |s| match s {
+                    Sock::Listener(l) => match l.accept() {
+                        Ok((s, _)) => Ok(s),
+                        Err(e) => err(format!("net::accept: {e}")),
+                    },
+                    Sock::Stream(_) => err("net::accept: that is a connection, not a listener"),
+                })?;
+                Ok(put_sock(Sock::Stream(std::io::BufReader::new(stream))))
+            })),
+            ("write", binary("write", |h, text| {
+                let text = text.to_string();
+                with_sock(h, "write", |s| {
+                    let s = stream_of(s, "write")?;
+                    match s.get_mut().write_all(text.as_bytes()).and_then(|()| s.get_mut().flush()) {
+                        Ok(()) => Ok(Value::Num(text.len() as f64)),
+                        Err(e) => err(format!("net::write: {e}")),
+                    }
+                })
+            })),
+            // one line, without its newline; nil when the peer is done
+            ("read_line", unary("read_line", |h| {
+                with_sock(h, "read_line", |s| {
+                    let s = stream_of(s, "read_line")?;
+                    let mut line = String::new();
+                    match s.read_line(&mut line) {
+                        Ok(0) => Ok(Value::Nil),
+                        Ok(_) => Ok(Value::str(line.trim_end_matches(['\n', '\r']))),
+                        Err(e) => err(format!("net::read_line: {e}")),
+                    }
+                })
+            })),
+            // everything the peer sends until it closes
+            ("read", unary("read", |h| {
+                with_sock(h, "read", |s| {
+                    let s = stream_of(s, "read")?;
+                    let mut buf = Vec::new();
+                    match s.read_to_end(&mut buf) {
+                        Ok(_) => Ok(Value::str(String::from_utf8_lossy(&buf))),
+                        Err(e) => err(format!("net::read: {e}")),
+                    }
+                })
+            })),
+            ("close", unary("close", |h| {
+                let i = h.as_num()? as usize;
+                SOCKETS.with(|all| {
+                    let mut all = all.borrow_mut();
+                    match all.get_mut(i.wrapping_sub(1)) {
+                        Some(slot) => {
+                            *slot = None;
+                            Ok(Value::Nil)
+                        }
+                        None => err("net::close: not a socket"),
+                    }
+                })
+            })),
+            // a read that waits forever is a script that hangs forever
+            ("timeout", binary("timeout", |h, secs| {
+                let secs = secs.as_num()?;
+                with_sock(h, "timeout", |s| {
+                    let d = if secs <= 0.0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_secs_f64(secs))
+                    };
+                    let s = stream_of(s, "timeout")?;
+                    s.get_ref()
+                        .set_read_timeout(d)
+                        .and_then(|()| s.get_ref().set_write_timeout(d))
+                        .map_err(|e| Error(format!("net::timeout: {e}")))?;
+                    Ok(Value::Nil)
+                })
+            })),
+            ("address", unary("address", |h| {
+                with_sock(h, "address", |s| {
+                    let a = match s {
+                        Sock::Stream(s) => s.get_ref().peer_addr(),
+                        Sock::Listener(l) => l.local_addr(),
+                    };
+                    match a {
+                        Ok(a) => Ok(Value::str(a.to_string())),
+                        Err(e) => err(format!("net::address: {e}")),
+                    }
+                })
             })),
         ],
     );

@@ -1405,3 +1405,40 @@ fn format_can_line_a_column_up() {
     assert_eq!(s(r#""[{:6}|{:6}]".format(42, "ab")"#), "[    42|ab    ]");
     assert_eq!(s(r#""[{:x}|{:o}|{:b}]".format(255, 64, 5)"#), "[ff|100|101]");
 }
+
+/// A socket is a number the runtime owns. Binding to port 0 asks the system
+/// for a free one, and connecting to a listening socket does not wait for the
+/// accept — so a client and a server fit in one process, which is what makes
+/// this a test rather than a demo.
+#[test]
+fn a_script_can_talk_over_a_socket() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let srv = net::listen("127.0.0.1:0")
+        let c = net::connect(net::address(srv))
+        let s = net::accept(srv)
+        net::write(c, "ping
+")
+        let heard = net::read_line(s)
+        net::write(s, "pong " + heard + "
+")
+        let back = net::read_line(c)
+        net::close(c)
+        net::close(s)
+        net::close(srv)
+        let (ok, why) = try(|| net::read_line(c))
+        return heard, back, ok, why;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "ping");
+    assert_eq!(out[1].to_string(), "pong ping");
+    assert_eq!(out[2].to_string(), "false", "a closed socket is not readable");
+    assert!(
+        out[3].to_string().contains("not an open socket"),
+        "and it says so: {}",
+        out[3]
+    );
+}
