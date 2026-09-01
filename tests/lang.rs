@@ -1389,3 +1389,19 @@ fn braces_in_strings_escape_the_same_way_everywhere() {
     // and the format placeholders still are what they are
     assert_eq!(s(r#"let n = 2; "{}" .format(n)"#), "2");
 }
+
+/// What a script prints is mostly a table of numbers beside their names, and
+/// lining those up needs a width and a side to pad on. The spec is Rust's.
+#[test]
+fn format_can_line_a_column_up() {
+    assert_eq!(s(r#""[{:>8}]".format("right")"#), "[   right]");
+    assert_eq!(s(r#""[{:<8}]".format("left")"#), "[left    ]");
+    assert_eq!(s(r#""[{:^9}]".format("mid")"#), "[   mid   ]");
+    assert_eq!(s(r#""[{:-^9}]".format("mid")"#), "[---mid---]");
+    assert_eq!(s(r#""[{:>7.1}]".format(3.14159)"#), "[    3.1]");
+    assert_eq!(s(r#""[{:08.3}]".format(3.14159)"#), "[0003.142]");
+    assert_eq!(s(r#""[{:.3}]".format("truncated")"#), "[tru]");
+    // a number pads right and a string pads left, unasked, as in Rust
+    assert_eq!(s(r#""[{:6}|{:6}]".format(42, "ab")"#), "[    42|ab    ]");
+    assert_eq!(s(r#""[{:x}|{:o}|{:b}]".format(255, 64, 5)"#), "[ff|100|101]");
+}

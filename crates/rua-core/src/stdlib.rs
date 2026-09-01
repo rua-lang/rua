@@ -439,49 +439,105 @@ fn format_impl(fmt: &str, args: &[Value]) -> Res<String> {
                 }
                 let v = args.get(next).cloned().unwrap_or(Value::Nil);
                 next += 1;
-                let spec = spec.trim_start_matches(':');
-                out.push_str(&match spec {
-                    "" => v.to_string(),
-                    "x" => format!("{:x}", v.as_num()? as i64),
-                    "X" => format!("{:X}", v.as_num()? as i64),
-                    "b" => format!("{:b}", v.as_num()? as i64),
-                    "e" => format!("{:e}", v.as_num()?),
-                    s if s.starts_with('.') => {
-                        let p: usize = s[1..]
-                            .parse()
-                            .map_err(|_| Error(format!("format: bad precision `{s}`")))?;
-                        if p > MAX_FORMAT_WIDTH {
-                            return err(format!("format: precision {p} is too large"));
-                        }
-                        format!("{:.*}", p, v.as_num()?)
-                    }
-                    s => {
-                        // a bare width, optionally right aligned with `>`
-                        let (right, digits) = match s.strip_prefix('>') {
-                            Some(rest) => (true, rest),
-                            None => (false, s),
-                        };
-                        let w: usize = digits
-                            .parse()
-                            .map_err(|_| Error(format!("format: unsupported spec `{s}`")))?;
-                        if w > MAX_FORMAT_WIDTH {
-                            return err(format!("format: width {w} is too large"));
-                        }
-                        let text = v.to_string();
-                        if text.len() >= w {
-                            text
-                        } else if right {
-                            format!("{}{}", " ".repeat(w - text.len()), text)
-                        } else {
-                            format!("{}{}", text, " ".repeat(w - text.len()))
-                        }
-                    }
-                });
+                out.push_str(&format_one(spec.trim_start_matches(':'), &v)?);
             }
             c => out.push(c),
         }
     }
     Ok(out)
+}
+
+/// One placeholder: `[[fill]align][width][.precision][kind]`, as Rust writes
+/// it — `{:>8}`, `{:<12}`, `{:^5}`, `{:.3}`, `{:>9.2}`, `{:x}`.
+///
+/// A script's output is mostly a table of numbers beside their names, and
+/// lining those up needs a width and a side to pad on. Alignment defaults the
+/// way Rust's does: numbers right, everything else left.
+fn format_one(spec: &str, v: &Value) -> Res<String> {
+    let mut rest = spec;
+
+    // fill and alignment: `>` or `-^` or nothing
+    let mut fill = ' ';
+    let mut align = None;
+    let chars: Vec<char> = rest.chars().collect();
+    if chars.len() >= 2 && matches!(chars[1], '<' | '^' | '>') {
+        fill = chars[0];
+        align = Some(chars[1]);
+        rest = &rest[chars[0].len_utf8() + 1..];
+    } else if let Some(first) = chars.first() {
+        if matches!(first, '<' | '^' | '>') {
+            align = Some(*first);
+            rest = &rest[1..];
+        }
+    }
+
+    // `{:08.3}` — a leading zero on the width is a fill, as in Rust
+    if align.is_none() && rest.starts_with('0') && rest.len() > 1 {
+        fill = '0';
+        align = Some('>');
+        rest = &rest[1..];
+    }
+
+    // width, then precision, then what to render it as
+    let width_end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let width: usize = match &rest[..width_end] {
+        "" => 0,
+        digits => digits
+            .parse()
+            .map_err(|_| Error(format!("format: bad width in `{spec}`")))?,
+    };
+    rest = &rest[width_end..];
+
+    let mut precision = None;
+    if let Some(after) = rest.strip_prefix('.') {
+        let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        precision = Some(
+            after[..end]
+                .parse::<usize>()
+                .map_err(|_| Error(format!("format: bad precision in `{spec}`")))?,
+        );
+        rest = &after[end..];
+    }
+    if width > MAX_FORMAT_WIDTH || precision.unwrap_or(0) > MAX_FORMAT_WIDTH {
+        return err(format!("format: `{spec}` asks for more room than is sensible"));
+    }
+
+    let numeric = matches!(v, Value::Num(_));
+    let body = match rest {
+        "" => match precision {
+            // a precision on a string is how much of it to keep, as in Rust
+            Some(p) if !numeric => v.to_string().chars().take(p).collect(),
+            Some(p) => format!("{:.*}", p, v.as_num()?),
+            None => v.to_string(),
+        },
+        "x" => format!("{:x}", v.as_num()? as i64),
+        "X" => format!("{:X}", v.as_num()? as i64),
+        "b" => format!("{:b}", v.as_num()? as i64),
+        "o" => format!("{:o}", v.as_num()? as i64),
+        "e" => format!("{:e}", v.as_num()?),
+        // `f` is what a C or Python habit reaches for, and it means the same
+        // thing here as no kind at all
+        "f" => format!("{:.*}", precision.unwrap_or(6), v.as_num()?),
+        other => return err(format!("format: unsupported spec `{other}` in `{spec}`")),
+    };
+
+    let pad = width.saturating_sub(body.chars().count());
+    if pad == 0 {
+        return Ok(body);
+    }
+    Ok(match align.unwrap_or(if numeric { '>' } else { '<' }) {
+        '>' => format!("{}{}", fill.to_string().repeat(pad), body),
+        '^' => {
+            let left = pad / 2;
+            format!(
+                "{}{}{}",
+                fill.to_string().repeat(left),
+                body,
+                fill.to_string().repeat(pad - left)
+            )
+        }
+        _ => format!("{}{}", body, fill.to_string().repeat(pad)),
+    })
 }
 
 fn table_lib(vm: &mut Vm) -> Rc<RefCell<Table>> {
