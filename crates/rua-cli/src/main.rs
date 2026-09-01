@@ -50,7 +50,8 @@ struct Args {
     #[arg(long)]
     dump_bytecode: bool,
 
-    /// Lay out the script and print it, or rewrite it in place with --write
+    /// Lay out the script and print it, or rewrite it in place with --write.
+    /// With no file, reads standard input.
     #[arg(long)]
     fmt: bool,
 
@@ -194,9 +195,24 @@ fn main() {
 /// to lay out bytes nobody can read.
 fn format_files(args: &Args) -> i32 {
     let paths: Vec<&String> = args.script.iter().chain(args.script_args.iter()).collect();
+    // no file named: read the program from the pipe and write it to the next
+    // one, which is how a formatter is used from anything but an editor
     if paths.is_empty() {
-        eprintln!("rua --fmt: give it a file");
-        return 1;
+        let mut src = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut src) {
+            eprintln!("rua --fmt: cannot read standard input: {e}");
+            return 1;
+        }
+        return match rua::fmt(&src) {
+            Ok(out) => {
+                print!("{out}");
+                0
+            }
+            Err(e) => {
+                eprintln!("rua --fmt: line {}: {}", e.line, e.message);
+                1
+            }
+        };
     }
     let mut bad = 0;
     for path in paths {

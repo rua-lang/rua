@@ -134,6 +134,7 @@ Rust for colours — the same trick `.gitattributes` uses for GitHub:
 ```sh
 rua --fmt file.rua              # to standard output
 rua --fmt --write *.rua         # in place, printing what it changed
+cat a.rua | rua --fmt           # with no file, a filter
 ```
 
 The same formatter the server uses. It moves whitespace between tokens and
@@ -142,14 +143,20 @@ change what a program means — the test suite lays out every `.rua` file in
 the repository and checks the tokens come back identical. A file that does
 not lex is reported and left alone.
 
-fresh can be told to use it on save:
+Both editors format through the server rather than through this command:
+fresh's LSP client sends `textDocument/formatting`, and VS Code's Format
+Document is wired to it by the extension, which names itself the default
+formatter for rua so nothing stops to ask which one to use.
+
+fresh can be told to run the command instead, which is the way to get
+`format_on_save`:
 
 ```jsonc
 "languages": {
   "rua": {
     "extensions": ["rua"],
-    "formatter": { "command": "rua", "args": ["--fmt"], "stdin": false },
-    "format_on_save": false
+    "formatter": { "command": "rua", "args": ["--fmt"], "stdin": true },
+    "format_on_save": true
   }
 }
 ```
