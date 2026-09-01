@@ -864,16 +864,86 @@ fn fs_lib(vm: &mut Vm) {
     );
 }
 
+/// How many sockets a script may have open at once, and how many times one
+/// slot may be reused. Both fit in a handle a `f64` holds exactly.
+const SOCKET_SLOTS: u64 = 1 << 26;
+
 thread_local! {
     /// The sockets a script has open, by handle.
     ///
     /// A socket is a number rather than an object because rua has no type to
-    /// hang one on: the runtime owns it, closing is explicit, and dropping
-    /// the last reference to the script's number does not silently drop a
-    /// connection. A slot is emptied on close and never handed out again in
-    /// the same run, so a stale handle is an error rather than someone else's
-    /// connection.
-    static SOCKETS: RefCell<Vec<Option<Sock>>> = const { RefCell::new(Vec::new()) };
+    /// hang one on: the runtime owns it, and closing is explicit rather than
+    /// something that happens when a number goes out of scope.
+    ///
+    /// A closed slot is reused, or a server that accepts a million
+    /// connections keeps a million dead ones — but the handle carries the
+    /// generation the slot was at, so a handle held past its close is an
+    /// error rather than whoever is using that slot now.
+    static SOCKETS: RefCell<Sockets> = const { RefCell::new(Sockets::new()) };
+}
+
+struct Sockets {
+    slots: Vec<Slot>,
+    free: Vec<usize>,
+}
+
+struct Slot {
+    generation: u64,
+    sock: Option<Sock>,
+}
+
+impl Sockets {
+    const fn new() -> Sockets {
+        Sockets { slots: Vec::new(), free: Vec::new() }
+    }
+
+    fn insert(&mut self, sock: Sock) -> Res<Value> {
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.slots[i].sock = Some(sock);
+                i
+            }
+            None => {
+                if self.slots.len() as u64 >= SOCKET_SLOTS {
+                    return err("net: too many sockets open at once");
+                }
+                self.slots.push(Slot { generation: 0, sock: Some(sock) });
+                self.slots.len() - 1
+            }
+        };
+        let handle = self.slots[i].generation * SOCKET_SLOTS + i as u64 + 1;
+        Ok(Value::Num(handle as f64))
+    }
+
+    fn at(&mut self, handle: &Value) -> Option<&mut Sock> {
+        let h = handle.as_num().ok()?;
+        if h < 1.0 || h.fract() != 0.0 {
+            return None;
+        }
+        let h = h as u64 - 1;
+        let slot = self.slots.get_mut((h % SOCKET_SLOTS) as usize)?;
+        // the generation is what tells a live handle from one that named this
+        // slot before it was closed and handed out again
+        (slot.generation == h / SOCKET_SLOTS).then(|| slot.sock.as_mut())?
+    }
+
+    fn close(&mut self, handle: &Value) -> bool {
+        let Some(h) = handle.as_num().ok().filter(|h| *h >= 1.0) else { return false };
+        let h = h as u64 - 1;
+        let i = (h % SOCKET_SLOTS) as usize;
+        let Some(slot) = self.slots.get_mut(i) else { return false };
+        if slot.generation != h / SOCKET_SLOTS || slot.sock.is_none() {
+            return false;
+        }
+        slot.sock = None;
+        slot.generation += 1;
+        // a slot whose generations are spent is retired rather than wrapped,
+        // since wrapping would make an ancient handle valid again
+        if slot.generation < SOCKET_SLOTS {
+            self.free.push(i);
+        }
+        true
+    }
 }
 
 enum Sock {
@@ -882,23 +952,15 @@ enum Sock {
     Listener(std::net::TcpListener),
 }
 
-fn put_sock(s: Sock) -> Value {
-    SOCKETS.with(|all| {
-        let mut all = all.borrow_mut();
-        all.push(Some(s));
-        Value::Num(all.len() as f64)
-    })
+fn put_sock(s: Sock) -> Res<Value> {
+    SOCKETS.with(|all| all.borrow_mut().insert(s))
 }
 
 /// Do something with an open socket, by handle.
 fn with_sock<T>(h: &Value, what: &str, f: impl FnOnce(&mut Sock) -> Res<T>) -> Res<T> {
-    let i = h.as_num()? as usize;
-    SOCKETS.with(|all| {
-        let mut all = all.borrow_mut();
-        match all.get_mut(i.wrapping_sub(1)).and_then(|s| s.as_mut()) {
-            Some(sock) => f(sock),
-            None => err(format!("net::{what}: not an open socket")),
-        }
+    SOCKETS.with(|all| match all.borrow_mut().at(h) {
+        Some(sock) => f(sock),
+        None => err(format!("net::{what}: not an open socket")),
     })
 }
 
@@ -920,14 +982,14 @@ fn net_lib(vm: &mut Vm) {
             ("connect", unary("connect", |addr| {
                 let addr = addr.as_str()?;
                 match std::net::TcpStream::connect(&*addr) {
-                    Ok(s) => Ok(put_sock(Sock::Stream(std::io::BufReader::new(s)))),
+                    Ok(s) => put_sock(Sock::Stream(std::io::BufReader::new(s))),
                     Err(e) => err(format!("net::connect {addr}: {e}")),
                 }
             })),
             ("listen", unary("listen", |addr| {
                 let addr = addr.as_str()?;
                 match std::net::TcpListener::bind(&*addr) {
-                    Ok(l) => Ok(put_sock(Sock::Listener(l))),
+                    Ok(l) => put_sock(Sock::Listener(l)),
                     Err(e) => err(format!("net::listen {addr}: {e}")),
                 }
             })),
@@ -940,7 +1002,7 @@ fn net_lib(vm: &mut Vm) {
                     },
                     Sock::Stream(_) => err("net::accept: that is a connection, not a listener"),
                 })?;
-                Ok(put_sock(Sock::Stream(std::io::BufReader::new(stream))))
+                put_sock(Sock::Stream(std::io::BufReader::new(stream)))
             })),
             ("write", binary("write", |h, text| {
                 let text = text.to_string();
@@ -976,17 +1038,11 @@ fn net_lib(vm: &mut Vm) {
                 })
             })),
             ("close", unary("close", |h| {
-                let i = h.as_num()? as usize;
-                SOCKETS.with(|all| {
-                    let mut all = all.borrow_mut();
-                    match all.get_mut(i.wrapping_sub(1)) {
-                        Some(slot) => {
-                            *slot = None;
-                            Ok(Value::Nil)
-                        }
-                        None => err("net::close: not a socket"),
-                    }
-                })
+                if SOCKETS.with(|all| all.borrow_mut().close(h)) {
+                    Ok(Value::Nil)
+                } else {
+                    err("net::close: not an open socket")
+                }
             })),
             // a read that waits forever is a script that hangs forever
             ("timeout", binary("timeout", |h, secs| {

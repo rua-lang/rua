@@ -1489,3 +1489,36 @@ fn a_script_can_run_a_command() {
     assert_eq!(out[2].to_string(), "err");
     assert_eq!(out[3].as_num().unwrap(), 3.0, "a failure is a status, not a throw");
 }
+
+/// A closed socket's slot is handed out again — or a server that accepts a
+/// million connections keeps a million dead ones. The handle carries the
+/// generation the slot was at when it was issued, so a handle held past its
+/// close is an error and not whoever holds that slot now.
+#[test]
+fn a_stale_socket_handle_cannot_reach_the_connection_that_replaced_it() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let srv = net::listen("127.0.0.1:0")
+        let addr = net::address(srv)
+        let a = net::connect(addr)
+        let sa = net::accept(srv)
+        net::close(a)                  // frees exactly one slot
+        let b = net::connect(addr)     // which this takes
+        let sb = net::accept(srv)
+        let same_slot = (a - 1) % 67108864 == (b - 1) % 67108864
+        let (reached, why) = try(|| net::write(a, "stolen
+"))
+        net::write(b, "mine
+")
+        let heard = net::read_line(sb)
+        return same_slot, reached, heard, a != b;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "true", "the slot really was reused");
+    assert_eq!(out[1].to_string(), "false", "and the old handle did not reach it");
+    assert_eq!(out[2].to_string(), "mine", "the live socket is unaffected");
+    assert_eq!(out[3].to_string(), "true", "the handles differ by generation");
+}
