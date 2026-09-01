@@ -1605,6 +1605,50 @@ fn net_tls_reaches_a_real_host() {
     assert_eq!(out[2].to_string(), "false", "a certificate for another name is refused");
 }
 
+/// A file being typed into is not a finished one. The front end reads past
+/// what it cannot make sense of, so that an editor gets every mistake at once
+/// and a tree of everything else — rather than one error and nothing.
+#[test]
+fn the_parser_reads_on_after_a_mistake() {
+    let src = "let a = 1\nlet = 2\nlet c = 3 + * 4\nfn good(x) { x + 1 }\nlet d = 5\n";
+    let (block, errors) = rua_syntax::parser::parse_recover(src);
+    assert_eq!(errors.len(), 2, "both mistakes, not just the first: {errors:?}");
+    assert!(errors[0].message.contains("expected a name"), "{}", errors[0].message);
+    assert!(errors[1].message.contains("unexpected `*`"), "{}", errors[1].message);
+    // in order, and each pointing at the token rather than the line
+    assert!(errors[0].span.lo < errors[1].span.lo);
+    assert_eq!(&src[errors[1].span.lo as usize..errors[1].span.hi as usize], "*");
+    // the statements either side of the wreckage are still there
+    assert_eq!(block.stats.len(), 3, "a, good and d survived");
+}
+
+/// The same for the lexer: one character it cannot read costs one error, not
+/// the whole token stream.
+#[test]
+fn the_lexer_reads_on_after_a_character_it_cannot_read() {
+    let (toks, errors) = rua_syntax::lexer::Lexer::tokenize_all("let a = 1 @ let b = 2");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("unexpected character"));
+    // `let a = 1` is four tokens, `let b = 2` another four, plus the end
+    assert_eq!(toks.len(), 9, "everything either side of the `@` was read");
+    assert_eq!(toks.last().map(|t| t.tok.clone()), Some(rua_syntax::lexer::Tok::Eof));
+}
+
+/// Every token knows the bytes it was written with, which is what lets an
+/// error underline the token instead of the line it sits on.
+#[test]
+fn tokens_know_where_they_were_written() {
+    let src = "let hello = 42";
+    let (toks, errors) = rua_syntax::lexer::Lexer::tokenize_all(src);
+    assert!(errors.is_empty());
+    let spans: Vec<&str> = toks
+        .iter()
+        .filter(|t| t.tok != rua_syntax::lexer::Tok::Eof)
+        .map(|t| &src[t.span.lo as usize..t.span.hi as usize])
+        .collect();
+    assert_eq!(spans, vec!["let", "hello", "=", "42"], "spans cover the tokens exactly");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

@@ -13,6 +13,9 @@ pub use ast::{BinOp, Binding, Block, Expr, FuncDef, Stat, UnOp, UpvalSrc};
 pub struct SyntaxError {
     pub message: String,
     pub line: u32,
+    /// The bytes at fault. An editor underlines these; a terminal that has
+    /// only the line still has the line.
+    pub span: ast::Span,
 }
 
 impl std::fmt::Display for SyntaxError {
@@ -23,22 +26,14 @@ impl std::fmt::Display for SyntaxError {
 
 impl std::error::Error for SyntaxError {}
 
-impl From<String> for SyntaxError {
-    /// The parser reports `line N: message`; split that back apart.
-    fn from(s: String) -> Self {
-        if let Some(rest) = s.strip_prefix("line ") {
-            if let Some((num, msg)) = rest.split_once(": ") {
-                if let Ok(line) = num.parse() {
-                    return SyntaxError { message: msg.to_string(), line };
-                }
-            }
-        }
-        SyntaxError { message: s, line: 0 }
+impl SyntaxError {
+    pub fn new(message: impl Into<String>, line: u32, span: ast::Span) -> SyntaxError {
+        SyntaxError { message: message.into(), line, span }
     }
 }
 
 /// Parse and resolve a chunk, returning it with the frame size it needs.
 pub fn compile(src: &str) -> Result<(Block, usize), SyntaxError> {
-    let parsed = parser::parse(src).map_err(SyntaxError::from)?;
+    let parsed = parser::parse(src)?;
     Ok(resolve::resolve_chunk(&parsed))
 }

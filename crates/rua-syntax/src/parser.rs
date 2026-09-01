@@ -5,6 +5,7 @@
 
 use crate::ast::*;
 use crate::lexer::{Lexed, Lexer, Tok};
+use crate::SyntaxError;
 use std::rc::Rc;
 
 pub struct Parser {
@@ -16,16 +17,43 @@ pub struct Parser {
     /// Nesting depth, so that pathological input reports an error instead of
     /// running the parser out of stack.
     depth: usize,
+    /// Keep going after a statement that would not parse, instead of stopping
+    /// at the first one. An editor wants every error at once, and a tree of
+    /// what it could read; a command line wants the first error and nothing
+    /// else, since the rest are usually consequences of it.
+    recover: bool,
+    errors: Vec<SyntaxError>,
 }
 
 /// Deep enough for any real program, shallow enough to stay on the stack.
 const MAX_NESTING: usize = 160;
 
-type PResult<T> = Result<T, String>;
+type PResult<T> = Result<T, SyntaxError>;
+
+/// Parse as much as there is, and report everything that went wrong.
+///
+/// Always returns a tree: what could not be read is missing from it, and the
+/// errors say what and where. This is what an editor asks for.
+pub fn parse_recover(src: &str) -> (Block, Vec<SyntaxError>) {
+    let (toks, mut errors) = Lexer::tokenize_all(src);
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        anon: 0,
+        loops: 0,
+        depth: 0,
+        recover: true,
+        errors: Vec::new(),
+    };
+    let block = p.block_body(Tok::Eof).unwrap_or_default();
+    errors.append(&mut p.errors);
+    errors.sort_by_key(|e| (e.span.lo, e.line));
+    (block, errors)
+}
 
 pub fn parse(src: &str) -> PResult<Block> {
     let toks = Lexer::tokenize(src)?;
-    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0 };
+    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0, recover: false, errors: Vec::new() };
     let b = p.block_body(Tok::Eof)?;
     p.expect(Tok::Eof)?;
     Ok(b)
@@ -37,6 +65,19 @@ impl Parser {
     }
     fn line(&self) -> u32 {
         self.toks[self.pos].line
+    }
+    /// Where the token the parser is looking at was written.
+    fn span(&self) -> Span {
+        self.toks[self.pos].span
+    }
+    /// An error about the token in hand, which is the one at fault whenever
+    /// the parser is surprised by what it found.
+    fn err<T>(&self, message: impl Into<String>) -> PResult<T> {
+        Err(SyntaxError::new(message, self.line(), self.span()))
+    }
+    /// The same, about a token already consumed.
+    fn err_at<T>(&self, message: impl Into<String>, line: u32, span: Span) -> PResult<T> {
+        Err(SyntaxError::new(message, line, span))
     }
     fn bump(&mut self) -> Tok {
         let t = self.toks[self.pos].tok.clone();
@@ -58,14 +99,15 @@ impl Parser {
             self.bump();
             Ok(())
         } else {
-            Err(format!("line {}: expected {:?}, found {:?}", self.line(), t, self.peek()))
+            self.err(format!("expected {t}, found {}", self.peek()))
         }
     }
     fn name(&mut self) -> PResult<Rc<str>> {
         let line = self.line();
+        let span = self.span();
         match self.bump() {
             Tok::Name(n) => Ok(n.into()),
-            other => Err(format!("line {line}: expected a name, found {other:?}")),
+            other => self.err_at(format!("expected a name, found {other}"), line, span),
         }
     }
 
@@ -95,7 +137,22 @@ impl Parser {
                 continue;
             }
             let line = self.line();
-            match self.statement()? {
+            let before = self.pos;
+            let item = match self.statement() {
+                Ok(item) => item,
+                Err(e) if self.recover => {
+                    self.errors.push(e);
+                    // the statement may have failed without reading anything,
+                    // and a loop that reads nothing does not end
+                    if self.pos == before {
+                        self.bump();
+                    }
+                    self.sync(&end);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match item {
                 Item::Stat(s) => {
                     stats.push(s);
                     lines.push(line);
@@ -113,6 +170,32 @@ impl Parser {
             }
         }
         Ok(Block { stats, lines, tail, tail_line })
+    }
+
+    /// Read forward to somewhere a statement could begin, so that one mistake
+    /// costs one error rather than every line after it.
+    fn sync(&mut self, end: &Tok) {
+        loop {
+            match self.peek() {
+                Tok::Eof => return,
+                Tok::RBrace => return,
+                t if t == end => return,
+                // a `;` ends the wreckage; step over it and read on
+                Tok::Semi => {
+                    self.bump();
+                    return;
+                }
+                Tok::Let | Tok::Fn | Tok::If | Tok::While | Tok::For | Tok::Loop
+                | Tok::Return | Tok::Match | Tok::Break | Tok::Continue => return,
+                _ => {
+                    let before = self.pos;
+                    self.bump();
+                    if self.pos == before {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn statement(&mut self) -> PResult<Item> {
@@ -147,12 +230,13 @@ impl Parser {
                 Ok(Item::Stat(Stat::Return(exprs)))
             }
             Tok::Break | Tok::Continue => {
+                let span = self.span();
                 let word = if *self.peek() == Tok::Break { "break" } else { "continue" };
                 let stat = if word == "break" { Stat::Break } else { Stat::Continue };
                 self.bump();
                 self.accept(Tok::Semi);
                 if self.loops == 0 {
-                    return Err(format!("line {line}: `{word}` outside of a loop"));
+                    return self.err_at(format!("`{word}` outside of a loop"), line, span);
                 }
                 Ok(Item::Stat(stat))
             }
@@ -209,19 +293,20 @@ impl Parser {
                 Ok(Item::Stat(Stat::Expr(e)))
             }
             _ => {
+                let span = self.span();
                 let e = self.expr()?;
                 // assignment?
                 if let Some(op) = compound_op(self.peek()) {
                     self.bump();
                     let v = self.expr()?;
                     self.accept(Tok::Semi);
-                    check_target(&e, line)?;
+                    check_target(&e, line, span)?;
                     return Ok(Item::Stat(Stat::OpAssign(e, op, v)));
                 }
                 if self.accept(Tok::Assign) {
                     let vals = self.exprlist()?;
                     self.accept(Tok::Semi);
-                    check_target(&e, line)?;
+                    check_target(&e, line, span)?;
                     return Ok(Item::Stat(Stat::Assign(vec![e], vals)));
                 }
                 if self.accept(Tok::Semi) {
@@ -339,7 +424,7 @@ impl Parser {
         self.depth += 1;
         if self.depth > MAX_NESTING {
             self.depth -= 1;
-            return Err(format!("line {}: expression nests too deeply", self.line()));
+            return self.err("expression nests too deeply");
         }
         let out = self.binexpr_inner(limit, structs);
         self.depth -= 1;
@@ -471,6 +556,7 @@ impl Parser {
     }
 
     fn pattern(&mut self) -> PResult<Pattern> {
+        let span = self.span();
         let line = self.line();
         Ok(match self.peek().clone() {
             Tok::Name(n) if n == "_" => {
@@ -485,13 +571,20 @@ impl Parser {
                 Pattern::Lit(self.primary(false)?)
             }
             Tok::Minus => {
+                let span = self.span();
                 self.bump();
                 match self.bump() {
                     Tok::Num(n) => Pattern::Lit(Expr::Num(-n)),
-                    other => return Err(format!("line {line}: expected a number, found {other:?}")),
+                    other => {
+                        return self.err_at(
+                            format!("expected a number, found {other}"),
+                            line,
+                            span,
+                        )
+                    }
                 }
             }
-            other => return Err(format!("line {line}: {other:?} is not a pattern")),
+            other => return self.err_at(format!("{other} is not a pattern"), line, span),
         })
     }
 
@@ -522,8 +615,9 @@ impl Parser {
             }
             Tok::Str(text) => {
                 let line = self.line();
+                let span = self.span();
                 self.bump();
-                interpolate(&text, line)
+                interpolate(&text, line, span)
             }
             Tok::Nil => {
                 self.bump();
@@ -552,7 +646,7 @@ impl Parser {
             Tok::If => self.if_expr(),
             Tok::Match => self.match_expr(),
             Tok::LBrace if structs => Ok(Expr::Do(self.block()?)),
-            other => Err(format!("line {}: unexpected {:?}", self.line(), other)),
+            other => self.err(format!("unexpected {other}")),
         }
     }
 
@@ -605,7 +699,7 @@ impl Parser {
 
 /// `"a {x} b"` becomes `"a " + x + " b"`, and `{x:.2}` routes through
 /// `format`. `{{` and `}}` are literal braces.
-fn interpolate(text: &str, line: u32) -> PResult<Expr> {
+fn interpolate(text: &str, line: u32, span: Span) -> PResult<Expr> {
     // A string with neither brace has nothing to say about either. Skipping
     // only on `{` made `}}` mean two braces here and one in a string that
     // happened to contain a `{` elsewhere, which is the kind of rule you meet
@@ -662,13 +756,17 @@ fn interpolate(text: &str, line: u32) -> PResult<Expr> {
                     // brace rather than the start of an interpolation, which
                     // is what writing JSON or CSS out of a script is made of.
                     let hint = "write `{{` for a literal brace";
-                    return Err(format!("line {line}: unclosed `{{` in a string ({hint})"));
+                    return Err(SyntaxError::new(
+                        format!("unclosed `{{` in a string ({hint})"),
+                        line,
+                        span,
+                    ));
                 }
                 if !literal.is_empty() {
                     parts.push(Expr::Str(std::mem::take(&mut literal).into()));
                 }
                 let (expr_src, spec) = split_spec(&src);
-                let inner = parse_fragment(&expr_src, line)?;
+                let inner = parse_fragment(&expr_src, line, span)?;
                 parts.push(match spec {
                     // `{x:.2}` is `format("{:.2}", x)`
                     Some(spec) => Expr::Call(
@@ -722,12 +820,20 @@ fn split_spec(src: &str) -> (String, Option<String>) {
 }
 
 /// Parse one expression out of a fragment of source, for interpolation.
-fn parse_fragment(src: &str, line: u32) -> PResult<Expr> {
-    let toks = Lexer::tokenize(src).map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
-    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0 };
-    let e = p.expr().map_err(|e| format!("line {line}: in `{{{src}}}`: {e}"))?;
+fn parse_fragment(src: &str, line: u32, span: Span) -> PResult<Expr> {
+    let toks = Lexer::tokenize(src).map_err(|e| {
+        SyntaxError::new(format!("in `{{{src}}}`: {}", e.message), line, span)
+    })?;
+    let mut p = Parser { toks, pos: 0, anon: 0, loops: 0, depth: 0, recover: false, errors: Vec::new() };
+    let e = p
+        .expr()
+        .map_err(|e| SyntaxError::new(format!("in `{{{src}}}`: {}", e.message), line, span))?;
     if *p.peek() != Tok::Eof {
-        return Err(format!("line {line}: `{{{src}}}` is not a single expression"));
+        return Err(SyntaxError::new(
+            format!("`{{{src}}}` is not a single expression"),
+            line,
+            span,
+        ));
     }
     Ok(e)
 }
@@ -738,10 +844,10 @@ enum Item {
     Value(Expr),
 }
 
-fn check_target(e: &Expr, line: u32) -> PResult<()> {
+fn check_target(e: &Expr, line: u32, span: Span) -> PResult<()> {
     match e {
         Expr::Var(_) | Expr::Index(..) => Ok(()),
-        _ => Err(format!("line {line}: cannot assign to this expression")),
+        _ => Err(SyntaxError::new("cannot assign to this expression", line, span)),
     }
 }
 

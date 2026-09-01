@@ -44,6 +44,41 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp { Neg, Not }
 
+/// Where something is in the source, as byte offsets into it.
+///
+/// Lines are enough to say where an error happened when the reader is a
+/// person looking at a terminal. An editor wants the token: to underline it,
+/// to say what is under the cursor, to rename it. Both are kept, since one
+/// does not follow from the other without the source text in hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+impl Span {
+    pub fn new(lo: u32, hi: u32) -> Span {
+        Span { lo, hi }
+    }
+
+    /// From the start of this one to the end of that one.
+    pub fn to(self, end: Span) -> Span {
+        Span { lo: self.lo, hi: end.hi.max(self.hi) }
+    }
+
+    pub fn contains(self, at: u32) -> bool {
+        at >= self.lo && at < self.hi
+    }
+
+    pub fn len(self) -> u32 {
+        self.hi.saturating_sub(self.lo)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// `{ stmts...; tail }` — the tail expression is the block's value.
 ///
 /// `lines` runs parallel to `stats`, so a runtime error can say where it

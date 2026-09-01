@@ -104,7 +104,16 @@ fn report(e: &rua::Error, src: &str, name: &str) -> Report {
     Report {
         message: e.message.clone(),
         src: NamedSource::new(name, src.to_string()).with_language("rust"),
-        span: if e.located { line_span(src, e.line) } else { None },
+        // The front end knows which bytes it choked on, so point at those. A
+        // runtime error knows the line it reached and no more, and a whole
+        // line underlined is the honest answer there.
+        span: match e.span {
+            Some((lo, hi)) if hi > lo && hi as usize <= src.len() => {
+                Some(SourceSpan::new((lo as usize).into(), (hi - lo) as usize))
+            }
+            _ if e.located => line_span(src, e.line),
+            _ => None,
+        },
         label: match &e.where_ {
             Some(f) => format!("in {f}"),
             None => "here".to_string(),

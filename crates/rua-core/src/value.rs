@@ -23,6 +23,9 @@ pub struct Error {
     /// The call stack when it happened, innermost last: the function called,
     /// and the line its caller called it from.
     pub trace: Vec<(Rc<str>, u32)>,
+    /// The bytes at fault, when the front end knew them. A runtime error
+    /// knows the line it reached and no more, so this is None for those.
+    pub span: Option<(u32, u32)>,
 }
 
 impl Error {
@@ -57,6 +60,7 @@ pub fn Error(message: impl Into<String>) -> Error {
         located: false,
         where_: None,
         trace: Vec::new(),
+        span: None,
     }
 }
 

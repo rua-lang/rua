@@ -1,5 +1,8 @@
 //! Hand written lexer. Rust-shaped tokens.
 
+use crate::ast::Span;
+use crate::SyntaxError;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
     // literals
@@ -19,10 +22,79 @@ pub enum Tok {
     Eof,
 }
 
+impl std::fmt::Display for Tok {
+    /// How the token is written, so that an error names what the reader typed
+    /// rather than what the enum happens to call it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Tok::Num(n) => return write!(f, "the number {n}"),
+            Tok::Str(_) => return write!(f, "a string"),
+            Tok::Name(n) => return write!(f, "`{n}`"),
+            Tok::Eof => return write!(f, "end of file"),
+            Tok::Break => "break",
+            Tok::Continue => "continue",
+            Tok::Else => "else",
+            Tok::False => "false",
+            Tok::Fn => "fn",
+            Tok::For => "for",
+            Tok::If => "if",
+            Tok::In => "in",
+            Tok::Let => "let",
+            Tok::Loop => "loop",
+            Tok::Match => "match",
+            Tok::Mut => "mut",
+            Tok::Nil => "nil",
+            Tok::Return => "return",
+            Tok::True => "true",
+            Tok::While => "while",
+            Tok::Plus => "+",
+            Tok::Minus => "-",
+            Tok::Star => "*",
+            Tok::Slash => "/",
+            Tok::Percent => "%",
+            Tok::Bang => "!",
+            Tok::AndAnd => "&&",
+            Tok::OrOr => "||",
+            Tok::EqEq => "==",
+            Tok::Ne => "!=",
+            Tok::Le => "<=",
+            Tok::Ge => ">=",
+            Tok::Lt => "<",
+            Tok::Gt => ">",
+            Tok::Assign => "=",
+            Tok::LParen => "(",
+            Tok::RParen => ")",
+            Tok::LBrace => "{",
+            Tok::RBrace => "}",
+            Tok::LBracket => "[",
+            Tok::RBracket => "]",
+            Tok::Semi => ";",
+            Tok::Comma => ",",
+            Tok::Colon => ":",
+            Tok::ColonColon => "::",
+            Tok::Dot => ".",
+            Tok::DotDot => "..",
+            Tok::DotDotEq => "..=",
+            Tok::Pipe => "|",
+            Tok::Hash => "#",
+            Tok::Arrow => "->",
+            Tok::FatArrow => "=>",
+            Tok::PlusEq => "+=",
+            Tok::MinusEq => "-=",
+            Tok::StarEq => "*=",
+            Tok::SlashEq => "/=",
+            Tok::PercentEq => "%=",
+        };
+        write!(f, "`{s}`")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Lexed {
     pub tok: Tok,
     pub line: u32,
+    /// The bytes this token was written with, trivia excluded.
+    pub span: Span,
 }
 
 pub struct Lexer<'a> {
@@ -31,7 +103,7 @@ pub struct Lexer<'a> {
     line: u32,
 }
 
-pub type LexResult<T> = Result<T, String>;
+pub type LexResult<T> = Result<T, SyntaxError>;
 
 impl<'a> Lexer<'a> {
     pub fn new(src: &'a str) -> Self {
@@ -44,6 +116,49 @@ impl<'a> Lexer<'a> {
             }
         }
         Lexer { src: bytes, pos, line: 1 }
+    }
+
+    /// Every token, and everything that went wrong getting them.
+    ///
+    /// A file being typed into is not a finished one: it has a half-written
+    /// string in it, or a character that means nothing yet. Giving up on the
+    /// first of those leaves an editor with no tokens at all, which is the
+    /// moment it most needs them. This lexes past what it cannot read.
+    pub fn tokenize_all(src: &'a str) -> (Vec<Lexed>, Vec<SyntaxError>) {
+        let mut lx = Lexer::new(src);
+        let mut out = Vec::new();
+        let mut errors = Vec::new();
+        loop {
+            let before = lx.pos;
+            match lx.next_token() {
+                Ok(t) => {
+                    let eof = t.tok == Tok::Eof;
+                    out.push(t);
+                    if eof {
+                        return (out, errors);
+                    }
+                }
+                Err(e) => {
+                    errors.push(e);
+                    // An unterminated string or comment runs to the end, and
+                    // there is nothing after it to read. Anything else leaves
+                    // the offending byte behind it, and reading on is what
+                    // finds the rest of the file's tokens.
+                    if lx.pos >= lx.src.len() {
+                        let at = lx.src.len() as u32;
+                        out.push(Lexed {
+                            tok: Tok::Eof,
+                            line: lx.line,
+                            span: Span::new(at, at),
+                        });
+                        return (out, errors);
+                    }
+                    if lx.pos == before {
+                        lx.bump();
+                    }
+                }
+            }
+        }
     }
 
     pub fn tokenize(src: &'a str) -> LexResult<Vec<Lexed>> {
@@ -87,12 +202,19 @@ impl<'a> Lexer<'a> {
                 }
                 (b'/', b'*') => {
                     let start = self.line;
+                    let at = self.pos;
                     self.bump();
                     self.bump();
                     let mut depth = 1;
                     while depth > 0 {
                         match (self.peek(), self.peek2()) {
-                            (0, _) => return Err(format!("line {start}: unterminated /* comment")),
+                            (0, _) => {
+                                return Err(SyntaxError::new(
+                                    "unterminated /* comment",
+                                    start,
+                                    Span::new(at as u32, self.pos as u32),
+                                ))
+                            }
                             (b'/', b'*') => {
                                 self.bump();
                                 self.bump();
@@ -117,7 +239,15 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> LexResult<Lexed> {
         self.skip_trivia()?;
         let line = self.line;
-        let mk = |tok| Ok(Lexed { tok, line });
+        let lo = self.pos as u32;
+        let tok = self.next_tok()?;
+        Ok(Lexed { tok, line, span: Span::new(lo, self.pos as u32) })
+    }
+
+    /// The token itself. `next_token` is what knows where it started.
+    fn next_tok(&mut self) -> LexResult<Tok> {
+        let line = self.line;
+        let mk = Ok;
         let c = self.peek();
         if c == 0 {
             return mk(Tok::Eof);
@@ -246,7 +376,11 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     Tok::AndAnd
                 } else {
-                    return Err(format!("line {line}: rua has no `&`; did you mean `&&`?"));
+                    return Err(SyntaxError::new(
+                        "rua has no `&`; did you mean `&&`?",
+                        line,
+                        Span::new(self.pos as u32 - 1, self.pos as u32),
+                    ));
                 }
             }
             b'|' => {
@@ -257,7 +391,13 @@ impl<'a> Lexer<'a> {
                     Tok::Pipe
                 }
             }
-            other => return Err(format!("line {line}: unexpected character {:?}", other as char)),
+            other => {
+                return Err(SyntaxError::new(
+                    format!("unexpected character {:?}", other as char),
+                    line,
+                    Span::new(self.pos as u32 - 1, self.pos as u32),
+                ))
+            }
         };
         mk(tok)
     }
@@ -273,7 +413,13 @@ impl<'a> Lexer<'a> {
             let s: String = std::str::from_utf8(&self.src[start + 2..self.pos])
                 .unwrap()
                 .replace('_', "");
-            let n = u64::from_str_radix(&s, 16).map_err(|e| e.to_string())?;
+            let n = u64::from_str_radix(&s, 16).map_err(|e| {
+                SyntaxError::new(
+                    format!("bad hexadecimal number: {e}"),
+                    self.line,
+                    Span::new(start as u32, self.pos as u32),
+                )
+            })?;
             return Ok(Tok::Num(n as f64));
         }
         while self.peek().is_ascii_digit() || self.peek() == b'_' {
@@ -296,7 +442,13 @@ impl<'a> Lexer<'a> {
             }
         }
         let s: String = std::str::from_utf8(&self.src[start..self.pos]).unwrap().replace('_', "");
-        s.parse::<f64>().map(Tok::Num).map_err(|e| format!("line {}: bad number: {e}", self.line))
+        s.parse::<f64>().map(Tok::Num).map_err(|e| {
+            SyntaxError::new(
+                format!("bad number: {e}"),
+                self.line,
+                Span::new(start as u32, self.pos as u32),
+            )
+        })
     }
 
     fn name(&mut self) -> Tok {
@@ -327,12 +479,19 @@ impl<'a> Lexer<'a> {
     }
 
     fn string(&mut self) -> LexResult<Tok> {
+        let start = self.pos;
         let quote = self.bump();
         let mut out: Vec<u8> = Vec::new();
         loop {
             let c = self.bump();
             match c {
-                0 => return Err(format!("line {}: unterminated string", self.line)),
+                0 => {
+                    return Err(SyntaxError::new(
+                        "unterminated string",
+                        self.line,
+                        Span::new(start as u32, self.pos as u32),
+                    ))
+                }
                 b'\\' => {
                     let e = self.bump();
                     out.push(match e {

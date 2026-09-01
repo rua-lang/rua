@@ -402,6 +402,8 @@ impl Vm {
             located: e.line > 0,
             where_: None,
             trace: Vec::new(),
+            // the front end knows the token, so the report can point at it
+            span: (!e.span.is_empty()).then_some((e.span.lo, e.span.hi)),
         })?;
         let def = Rc::new(rua_syntax::ast::FuncDef {
             id: usize::MAX,
@@ -426,6 +428,8 @@ impl Vm {
             located: e.line > 0,
             where_: None,
             trace: Vec::new(),
+            // the front end knows the token, so the report can point at it
+            span: (!e.span.is_empty()).then_some((e.span.lo, e.span.hi)),
         })?;
         // A chunk is a function of no arguments, compiled the same way. It
         // keeps its syntax, so the JIT can still find the loops inside it.
@@ -543,6 +547,7 @@ impl Vm {
                 located: true,
                 line,
                 where_: self.frames.last().map(|(p, _)| frame_name(*p)).filter(|n| !n.is_empty()),
+                span: e.span,
                 trace: self
                     .frames
                     .iter()
