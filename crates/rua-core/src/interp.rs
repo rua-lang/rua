@@ -367,6 +367,24 @@ impl Vm {
         self.libs[kind as usize] = Some(t);
     }
 
+    /// The methods a value of this kind answers to — `"ab".len()`, `t.push(x)`.
+    /// The language server offers these after a `.`, so what it suggests is
+    /// what the runtime will actually find.
+    pub fn method_names(&self, kind: MethodTable) -> Vec<Rc<str>> {
+        match self.lib(kind) {
+            Some(t) => t
+                .borrow()
+                .keys()
+                .iter()
+                .filter_map(|k| match k.to_value() {
+                    Value::Str(s) => Some(Rc::from(&*s as &str)),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     fn lib(&self, kind: MethodTable) -> Option<&Rc<RefCell<Table>>> {
         self.libs[kind as usize].as_ref()
     }

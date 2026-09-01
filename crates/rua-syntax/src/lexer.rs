@@ -101,6 +101,16 @@ pub struct Lexer<'a> {
     src: &'a [u8],
     pos: usize,
     line: u32,
+    /// Record where the comments were, for a reader that cares.
+    keep_comments: bool,
+    comments: Vec<Span>,
+}
+
+/// A pass over the source, for somebody who wants all of it.
+pub struct Scan {
+    pub tokens: Vec<Lexed>,
+    pub comments: Vec<Span>,
+    pub errors: Vec<SyntaxError>,
 }
 
 pub type LexResult<T> = Result<T, SyntaxError>;
@@ -115,7 +125,21 @@ impl<'a> Lexer<'a> {
                 pos += 1;
             }
         }
-        Lexer { src: bytes, pos, line: 1 }
+        Lexer { src: bytes, pos, line: 1, keep_comments: false, comments: Vec::new() }
+    }
+
+    /// Everything a reader of the source might want: the tokens, where the
+    /// comments were, and what could not be read.
+    ///
+    /// Comments are trivia to a compiler and not to an editor, which has to
+    /// know that the cursor is inside one before it offers to complete a
+    /// keyword there. The lexer already finds them; this writes them down
+    /// rather than making somebody find them again.
+    pub fn scan(src: &'a str) -> Scan {
+        let mut lx = Lexer::new(src);
+        lx.keep_comments = true;
+        let (tokens, errors) = lx.run();
+        Scan { tokens, comments: lx.comments, errors }
     }
 
     /// Every token, and everything that went wrong getting them.
@@ -125,7 +149,11 @@ impl<'a> Lexer<'a> {
     /// first of those leaves an editor with no tokens at all, which is the
     /// moment it most needs them. This lexes past what it cannot read.
     pub fn tokenize_all(src: &'a str) -> (Vec<Lexed>, Vec<SyntaxError>) {
-        let mut lx = Lexer::new(src);
+        Lexer::new(src).run()
+    }
+
+    fn run(&mut self) -> (Vec<Lexed>, Vec<SyntaxError>) {
+        let lx = self;
         let mut out = Vec::new();
         let mut errors = Vec::new();
         loop {
@@ -189,6 +217,13 @@ impl<'a> Lexer<'a> {
         c
     }
 
+    /// Remember a comment that ended where the cursor now is.
+    fn note_comment(&mut self, from: usize) {
+        if self.keep_comments {
+            self.comments.push(Span::new(from as u32, self.pos as u32));
+        }
+    }
+
     fn skip_trivia(&mut self) -> LexResult<()> {
         loop {
             match (self.peek(), self.peek2()) {
@@ -196,13 +231,16 @@ impl<'a> Lexer<'a> {
                     self.bump();
                 }
                 (b'/', b'/') => {
+                    let at = self.pos;
                     while self.peek() != b'\n' && self.peek() != 0 {
                         self.bump();
                     }
+                    self.note_comment(at);
                 }
                 (b'/', b'*') => {
                     let start = self.line;
                     let at = self.pos;
+                    let opened = at;
                     self.bump();
                     self.bump();
                     let mut depth = 1;
@@ -230,6 +268,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
+                    self.note_comment(opened);
                 }
                 _ => return Ok(()),
             }

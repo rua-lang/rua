@@ -17,7 +17,9 @@ const WARN: u8 = 2;
 const INFO: u8 = 3;
 const DEBUG: u8 = 4;
 
-static LEVEL: AtomicU8 = AtomicU8::new(INFO);
+/// Silent until the server asks for a level. A library that logs whichever
+/// way it is used prints over its own tests.
+static LEVEL: AtomicU8 = AtomicU8::new(OFF);
 
 /// Read `RUA_LSP_LOG` once, at startup. `off`, `error`, `warn`, `info` or
 /// `debug`; anything else is `info`, since a typo in a log setting should not

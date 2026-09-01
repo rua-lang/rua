@@ -221,3 +221,132 @@ fn references_of_a_loop_variable_stay_inside_the_loop() {
     assert_eq!(after.len(), 2, "the later `let i` and the tail that reads it");
     assert!(loop_var.iter().all(|l| l.range.start.line == 1));
 }
+
+// ---- completion knows where the cursor is ----------------------------------
+
+fn labels(world: &rua_lsp::World, uri: &Url, at: Position) -> Vec<String> {
+    match world.complete_at(uri, at) {
+        Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// After a `.` the keywords are noise: `break` is not a method.
+#[test]
+fn a_method_position_offers_methods_and_not_keywords() {
+    let (world, uri) = open("let t = []\nt.\n");
+    let got = labels(&world, &uri, at(1, 2));
+    assert!(!got.is_empty(), "something should be offered");
+    for keyword in ["break", "return", "let", "fn", "while"] {
+        assert!(!got.contains(&keyword.to_string()), "`{keyword}` offered after a `.`");
+    }
+    // the runtime's own table and string methods
+    assert!(got.contains(&"push".to_string()), "{got:?}");
+    assert!(got.contains(&"len".to_string()), "{got:?}");
+    // and not the globals either, which are not reached through a dot
+    assert!(!got.contains(&"print".to_string()));
+}
+
+/// After `mod::` only that module's names, and nothing at all for a name that
+/// is not a module — better silence than every global pretending to be in it.
+#[test]
+fn a_module_position_offers_only_that_module() {
+    let (world, uri) = open("fs::\n");
+    let got = labels(&world, &uri, at(0, 4));
+    assert!(got.contains(&"read".to_string()), "{got:?}");
+    assert!(!got.contains(&"print".to_string()), "a global is not inside `fs`");
+    assert!(!got.contains(&"break".to_string()), "a keyword is not inside `fs`");
+
+    let (world, uri) = open("notamodule::\n");
+    assert!(labels(&world, &uri, at(0, 12)).is_empty(), "nothing is known to be in it");
+}
+
+/// Inside a comment nothing is worth offering, and a comment being typed
+/// counts from its first character to the cursor.
+#[test]
+fn nothing_is_offered_inside_a_comment() {
+    let (world, uri) = open("// a note about b\nlet b = 1\n/* and\n   a longer one */\n");
+    assert!(labels(&world, &uri, at(0, 10)).is_empty(), "inside a line comment");
+    assert!(labels(&world, &uri, at(0, 17)).is_empty(), "at the end of one");
+    assert!(labels(&world, &uri, at(3, 8)).is_empty(), "inside a block comment");
+    // but the line between them is ordinary code
+    assert!(!labels(&world, &uri, at(1, 9)).is_empty(), "the code between them");
+}
+
+/// A string is text, not code — until the `{}` in it, which is code again.
+#[test]
+fn a_string_is_text_but_its_interpolation_is_not() {
+    let (world, uri) = open("let who = \"you\"\nlet s = \"hello there\"\nlet t = \"hi {who}\"\n");
+    assert!(labels(&world, &uri, at(1, 14)).is_empty(), "inside the text");
+    // inside `{` ... `}` the ordinary names come back
+    let inside = labels(&world, &uri, at(2, 16));
+    assert!(inside.contains(&"who".to_string()), "{inside:?}");
+    assert!(inside.contains(&"print".to_string()), "globals too");
+}
+
+/// `require` is given a file name, so that is what to offer — and the file
+/// doing the requiring is not one of them.
+#[test]
+fn require_offers_the_files_beside_this_one() {
+    let dir = std::env::temp_dir().join(format!("rua-req-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    for f in ["json.rua", "http.rua", "notes.txt"] {
+        std::fs::write(dir.join(f), "").unwrap();
+    }
+    std::fs::write(dir.join("lib").join("vec2.rua"), "").unwrap();
+    let uri = Url::from_file_path(dir.join("main.rua")).unwrap();
+    let mut world = rua_lsp::World::new();
+    world.open(uri.clone(), "let j = require(\"\")\n");
+
+    let got = labels(&world, &uri, at(0, 17));
+    assert!(got.contains(&"json".to_string()), "{got:?}");
+    assert!(got.contains(&"http".to_string()), "{got:?}");
+    assert!(got.contains(&"lib/".to_string()), "a directory to descend into");
+    assert!(!got.iter().any(|g| g.ends_with(".rua")), "require adds the extension itself");
+    assert!(!got.contains(&"notes".to_string()), "not a rua file");
+    assert!(!got.contains(&"print".to_string()), "a global is not a module");
+
+    // and inside that directory
+    world.open(uri.clone(), "let v = require(\"lib/\")\n");
+    let inner = labels(&world, &uri, at(0, 21));
+    assert!(inner.contains(&"lib/vec2".to_string()), "{inner:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A name being invented has nothing to complete to.
+#[test]
+fn naming_something_new_offers_nothing() {
+    let (world, uri) = open("fn \nlet \nlet mut \n");
+    assert!(labels(&world, &uri, at(0, 3)).is_empty(), "after `fn`");
+    assert!(labels(&world, &uri, at(1, 4)).is_empty(), "after `let`");
+    assert!(labels(&world, &uri, at(2, 8)).is_empty(), "after `let mut`");
+}
+
+/// Half a name is still that position: `fs::re` is a module position, and
+/// `t.pu` a method one.
+#[test]
+fn a_name_being_typed_keeps_the_position_it_is_in() {
+    let (world, uri) = open("fs::re\n");
+    let got = labels(&world, &uri, at(0, 6));
+    assert!(got.contains(&"read".to_string()), "{got:?}");
+    assert!(!got.contains(&"print".to_string()));
+
+    let (world, uri) = open("let t = []\nt.pu\n");
+    let got = labels(&world, &uri, at(1, 4));
+    assert!(got.contains(&"push".to_string()), "{got:?}");
+    assert!(!got.contains(&"break".to_string()));
+}
+
+/// At the start of a statement everything is fair game.
+#[test]
+fn an_expression_position_offers_keywords_globals_and_local_names() {
+    let (world, uri) = open("fn helper(a) { a }\nlet total = 1\n\n");
+    let got = labels(&world, &uri, at(2, 0));
+    for want in ["let", "while", "print", "fs", "helper", "total"] {
+        assert!(got.contains(&want.to_string()), "`{want}` missing from {got:?}");
+    }
+    // a field name reached through a dot is not a name in scope
+    let (world, uri) = open("let p = #{}\nlet n = p.width\n\n");
+    let got = labels(&world, &uri, at(2, 0));
+    assert!(!got.contains(&"width".to_string()), "a field is not a variable");
+}

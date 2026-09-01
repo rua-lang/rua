@@ -62,19 +62,6 @@ impl World {
         self.describe(&toks, i)
     }
 
-    /// Completion at a position, without a request around it.
-    pub fn complete_at(&self, uri: &Url, at: Position) -> Option<CompletionResponse> {
-        self.complete(&CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: at,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: None,
-        })
-    }
-
     /// The names in the outline, in order.
     pub fn symbol_names(&self, uri: &Url) -> Vec<String> {
         match self.symbols(&DocumentSymbolParams {
@@ -371,29 +358,106 @@ impl World {
 
     pub fn complete(&self, p: &CompletionParams) -> Option<CompletionResponse> {
         let uri = &p.text_document_position.text_document.uri;
+        self.complete_at(uri, p.text_document_position.position)
+    }
+
+    /// What is worth offering where the cursor is.
+    ///
+    /// Most of the work is deciding that, not listing names: after a `.` the
+    /// keywords are noise, inside a comment everything is, and inside
+    /// `require("` the answer is a list of files rather than of names.
+    pub fn complete_at(&self, uri: &Url, at: Position) -> Option<CompletionResponse> {
         let index = self.docs.get(uri)?;
-        let at = index.offset(p.text_document_position.position);
-        let (toks, _) = Lexer::tokenize_all(index.text());
-        // what comes before the cursor decides the answer: after `fs::` only
-        // that module's names make sense
-        let before = toks.iter().rposition(|t| t.span.hi <= at && t.tok != Tok::Eof);
-        if let Some(b) = before {
-            if toks[b].tok == Tok::ColonColon || (b > 0 && toks[b - 1].tok == Tok::ColonColon) {
-                let m = if toks[b].tok == Tok::ColonColon { b } else { b - 1 };
-                if m > 0 {
-                    if let Tok::Name(module) = &toks[m - 1].tok {
-                        if let Some(members) = self.members(module) {
-                            return Some(CompletionResponse::Array(
-                                members
-                                    .into_iter()
-                                    .map(|m| item(&m, CompletionItemKind::FUNCTION, module))
-                                    .collect(),
-                            ));
-                        }
-                    }
+        let offset = index.offset(at);
+        let scan = Lexer::scan(index.text());
+        let items = match self.where_is(&scan, index.text(), offset) {
+            Where::Comment | Where::Text | Where::Naming => Vec::new(),
+            Where::Member(module) => match self.members(&module) {
+                Some(mut names) => {
+                    names.sort();
+                    names
+                        .into_iter()
+                        .map(|n| item(&n, CompletionItemKind::FUNCTION, &module))
+                        .collect()
+                }
+                // not a module this runtime has: better to say nothing than to
+                // offer every global as though it were inside it
+                None => Vec::new(),
+            },
+            Where::Method => self.methods(&scan),
+            Where::Require(prefix) => self.modules_beside(uri, &prefix),
+            Where::Expression => self.in_scope(&scan),
+        };
+        Some(CompletionResponse::Array(items))
+    }
+
+    /// The methods a `.` could be followed by: what the runtime answers for
+    /// strings, tables and numbers, plus the field names this file uses.
+    fn methods(&self, scan: &rua_syntax::lexer::Scan) -> Vec<CompletionItem> {
+        use rua_core::MethodTable;
+        let mut out = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        for (kind, what) in [
+            (MethodTable::Str, "string"),
+            (MethodTable::Table, "table"),
+            (MethodTable::Math, "number"),
+        ] {
+            let mut names: Vec<String> =
+                self.vm.method_names(kind).iter().map(|n| n.to_string()).collect();
+            names.sort();
+            for n in names {
+                if seen.iter().any(|s| *s == n) {
+                    continue;
+                }
+                seen.push(n.clone());
+                out.push(item(&n, CompletionItemKind::METHOD, what));
+            }
+        }
+        // a field is not a method, but `t.` is where both are written
+        for (i, t) in scan.tokens.iter().enumerate() {
+            if i == 0 || scan.tokens[i - 1].tok != Tok::Dot {
+                continue;
+            }
+            if let Tok::Name(n) = &t.tok {
+                if !seen.iter().any(|s| s == n) {
+                    seen.push(n.clone());
+                    out.push(item(n, CompletionItemKind::FIELD, "used in this file"));
                 }
             }
         }
+        out
+    }
+
+    /// What `require` could be given: the rua files beside this one.
+    fn modules_beside(&self, uri: &Url, prefix: &str) -> Vec<CompletionItem> {
+        let Ok(path) = uri.to_file_path() else { return Vec::new() };
+        let Some(dir) = path.parent() else { return Vec::new() };
+        // `require("lib/thing")` is written with a directory in it, so the
+        // part before the last slash says where to look
+        let (sub, _) = prefix.rsplit_once('/').unwrap_or(("", prefix));
+        let looking = if sub.is_empty() { dir.to_path_buf() } else { dir.join(sub) };
+        let Ok(entries) = std::fs::read_dir(&looking) else { return Vec::new() };
+        let mut out = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let full = if sub.is_empty() { name.clone() } else { format!("{sub}/{name}") };
+            if e.path().is_dir() && !name.starts_with('.') {
+                out.push(item(&format!("{full}/"), CompletionItemKind::FOLDER, "directory"));
+            } else if let Some(stem) = name.strip_suffix(".rua") {
+                // `require` adds the extension itself, so it is not written
+                let label =
+                    if sub.is_empty() { stem.to_string() } else { format!("{sub}/{stem}") };
+                if Some(&*label) != path.file_stem().and_then(|s| s.to_str()) {
+                    out.push(item(&label, CompletionItemKind::MODULE, "a file beside this one"));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.label.cmp(&b.label));
+        out
+    }
+
+    /// Keywords, what the runtime provides, and the names this file declares.
+    fn in_scope(&self, scan: &rua_syntax::lexer::Scan) -> Vec<CompletionItem> {
         let mut out: Vec<CompletionItem> = Vec::new();
         for k in KEYWORDS {
             out.push(item(k, CompletionItemKind::KEYWORD, "keyword"));
@@ -406,19 +470,71 @@ impl World {
             };
             out.push(item(&g, kind, "runtime"));
         }
-        // names written in this file, which is where the locals are
+        // names written here, minus the ones reached through a `.` or a `::`,
+        // which are somebody else's fields rather than names in scope
         let mut seen: Vec<String> = Vec::new();
-        for t in &toks {
+        for (i, t) in scan.tokens.iter().enumerate() {
+            let after_dot = i > 0
+                && matches!(scan.tokens[i - 1].tok, Tok::Dot | Tok::ColonColon);
+            if after_dot {
+                continue;
+            }
             if let Tok::Name(n) = &t.tok {
                 if !seen.iter().any(|s| s == n) && !self.is_global(n) {
                     seen.push(n.clone());
+                    out.push(item(n, CompletionItemKind::VARIABLE, "this file"));
                 }
             }
         }
-        for n in seen {
-            out.push(item(&n, CompletionItemKind::VARIABLE, "this file"));
+        out
+    }
+
+    /// Work out where the cursor is standing.
+    fn where_is(&self, scan: &rua_syntax::lexer::Scan, text: &str, at: u32) -> Where {
+        // a comment swallows everything in it, and the cursor may be at the
+        // very end of one that is still being typed
+        if scan.comments.iter().any(|c| c.contains(at) || c.hi == at) {
+            return Where::Comment;
         }
-        Some(CompletionResponse::Array(out))
+        let toks = &scan.tokens;
+        // inside a string literal, which the lexer hands back whole
+        if let Some(i) = toks.iter().position(|t| {
+            matches!(t.tok, Tok::Str(_)) && at > t.span.lo && at <= t.span.hi
+        }) {
+            let body = &text[toks[i].span.lo as usize..at as usize];
+            if !in_interpolation(body) {
+                // `require("…")` is the one string whose contents are a name
+                let opens_require = i >= 2
+                    && toks[i - 1].tok == Tok::LParen
+                    && matches!(&toks[i - 2].tok, Tok::Name(n) if n == "require");
+                return if opens_require {
+                    Where::Require(body.trim_start_matches('"').to_string())
+                } else {
+                    Where::Text
+                };
+            }
+            // inside `{...}`: an expression like any other
+        }
+        // the token being typed, if the cursor is in the middle of a name
+        let typing = toks
+            .iter()
+            .position(|t| matches!(t.tok, Tok::Name(_)) && at > t.span.lo && at <= t.span.hi);
+        let before = match typing {
+            Some(i) => i.checked_sub(1),
+            None => toks.iter().rposition(|t| t.span.hi <= at && t.tok != Tok::Eof),
+        };
+        let Some(b) = before else { return Where::Expression };
+        match &toks[b].tok {
+            Tok::ColonColon => match b.checked_sub(1).map(|j| &toks[j].tok) {
+                Some(Tok::Name(module)) => Where::Member(module.clone()),
+                _ => Where::Expression,
+            },
+            Tok::Dot => Where::Method,
+            // `fn here`, `let here`, `let mut here` — a name being invented
+            Tok::Fn | Tok::Let => Where::Naming,
+            Tok::Mut if b > 0 && toks[b - 1].tok == Tok::Let => Where::Naming,
+            _ => Where::Expression,
+        }
     }
 
     fn is_global(&self, name: &str) -> bool {
@@ -437,12 +553,55 @@ impl World {
     }
 }
 
+/// Where the cursor is, which is what decides whether a suggestion is help
+/// or noise. `break` is a fine thing to offer at the start of a statement and
+/// nonsense after a `.`.
+#[derive(Debug, PartialEq)]
+enum Where {
+    /// Inside a comment. Nothing belongs here.
+    Comment,
+    /// Inside a string, outside any `{}` in it.
+    Text,
+    /// Inside the string `require` is being given.
+    Require(String),
+    /// After `mod::`.
+    Member(String),
+    /// After a `.`.
+    Method,
+    /// Naming something that does not exist yet, after `fn` or `let`.
+    Naming,
+    /// Anywhere a value could be written.
+    Expression,
+}
+
 /// Is this something rua would lex as one name?
 fn is_name(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
         && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
         && !KEYWORDS.contains(&s)
+}
+
+/// Is the end of this string's text inside a `{...}`?
+///
+/// `{{` and `}}` are how a literal brace is written, so neither opens or
+/// closes one.
+fn in_interpolation(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'{' if bytes.get(i + 1) == Some(&b'{') => i += 1,
+            b'}' if bytes.get(i + 1) == Some(&b'}') => i += 1,
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth > 0
 }
 
 fn item(label: &str, kind: CompletionItemKind, detail: &str) -> CompletionItem {
