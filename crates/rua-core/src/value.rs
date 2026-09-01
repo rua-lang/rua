@@ -8,6 +8,7 @@ use crate::hash::FxMap;
 use std::fmt;
 use std::os::raw::c_void;
 use std::rc::Rc;
+use smallvec::SmallVec;
 
 /// A runtime error, with the line it came from once the interpreter has had a
 /// chance to stamp it.
@@ -641,9 +642,26 @@ impl Key {
 pub struct Table {
     arr: Vec<Value>,
     /// Keyed entries, in insertion order.
-    pairs: Vec<(Key, Value)>,
+    ///
+    /// The first two live in the table itself. `#{ l: .., r: .. }` is what a
+    /// tree node, a point, a pair of coordinates all look like, and a program
+    /// that builds millions of them was paying a second `malloc` per object
+    /// for a vector holding two entries. Two is also exactly what the header
+    /// has room for: the fields below fold into one word, so the inline pairs
+    /// are free — the table allocation is the same 128 bytes it always was.
+    pairs: SmallVec<[(Key, Value); 2]>,
+    /// Everything a *big* table needs and an object-shaped one never does: the
+    /// hash index and the views compiled code reads through. Kept behind one
+    /// pointer so that the common table costs one word for all three.
+    extra: Option<Box<Extra>>,
+}
+
+/// The parts of a table that only appear once it grows or is handed to
+/// compiled code.
+#[derive(Default, Debug)]
+struct Extra {
     /// Key to index into `pairs`, built once `pairs` gets long.
-    index: Option<Box<FxMap<Key, usize>>>,
+    index: Option<FxMap<Key, usize>>,
     /// The views of every element, for compiled code that walks an array of
     /// arrays, with the shape epoch they were built at. Rebuilding them at
     /// every call was a third of n-body.
@@ -693,6 +711,48 @@ impl Table {
         Table::default()
     }
 
+    /// The hash index, if this table has grown one.
+    #[inline]
+    fn index(&self) -> Option<&FxMap<Key, usize>> {
+        match &self.extra {
+            Some(e) => e.index.as_ref(),
+            None => None,
+        }
+    }
+
+    /// The numeric view, if compiled code has asked for one.
+    #[inline]
+    fn nums(&self) -> Option<&Vec<f64>> {
+        match &self.extra {
+            Some(e) => e.nums.as_ref(),
+            None => None,
+        }
+    }
+
+    #[inline]
+    fn nums_mut(&mut self) -> Option<&mut Vec<f64>> {
+        match &mut self.extra {
+            Some(e) => e.nums.as_mut(),
+            None => None,
+        }
+    }
+
+    /// Throw the numeric view away, if there is one. Returns whether there
+    /// was: the shape epoch only has to move when something really changed.
+    #[inline]
+    fn drop_nums(&mut self) -> bool {
+        match &mut self.extra {
+            Some(e) => e.nums.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// The side table, made if it is not there yet.
+    #[inline]
+    fn extra_mut(&mut self) -> &mut Extra {
+        self.extra.get_or_insert_with(Default::default)
+    }
+
     pub fn get(&self, k: &Key) -> Value {
         if let Some(i) = array_index(k) {
             if i < self.arr.len() {
@@ -718,7 +778,7 @@ impl Table {
     /// same line of a program reads the same field of objects built the same
     /// way. The cache holds a position, and checking it is one pointer
     /// comparison — the names are interned, so equal names are one allocation.
-    #[inline]
+    #[inline(always)]
     pub fn get_field_cached(&self, name: &RStr, at: &std::cell::Cell<u32>) -> Value {
         if let Some((Key::Str(ks), v)) = self.pairs.get(at.get() as usize) {
             if ks.same(name) {
@@ -734,11 +794,11 @@ impl Table {
         }
     }
 
-    pub fn get_field(&self, name: &RStr) -> Option<Value> {
-        Some(match self.probe_str(name) {
+    pub fn get_field(&self, name: &RStr) -> Value {
+        match self.probe_str(name) {
             Some(i) => self.pairs[i].1.clone(),
             None => Value::Nil,
-        })
+        }
     }
 
     /// Where a string key lives in `pairs`.
@@ -750,7 +810,7 @@ impl Table {
     /// nothing owns it and nothing double-frees.
     #[inline]
     fn probe_str(&self, name: &RStr) -> Option<usize> {
-        match &self.index {
+        match self.index() {
             Some(ix) => {
                 let borrowed = std::mem::ManuallyDrop::new(Key::Str(
                     // SAFETY: `name` outlives `borrowed`, which is never
@@ -775,7 +835,20 @@ impl Table {
     /// instead of an owned key nobody keeps.
     #[inline]
     pub fn set_field(&mut self, name: &RStr, v: &Value) -> bool {
+        // The first field of a table literal, which is where half of an
+        // object's stores are: there is nothing to search and no index to
+        // keep — an index only exists above `INDEX_THRESHOLD` entries.
+        if self.pairs.is_empty() {
+            if !matches!(v, Value::Nil) {
+                self.pairs.push((Key::Str(name.clone()), v.clone()));
+            }
+            return true;
+        }
         if matches!(v, Value::Nil) {
+            // Assigning nil to a field the table does not have is a no-op, and
+            // that is what `#{ l: nil }` is: a literal whose value happens to
+            // be nil. Only *removing* a field needs the long way round, which
+            // moves every entry after it.
             return self.probe_str(name).is_none();
         }
         if let Some(i) = self.probe_str(name) {
@@ -784,7 +857,7 @@ impl Table {
         }
         self.pairs.push((Key::Str(name.clone()), v.clone()));
         let last = self.pairs.len() - 1;
-        match &mut self.index {
+        match self.extra.as_mut().and_then(|e| e.index.as_mut()) {
             Some(ix) => {
                 ix.insert(Key::Str(name.clone()), last);
             }
@@ -797,7 +870,7 @@ impl Table {
     /// Where `k` lives in `pairs`, by index or by scan.
     #[inline]
     fn find(&self, k: &Key) -> Option<usize> {
-        match &self.index {
+        match self.index() {
             Some(ix) => ix.get(k).copied(),
             None => self.pairs.iter().position(|(key, _)| key == k),
         }
@@ -838,10 +911,15 @@ impl Table {
         if i as f64 != n || i >= self.arr.len() || matches!(v, Value::Nil) {
             return false;
         }
-        match (&mut self.nums, v) {
-            (Some(cache), Value::Num(x)) => cache[i] = *x,
-            (slot @ Some(_), _) => *slot = None,
-            (None, _) => {}
+        match v {
+            Value::Num(x) => {
+                if let Some(cache) = self.nums_mut() {
+                    cache[i] = *x;
+                }
+            }
+            _ => {
+                self.drop_nums();
+            }
         }
         self.arr[i] = v.clone();
         true
@@ -859,16 +937,16 @@ impl Table {
     pub fn nums_span_mut(&mut self) -> Option<(*mut f64, usize)> {
         self.nums_span()?;
         // what is written through it no longer matches the array part
-        let cache = self.nums.as_mut()?;
+        let cache = self.nums_mut()?;
         Some((cache.as_mut_ptr(), cache.len()))
     }
 
     /// Compiled code finished: copy what it wrote back over the array part.
     pub fn commit_nums(&mut self) {
-        if let Some(cache) = &self.nums {
-            for (slot, n) in self.arr.iter_mut().zip(cache) {
-                *slot = Value::Num(*n);
-            }
+        let Some(e) = &self.extra else { return };
+        let Some(cache) = &e.nums else { return };
+        for (slot, n) in self.arr.iter_mut().zip(cache) {
+            *slot = Value::Num(*n);
         }
     }
 
@@ -878,7 +956,7 @@ impl Table {
     /// does, which is a rule someone has to remember. A debug build checks it
     /// instead: a stale view fails a test rather than reading freed memory.
     pub fn cached_spans(&self, epoch: u64) -> Option<(*const rua_jit::RtSpan, usize)> {
-        match &self.spans {
+        match self.extra.as_ref().and_then(|e| e.spans.as_ref()) {
             Some((at, views)) if *at == epoch => {
                 debug_assert!(self.views_still_true(views), "a cached element view went stale");
                 Some((views.as_ptr(), views.len()))
@@ -894,7 +972,7 @@ impl Table {
         }
         self.arr.iter().zip(views).all(|(v, span)| match v {
             Value::Table(t) => match t.try_borrow() {
-                Ok(inner) => match &inner.nums {
+                Ok(inner) => match inner.extra.as_ref().and_then(|e| e.nums.as_ref()) {
                     Some(cache) => cache.as_ptr() == span.ptr && cache.len() == span.len,
                     None => false,
                 },
@@ -916,14 +994,15 @@ impl Table {
         epoch: u64,
         views: Box<[rua_jit::RtSpan]>,
     ) -> Option<Box<[rua_jit::RtSpan]>> {
-        let old = self.spans.take().map(|(_, v)| v);
-        self.spans = Some((epoch, views));
+        let e = self.extra_mut();
+        let old = e.spans.take().map(|(_, v)| v);
+        e.spans = Some((epoch, views));
         old
     }
 
     /// Compiled code bailed out: throw away what it wrote.
     pub fn discard_nums(&mut self) {
-        self.nums = None;
+        self.drop_nums();
         bump_shape_epoch();
     }
 
@@ -938,14 +1017,14 @@ impl Table {
         if n < self.arr.len() {
             bump_shape_epoch();
             self.arr.truncate(n);
-            if let Some(cache) = &mut self.nums {
+            if let Some(cache) = self.nums_mut() {
                 cache.truncate(n);
             }
         }
     }
 
     pub fn nums_span(&mut self) -> Option<(*const f64, usize)> {
-        if self.nums.is_none() {
+        if self.nums().is_none() {
             let mut out = Vec::with_capacity(self.arr.len());
             for v in &self.arr {
                 match v {
@@ -953,12 +1032,12 @@ impl Table {
                     _ => return None,
                 }
             }
-            self.nums = Some(out);
+            self.extra_mut().nums = Some(out);
             // the view is a fresh allocation, so anything holding the old one
             // is looking at nothing
             bump_shape_epoch();
         }
-        let cache = self.nums.as_ref().expect("just filled in");
+        let cache = self.nums().expect("just filled in");
         Some((cache.as_ptr(), cache.len()))
     }
 
@@ -983,20 +1062,23 @@ impl Table {
     pub fn set(&mut self, k: Key, v: Value) {
         if let Some(i) = array_index(&k) {
             // an in-place numeric write can stay in the view too
-            match (&mut self.nums, &v) {
-                (Some(cache), Value::Num(n)) if i < cache.len() => cache[i] = *n,
-                (slot @ Some(_), _) => {
-                    *slot = None;
-                    bump_shape_epoch();
+            let kept = match (self.nums_mut(), &v) {
+                (Some(cache), Value::Num(n)) if i < cache.len() => {
+                    cache[i] = *n;
+                    true
                 }
-                (None, _) => {}
+                (Some(_), _) => false,
+                (None, _) => true,
+            };
+            if !kept && self.drop_nums() {
+                bump_shape_epoch();
             }
             if i < self.arr.len() {
                 self.arr[i] = v;
                 // a nil at the end shrinks the array part
                 while matches!(self.arr.last(), Some(Value::Nil)) {
                     self.arr.pop();
-                    self.nums = None;
+                    self.drop_nums();
                     bump_shape_epoch();
                 }
                 return;
@@ -1012,7 +1094,9 @@ impl Table {
             if let Some(i) = self.find(&k) {
                 self.pairs.remove(i);
                 // the indices after it just moved
-                self.index = None;
+                if let Some(e) = &mut self.extra {
+                    e.index = None;
+                }
                 self.reindex();
             }
             return;
@@ -1021,9 +1105,10 @@ impl Table {
             Some(i) => self.pairs[i].1 = v,
             None => {
                 self.pairs.push((k.clone(), v));
-                match &mut self.index {
+                let last = self.pairs.len() - 1;
+                match self.extra.as_mut().and_then(|e| e.index.as_mut()) {
                     Some(ix) => {
-                        ix.insert(k, self.pairs.len() - 1);
+                        ix.insert(k, last);
                     }
                     None if self.pairs.len() > INDEX_THRESHOLD => self.reindex(),
                     None => {}
@@ -1042,7 +1127,7 @@ impl Table {
         for (i, (k, _)) in self.pairs.iter().enumerate() {
             ix.insert(k.clone(), i);
         }
-        self.index = Some(Box::new(ix));
+        self.extra_mut().index = Some(ix);
     }
 
     /// After growing the array part, pull in any keys that now sit next to it.
@@ -1056,10 +1141,12 @@ impl Table {
             let next = Key::Num((self.arr.len() as f64).to_bits());
             match self.find(&next) {
                 Some(i) => {
-                    self.nums = None;
                     let (_, v) = self.pairs.remove(i);
                     self.arr.push(v);
-                    self.index = None;
+                    if let Some(e) = &mut self.extra {
+                        e.nums = None;
+                        e.index = None;
+                    }
                     self.reindex();
                     bump_shape_epoch();
                 }
@@ -1093,18 +1180,24 @@ impl Table {
         // pushing a row at a time would otherwise throw away the views of
         // every other row on each one.
         let room = self.arr.capacity();
-        let room_nums = self.nums.as_ref().map_or(usize::MAX, |c| c.capacity());
+        let room_nums = self.nums().map_or(usize::MAX, |c| c.capacity());
         // Keep the numeric view in step rather than dropping it. Filling an
         // array and then reading it is the common shape, and rebuilding the
         // view on the next read costs more than the whole fill.
-        match (&mut self.nums, &v) {
-            (Some(cache), Value::Num(n)) => cache.push(*n),
-            (slot @ Some(_), _) => *slot = None,
-            (None, _) => {}
+        match &v {
+            Value::Num(n) => {
+                let n = *n;
+                if let Some(cache) = self.nums_mut() {
+                    cache.push(n);
+                }
+            }
+            _ => {
+                self.drop_nums();
+            }
         }
         self.arr.push(v);
         if self.arr.capacity() != room
-            || self.nums.as_ref().map_or(usize::MAX, |c| c.capacity()) != room_nums
+            || self.nums().map_or(usize::MAX, |c| c.capacity()) != room_nums
         {
             bump_shape_epoch();
         }

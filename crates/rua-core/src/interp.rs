@@ -123,6 +123,26 @@ pub enum MethodTable {
     Table = 2,
 }
 
+/// Slots in the library method cache. A power of two, and larger than the
+/// number of builtin names a program calls in a loop.
+const METHOD_IC: usize = 64;
+
+/// A cached field read of a library table.
+///
+/// Deliberately its own function rather than a second call to
+/// `Table::get_field_cached`: the interpreter's `t.field` handler wants that
+/// one inlined into the dispatch loop, and giving the inliner a second, colder
+/// call site is enough for it to stop — which costs every field read in the
+/// program about 2%.
+#[inline(never)]
+fn cached_member(
+    t: &Rc<RefCell<Table>>,
+    name: &RStr,
+    at: &std::cell::Cell<u32>,
+) -> Value {
+    t.borrow().get_field_cached(name, at)
+}
+
 pub struct Vm {
     /// Globals live in a flat array; `Expr::Global` caches the index it got.
     gvals: Vec<Value>,
@@ -171,6 +191,15 @@ pub struct Vm {
     loops: HashMap<u32, LoopEntry>,
     /// `string`, `math` and `table`, kept to hand for method dispatch.
     libs: [Option<Rc<RefCell<Table>>>; 3],
+    /// Where each library method was found last time, by name.
+    ///
+    /// `parts.push(x)` reaches its builtin through a hash probe of the library
+    /// table, and a program that calls builtins in a loop does that probe on
+    /// every iteration for a table that never changes. A position is checked
+    /// by comparing the name stored there, which is one pointer comparison —
+    /// names are interned — so a stale or colliding entry is a miss, never a
+    /// wrong answer.
+    method_ic: Box<[std::cell::Cell<u32>; METHOD_IC]>,
     /// Call depth, shared with compiled code through [`RtCtx`] so that native
     /// recursion is bounded by the same limit. Boxed because compiled code
     /// holds its address and the VM itself may move.
@@ -219,6 +248,7 @@ impl Vm {
             retired_ctx: Vec::new(),
             loops: HashMap::new(),
             libs: [None, None, None],
+            method_ic: Box::new([const { std::cell::Cell::new(u32::MAX) }; METHOD_IC]),
             depth: Rc::new(std::cell::Cell::new(0)),
         }
     }
@@ -937,7 +967,11 @@ impl Vm {
 
     fn lib_member(&self, kind: MethodTable, name: &RStr) -> Value {
         match self.lib(kind) {
-            Some(t) => t.borrow().get_field(name).unwrap_or(Value::Nil),
+            Some(t) => {
+                let slot = (name.hash_bits() as usize).wrapping_add(kind as usize)
+                    & (METHOD_IC - 1);
+                cached_member(t, name, &self.method_ic[slot])
+            }
             None => Value::Nil,
         }
     }
@@ -947,7 +981,7 @@ impl Vm {
     pub(crate) fn method(&self, o: &Value, name: &RStr) -> Res<Value> {
         let kind = match o {
             Value::Table(t) => {
-                let own = t.borrow().get_field(name).unwrap_or(Value::Nil);
+                let own = t.borrow().get_field(name);
                 if !matches!(own, Value::Nil) {
                     return Ok(own);
                 }

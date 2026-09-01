@@ -11,6 +11,11 @@ use crate::value::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// `t[name]`, kept out of line: see the call site.
+#[inline(never)]
+fn field_of(t: &Rc<RefCell<Table>>, name: &RStr) -> Value {
+    t.borrow().get_field(name)
+}
 
 /// One suspended call: where to go back to when the current function returns.
 ///
@@ -500,10 +505,14 @@ impl Vm {
                         (Value::Table(t), Value::Num(n)) => {
                             t.borrow().get_num(*n).cloned()
                         }
-                        // `t[k]` with the name in a register, which is what a
-                        // table used as a map looks like: reach it by name,
-                        // rather than building an owned key to throw away
-                        (Value::Table(t), Value::Str(s)) => t.borrow().get_field(s),
+                        // `t[name]` with the name in a register: the same
+                        // lookup as `t.name`, and it need not build a `Key`
+                        // — which is a refcount round trip per read.
+                        //
+                        // Outlined: `t[i]` on an array is the inner loop of
+                        // every numeric program, and inlining a hash probe
+                        // beside it costs those programs registers.
+                        (Value::Table(t), Value::Str(s)) => Some(field_of(t, s)),
                         _ => None,
                     };
                     let v = match fast {
@@ -533,8 +542,8 @@ impl Vm {
                     set!(dst, v);
                 }
                 Op::SetIndexK { obj, k, val } => {
-                    // the key is a constant of this function, and nothing here
-                    // keeps it: borrow it out of the pool
+                    // the constant stays borrowed: cloning it to match on it
+                    // is a refcount round trip at every field store
                     let key = &proto.consts[k as usize];
                     let done = match (
                         at!(obj),

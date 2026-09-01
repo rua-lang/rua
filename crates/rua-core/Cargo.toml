@@ -9,3 +9,4 @@ license = "MIT"
 rua-syntax = { path = "../rua-syntax", version = "0.1.0" }
 rua-jit = { path = "../rua-jit", version = "0.1.0" }
 rua-ffi = { path = "../rua-ffi", version = "0.1.0" }
+smallvec = { version = "1.15.2", features = ["union"] }
