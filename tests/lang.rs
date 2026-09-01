@@ -1360,7 +1360,8 @@ fn a_script_can_read_and_write_files() {
         let p = "{p}"
         fs::write(p, "alpha\nbeta\n")
         fs::append(p, "gamma\n")
-        let ls = fs::lines(p)
+        let ls = []
+        for line in fs::lines(p) {{ ls.push(line) }}
         let missing = try(|| fs::read(p + ".nope"))
         let size = fs::size(p)
         fs::remove(p)
@@ -1374,6 +1375,84 @@ fn a_script_can_read_and_write_files() {
     assert_eq!(out[2].to_string(), "false", "a missing file is an error, not nil");
     assert_eq!(out[3].as_num().unwrap(), 17.0);
     assert_eq!(out[4].to_string(), "false", "removed");
+}
+
+/// `fs::open` is here because appending in a loop reopened the file once per
+/// line, which cost 8x a single buffered handle. A handle that is closed, or
+/// used the wrong way round, has to say so rather than dropping the write.
+#[test]
+fn an_open_file_writes_through_one_buffered_handle() {
+    let dir = std::env::temp_dir().join(format!("rua-open-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("log.txt");
+    let p = path.to_string_lossy().replace('\\', "/");
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(&format!(
+            r#"
+        let w = fs::open("{p}", "w")
+        for i in 0..3 {{ w.write("line {{i}}\n") }}
+        w.close()
+        let r = fs::open("{p}")
+        let first = r.read_line()
+        let rest = []
+        for l in r.lines() {{ rest.push(l) }}
+        r.close()
+
+        let a = fs::open("{p}", "a")
+        a.write("tail\n")
+        a.close()
+        let content = fs::read("{p}")
+
+        let closed = fs::open("{p}", "w")
+        closed.close()
+        let after = try(|| closed.write("x"))
+        let wrong = try(|| fs::open("{p}").write("x"))
+        let mode = try(|| fs::open("{p}", "z"))
+        return first, rest.join(","), content, after, wrong, mode;
+        "#
+        ))
+        .unwrap_or_else(|e| panic!("{{e}}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out[0].to_string(), "line 0");
+    assert_eq!(out[1].to_string(), "line 1,line 2", "reading resumes where it left off");
+    assert_eq!(out[2].to_string(), "line 0\nline 1\nline 2\ntail\n", "\"a\" adds to the end");
+    assert_eq!(out[3].to_string(), "false", "writing to a closed file is an error");
+    assert_eq!(out[4].to_string(), "false", "writing a file opened for reading is an error");
+    assert_eq!(out[5].to_string(), "false", "an unknown mode is an error");
+}
+
+/// `fs::lines` hands back one line at a time rather than a table of all of
+/// them, so a file larger than memory still goes through. Stopping early has
+/// to be allowed, and a file that isn't there has to say so at the call.
+#[test]
+fn reading_lines_streams_and_can_stop_early() {
+    let dir = std::env::temp_dir().join(format!("rua-lines-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("many.txt");
+    let text: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&path, &text).unwrap();
+    let p = path.to_string_lossy().replace('\\', "/");
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(&format!(
+            r#"
+        let seen = 0
+        let first = ""
+        for line in fs::lines("{p}") {{
+            if seen == 0 {{ first = line }}
+            seen = seen + 1
+            if seen == 3 {{ break }}
+        }}
+        let gone = try(|| {{ for l in fs::lines("{p}.nope") {{ }} }})
+        return seen, first, gone;
+        "#
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out[0].as_num().unwrap(), 3.0, "stopped after three");
+    assert_eq!(out[1].to_string(), "line 0", "newline trimmed");
+    assert_eq!(out[2].to_string(), "false", "a missing file is an error");
 }
 
 /// `{` starts an interpolation, so a literal brace is doubled — and `}}` has

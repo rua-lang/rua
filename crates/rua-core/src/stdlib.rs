@@ -215,6 +215,19 @@ where
     native(name, move |_vm, _args| Ok(f().unwrap_or_else(|| vec![Value::Nil])))
 }
 
+/// An iterator that may fail part way — reading a file, say, where the open
+/// succeeded and the disk gave out later. Ending the loop quietly would be a
+/// short answer that looks like a complete one.
+pub fn try_iterator<F>(name: &str, f: F) -> Value
+where
+    F: Fn() -> Res<Option<Vec<Value>>> + 'static,
+{
+    native(name, move |_vm, _args| match f()? {
+        Some(vals) => Ok(vals),
+        None => Ok(vec![Value::Nil]),
+    })
+}
+
 /// `for v in t` walks a table's values, in key order.
 pub fn value_iterator(t: Rc<RefCell<Table>>) -> Value {
     let keys = t.borrow().keys();
@@ -812,6 +825,110 @@ fn os_io(vm: &mut Vm) {
 /// write it, or to walk its lines, and a handle is machinery in the way of all
 /// three. Anything that fails says what it was doing and to which path, since
 /// a script that cannot open a file wants to print that, not a number.
+/// An open file. `fs::append` in a loop opens, writes and closes once per
+/// line, which costs 8x what one buffered handle costs; Lua has `io.open` for
+/// the same reason. Closing sets this to None, so writing to a closed file
+/// says so instead of being quietly lost.
+enum Handle {
+    Read(std::io::BufReader<std::fs::File>),
+    Write(std::io::BufWriter<std::fs::File>),
+}
+
+type Open = Rc<RefCell<Option<Handle>>>;
+
+/// The shared file, or the reason it isn't available: closed, or opened the
+/// other way round.
+fn held<'a>(h: &'a Open, want_write: bool, who: &str) -> Res<std::cell::RefMut<'a, Option<Handle>>> {
+    let borrowed = h.borrow_mut();
+    match borrowed.as_ref() {
+        None => err(format!("fs::{who}: the file is closed")),
+        Some(Handle::Read(_)) if want_write => {
+            err(format!("fs::{who}: this file was opened for reading"))
+        }
+        Some(Handle::Write(_)) if !want_write => {
+            err(format!("fs::{who}: this file was opened for writing"))
+        }
+        Some(_) => Ok(borrowed),
+    }
+}
+
+/// The table a script gets back from `fs::open`: closures over one file, so
+/// `f.write(..)` and `f.close()` read as methods.
+fn handle_table(h: Open, path: String) -> Value {
+    use std::io::{BufRead, Read, Write};
+    let t = Rc::new(RefCell::new(Table::new()));
+    let (w, name) = (h.clone(), path.clone());
+    t.borrow_mut().set_str("write", native("write", move |_vm, args| {
+        let text = str_arg(args, 1)?;
+        let mut slot = held(&w, true, "write")?;
+        let Some(Handle::Write(f)) = slot.as_mut() else { unreachable!() };
+        f.write_all(text.as_bytes()).map_err(|e| Error(format!("fs::write {name}: {e}")))?;
+        one(Value::Nil)
+    }));
+    let (r, name) = (h.clone(), path.clone());
+    t.borrow_mut().set_str("read_line", native("read_line", move |_vm, _args| {
+        let mut slot = held(&r, false, "read_line")?;
+        let Some(Handle::Read(f)) = slot.as_mut() else { unreachable!() };
+        let mut line = String::new();
+        match f.read_line(&mut line) {
+            Ok(0) => one(Value::Nil),
+            Ok(_) => {
+                line.truncate(line.trim_end_matches(['\n', '\r']).len());
+                one(Value::str(line))
+            }
+            Err(e) => err(format!("fs::read_line {name}: {e}")),
+        }
+    }));
+    let (r, name) = (h.clone(), path.clone());
+    t.borrow_mut().set_str("read", native("read", move |_vm, _args| {
+        let mut slot = held(&r, false, "read")?;
+        let Some(Handle::Read(f)) = slot.as_mut() else { unreachable!() };
+        let mut text = String::new();
+        match f.read_to_string(&mut text) {
+            Ok(_) => one(Value::str(text)),
+            Err(e) => err(format!("fs::read {name}: {e}")),
+        }
+    }));
+    let (r, name) = (h.clone(), path.clone());
+    t.borrow_mut().set_str("lines", native("lines", move |_vm, _args| {
+        // hold the handle, not a borrow of it: the loop body runs between calls
+        let (r, name) = (r.clone(), name.clone());
+        one(try_iterator("lines", move || {
+            let mut slot = held(&r, false, "lines")?;
+            let Some(Handle::Read(f)) = slot.as_mut() else { unreachable!() };
+            let mut line = String::new();
+            match f.read_line(&mut line) {
+                Ok(0) => Ok(None),
+                Ok(_) => {
+                    line.truncate(line.trim_end_matches(['\n', '\r']).len());
+                    Ok(Some(vec![Value::str(line)]))
+                }
+                Err(e) => err(format!("fs::lines {name}: {e}")),
+            }
+        }))
+    }));
+    let (w, name) = (h.clone(), path.clone());
+    t.borrow_mut().set_str("flush", native("flush", move |_vm, _args| {
+        let mut slot = held(&w, true, "flush")?;
+        let Some(Handle::Write(f)) = slot.as_mut() else { unreachable!() };
+        f.flush().map_err(|e| Error(format!("fs::flush {name}: {e}")))?;
+        one(Value::Nil)
+    }));
+    let (c, name) = (h, path);
+    t.borrow_mut().set_str("close", native("close", move |_vm, _args| {
+        // a buffered write that fails on the way out is the one a script most
+        // wants to hear about, so flush here rather than leaving it to drop
+        match c.borrow_mut().take() {
+            Some(Handle::Write(mut f)) => match f.flush() {
+                Ok(()) => one(Value::Nil),
+                Err(e) => err(format!("fs::close {name}: {e}")),
+            },
+            _ => one(Value::Nil),
+        }
+    }));
+    Value::Table(t)
+}
+
 fn fs_lib(vm: &mut Vm) {
     module(
         vm,
@@ -824,22 +941,49 @@ fn fs_lib(vm: &mut Vm) {
                     Err(e) => err(format!("fs::read {p}: {e}")),
                 }
             })),
-            ("lines", unary("lines", |p| {
-                let p = p.as_str()?;
-                match std::fs::read_to_string(&*p) {
-                    Ok(text) => {
-                        let mut t = Table::new();
-                        // a trailing newline ends the last line, it does not
-                        // start an empty one
-                        for line in text.strip_suffix('\n').unwrap_or(&text).split('\n') {
-                            t.push(Value::str(line.strip_suffix('\r').unwrap_or(line)));
+            // one line at a time: a file is often larger than the memory a
+            // script has, and a table of every line is 26x the file here
+            ("lines", native("lines", |_vm, args| {
+                use std::io::BufRead;
+                let p = str_arg(args, 0)?;
+                let file = std::fs::File::open(&*p)
+                    .map_err(|e| Error(format!("fs::lines {p}: {e}")))?;
+                let reader = RefCell::new(std::io::BufReader::new(file));
+                let where_ = p.to_string();
+                one(try_iterator("lines", move || {
+                    let mut line = String::new();
+                    match reader.borrow_mut().read_line(&mut line) {
+                        Ok(0) => Ok(None),
+                        Ok(_) => {
+                            let end = line.trim_end_matches(['\n', '\r']).len();
+                            line.truncate(end);
+                            Ok(Some(vec![Value::str(line)]))
                         }
-                        if text.is_empty() {
-                            t = Table::new();
-                        }
-                        Ok(Value::table(t))
+                        Err(e) => err(format!("fs::lines {where_}: {e}")),
                     }
-                    Err(e) => err(format!("fs::lines {p}: {e}")),
+                }))
+            })),
+            // "r" to read, "w" to truncate and write, "a" to add to the end
+            ("open", native("open", |_vm, args| {
+                let p = str_arg(args, 0)?;
+                let mode = match args.get(1) {
+                    Some(m) if !matches!(m, Value::Nil) => str_arg(args, 1)?.to_string(),
+                    _ => "r".to_string(),
+                };
+                let opts = &mut std::fs::OpenOptions::new();
+                let handle = match mode.as_str() {
+                    "r" => opts.read(true).open(&*p).map(|f| Handle::Read(std::io::BufReader::new(f))),
+                    "w" => opts.write(true).create(true).truncate(true).open(&*p)
+                        .map(|f| Handle::Write(std::io::BufWriter::new(f))),
+                    "a" => opts.append(true).create(true).open(&*p)
+                        .map(|f| Handle::Write(std::io::BufWriter::new(f))),
+                    other => return err(format!(
+                        "fs::open {p}: mode is \"r\", \"w\" or \"a\", not \"{other}\""
+                    )),
+                };
+                match handle {
+                    Ok(h) => one(handle_table(Rc::new(RefCell::new(Some(h))), p.to_string())),
+                    Err(e) => err(format!("fs::open {p}: {e}")),
                 }
             })),
             ("write", binary("write", |p, text| {

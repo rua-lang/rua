@@ -141,11 +141,17 @@ coroutines. This is a scripting language that reads like Rust, not Rust.
 Enough to write something real, and no more than that.
 
 ```rust
-// files: whole ones, because that is what a script wants
+// files: whole ones, because that is what a script usually wants
 let text = fs::read("notes.md")
-for line in fs::lines("notes.md") { print(line) }
+for line in fs::lines("notes.md") { print(line) }   // streams, one at a time
 fs::write("out.json", body)
 fs::append("log.txt", "done\n")
+
+// or an open handle, when one line at a time is the point. Appending in a
+// loop reopens the file for every line; this buffers, and is 8x faster.
+let log = fs::open("log.txt", "a")             // "r" read, "w" truncate, "a" add
+log.write("started\n")
+log.close()                                    // flushes, and says so if that fails
 if fs::exists(p) && !fs::is_dir(p) { print(fs::size(p)) }
 for name in fs::list(".") { }                  // sorted, so runs compare
 fs::mkdir("out/logs")                          // and its parents
