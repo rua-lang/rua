@@ -96,6 +96,95 @@ impl World {
         out
     }
 
+    /// The function whose call the cursor is inside, and which argument it is
+    /// on — what an editor shows while a call is being written.
+    ///
+    /// Only functions written in this file: the runtime's own are closures
+    /// with no parameter names to read, and inventing them would be worse
+    /// than saying nothing.
+    pub fn signature_at(&self, uri: &Url, at: Position) -> Option<SignatureHelp> {
+        let index = self.docs.get(uri)?;
+        let offset = index.offset(at);
+        let scan = Lexer::scan(index.text());
+        let toks = &scan.tokens;
+        // walk back to the `(` this cursor is inside, counting the commas
+        // that belong to it on the way
+        let last = toks.iter().rposition(|t| t.span.hi <= offset && t.tok != Tok::Eof)?;
+        let (mut depth, mut argument, mut open) = (0i32, 0u32, None);
+        for i in (0..=last).rev() {
+            match toks[i].tok {
+                Tok::RParen | Tok::RBracket | Tok::RBrace => depth += 1,
+                Tok::LBracket | Tok::LBrace if depth > 0 => depth -= 1,
+                Tok::LParen if depth > 0 => depth -= 1,
+                Tok::LParen => {
+                    open = Some(i);
+                    break;
+                }
+                Tok::Comma if depth == 0 => argument += 1,
+                // a call does not run past the end of a statement
+                Tok::Semi | Tok::Fn if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        let open = open?;
+        let Some(Tok::Name(callee)) = open.checked_sub(1).map(|i| &toks[i].tok) else {
+            return None;
+        };
+        let (params, at_span) = self.parameters_of(&scan, callee)?;
+        let label = format!("{callee}({})", params.join(", "));
+        let _ = at_span;
+        Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: label.clone(),
+                documentation: None,
+                parameters: Some(
+                    params
+                        .iter()
+                        .map(|p| ParameterInformation {
+                            label: ParameterLabel::Simple(p.clone()),
+                            documentation: None,
+                        })
+                        .collect(),
+                ),
+                active_parameter: Some(argument.min(params.len().saturating_sub(1) as u32)),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(argument),
+        })
+    }
+
+    /// The parameters of a `fn` written in this file, read from the tokens so
+    /// that a file which does not yet parse still answers.
+    fn parameters_of(
+        &self,
+        scan: &rua_syntax::lexer::Scan,
+        name: &str,
+    ) -> Option<(Vec<String>, rua_syntax::ast::Span)> {
+        let toks = &scan.tokens;
+        for i in 0..toks.len() {
+            if toks[i].tok != Tok::Fn {
+                continue;
+            }
+            let Some(Tok::Name(n)) = toks.get(i + 1).map(|t| &t.tok) else { continue };
+            if n != name || toks.get(i + 2).map(|t| &t.tok) != Some(&Tok::LParen) {
+                continue;
+            }
+            let mut params = Vec::new();
+            let mut j = i + 3;
+            while let Some(t) = toks.get(j) {
+                match &t.tok {
+                    Tok::RParen => return Some((params, toks[i + 1].span)),
+                    Tok::Name(p) => params.push(p.clone()),
+                    Tok::Comma => {}
+                    _ => return Some((params, toks[i + 1].span)),
+                }
+                j += 1;
+            }
+            return Some((params, toks[i + 1].span));
+        }
+        None
+    }
+
     /// Lay out a whole document.
     ///
     /// One edit replacing everything: the formatter moves whitespace between

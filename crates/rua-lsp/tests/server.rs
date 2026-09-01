@@ -350,3 +350,55 @@ fn an_expression_position_offers_keywords_globals_and_local_names() {
     let got = labels(&world, &uri, at(2, 0));
     assert!(!got.contains(&"width".to_string()), "a field is not a variable");
 }
+
+// ---- signature help --------------------------------------------------------
+
+/// While a call is being written, say what it takes and which one is being
+/// written now.
+#[test]
+fn signature_help_names_the_parameters_and_the_one_being_written() {
+    let (world, uri) = open("fn add(left, right) { left + right }\nlet n = add(1, 2)\n");
+    let sig = world.signature_at(&uri, at(1, 12)).expect("inside the call");
+    assert_eq!(sig.signatures[0].label, "add(left, right)");
+    assert_eq!(sig.active_parameter, Some(0), "on the first argument");
+
+    let second = world.signature_at(&uri, at(1, 15)).expect("after the comma");
+    assert_eq!(second.active_parameter, Some(1), "on the second");
+}
+
+/// A call with nothing around it is not a call, and neither is a function the
+/// runtime provides — those are closures with no parameter names to read, and
+/// inventing some would be worse than saying nothing.
+#[test]
+fn signature_help_says_nothing_it_does_not_know() {
+    let (world, uri) = open("fn add(a, b) { a + b }\nlet n = 1\nprint(n)\n");
+    assert!(world.signature_at(&uri, at(1, 9)).is_none(), "not inside a call");
+    assert!(world.signature_at(&uri, at(2, 6)).is_none(), "`print` is the runtime's");
+}
+
+/// Calls inside calls: the innermost one is the one being written.
+#[test]
+fn signature_help_follows_a_call_inside_a_call() {
+    let (world, uri) = open("fn outer(a) { a }\nfn inner(x, y) { x }\nlet n = outer(inner(1, 2))\n");
+    let sig = world.signature_at(&uri, at(2, 24)).expect("inside inner");
+    assert_eq!(sig.signatures[0].label, "inner(x, y)");
+    assert_eq!(sig.active_parameter, Some(1));
+    let out = world.signature_at(&uri, at(2, 14)).expect("inside outer");
+    assert_eq!(out.signatures[0].label, "outer(a)");
+}
+
+/// Formatting comes back as one edit over the whole file, and nothing at all
+/// when there is nothing to change.
+#[test]
+fn formatting_replaces_the_document_or_says_nothing() {
+    let (world, uri) = open("fn f( a ){a+1}\n");
+    let edits = world.format(&uri).expect("an edit");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "fn f(a) { a + 1 }\n");
+
+    let (world, uri) = open("fn f(a) { a + 1 }\n");
+    assert!(world.format(&uri).unwrap().is_empty(), "already laid out");
+
+    let (world, uri) = open("let x = @\n");
+    assert!(world.format(&uri).is_err(), "a file that does not lex is left alone");
+}

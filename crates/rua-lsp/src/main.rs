@@ -46,6 +46,14 @@ fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        // rua has no interfaces, so where a name is implemented and where it
+        // is declared are the same place
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
         references_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         // `prepareProvider` is what lets the editor grey the command out on a
@@ -150,6 +158,22 @@ fn answer(world: &mut analysis::World, req: Request) -> Response {
                 .and_then(|(_, p)| world.format(&p.text_document.uri));
             reply(id, out)
         }
+        request::SignatureHelpRequest::METHOD => reply(
+            id,
+            cast::<request::SignatureHelpRequest>(req).map(|(_, p)| {
+                let at = p.text_document_position_params;
+                world.signature_at(&at.text_document.uri, at.position)
+            }),
+        ),
+        request::GotoImplementation::METHOD => reply(
+            id,
+            cast::<request::GotoImplementation>(req).map(|(_, p)| {
+                let at = p.text_document_position_params;
+                world
+                    .definition_at(&at.text_document.uri, at.position)
+                    .map(GotoDefinitionResponse::Scalar)
+            }),
+        ),
         request::References::METHOD => reply(
             id,
             cast::<request::References>(req).map(|(_, p)| {

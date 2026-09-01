@@ -43,27 +43,29 @@ colours.
 
 ## fresh
 
-fresh highlights with [syntect], which reads `.sublime-syntax` and **not**
-TextMate `.tmLanguage.json` — so it cannot share the grammar VS Code uses.
-`editors/fresh/rua/` is a fresh language pack: a syntect grammar written from
-the same lexer, and a manifest that also tells fresh how to start the server.
+Two files and a config block. The grammar first — fresh highlights with
+[syntect], which reads `.sublime-syntax` and **not** TextMate
+`.tmLanguage.json`, so it cannot share the one VS Code uses:
 
 ```sh
-cp -r editors/fresh/rua ~/.config/fresh/grammars/rua
+cp editors/fresh/rua/grammars/syntax.sublime-syntax ~/.config/fresh/grammars/rua.sublime-syntax
 ```
-
-Restart fresh; grammars are built once at startup. The pack declares the
-extension, so nothing else is needed for colours. The language server is
-configured separately, since a pack's `lsp` block and the `lsp` map in
-`config.json` are two ways to say the same thing and the map is the one that
-survives reinstalling the pack:
 
 ```jsonc
 // ~/.config/fresh/config.json
 {
   "lsp_enabled": true,
   "languages": {
-    "rua": { "extensions": ["rua"], "comment_prefix": "//", "auto_indent": true }
+    "rua": {
+      "extensions": ["rua"],
+      "comment_prefix": "//",
+      "auto_indent": true,
+      // named for TextMate, but the loader takes the file's extension and
+      // accepts only .sublime-syntax
+      "textmate_grammar": "/home/you/.config/fresh/grammars/rua.sublime-syntax",
+      // fresh's own format command runs this, not the server
+      "formatter": { "command": "rua", "args": ["--fmt"], "stdin": true }
+    }
   },
   "lsp": {
     "rua": [
@@ -72,25 +74,31 @@ survives reinstalling the pack:
         "enabled": true,
         "name": "rua",
         "auto_start": true,
-        "root_markers": ["Cargo.toml", ".git"]
+        "root_markers": ["Cargo.toml", ".git"],
+        "env": { "RUA_LSP_LOG": "info" }
       }
     ]
   }
 }
 ```
 
+Grammars are built once at startup, so **restart fresh**, and reopen any
+buffer that was open before — it keeps the syntax it was given.
+
+What each of fresh's commands reaches:
+
+| fresh | what answers |
+| --- | --- |
+| diagnostics in the gutter, as you type | the server, unasked |
+| `Go to Definition`, `Find References`, `Rename`, `Go to Implementation` | the server |
+| `Signature Help` | the server, for functions written in the file |
+| `Completion` | the server |
+| hover under the mouse | the server |
+| `Format buffer` | **`rua --fmt`, not the server** — fresh has no `lsp_format` action, so its format command runs the configured formatter |
+| `Code Actions` | nothing yet; the server offers none |
+
 Do not put a `"grammar"` key in `languages.rua`: naming a built-in there
-overrides the pack.
-
-fresh keeps the server's own output in
-`~/.local/state/fresh/logs/lsp/rua-*.log`, and its own reasoning in
-`~/.local/state/fresh/logs/fresh-*.log`. In the second, `grammar-build` and
-`Failed to load grammar` are the lines that say why a file has no colours,
-and `LSP server 'rua' initialized for language: rua` says the server
-attached.
-
-A buffer that was open before the grammar loaded keeps the syntax it was
-given, so reopen the file after changing any of this.
+overrides the file above.
 
 [syntect]: https://github.com/trishume/syntect
 
@@ -143,23 +151,13 @@ change what a program means — the test suite lays out every `.rua` file in
 the repository and checks the tokens come back identical. A file that does
 not lex is reported and left alone.
 
-Both editors format through the server rather than through this command:
-fresh's LSP client sends `textDocument/formatting`, and VS Code's Format
-Document is wired to it by the extension, which names itself the default
-formatter for rua so nothing stops to ask which one to use.
+VS Code formats through the server: its Format Document is wired to whatever
+the server advertises, and the extension names itself the default formatter
+for rua so nothing stops to ask which one to use.
 
-fresh can be told to run the command instead, which is the way to get
-`format_on_save`:
-
-```jsonc
-"languages": {
-  "rua": {
-    "extensions": ["rua"],
-    "formatter": { "command": "rua", "args": ["--fmt"], "stdin": true },
-    "format_on_save": true
-  }
-}
-```
+fresh does not. Its `Format buffer` runs the command named in
+`languages.rua.formatter` — there is no `lsp_format` action — so that is
+where `rua --fmt` goes, and `"format_on_save": true` beside it does the rest.
 
 ## When it does not work
 
