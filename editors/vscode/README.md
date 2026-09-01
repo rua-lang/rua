@@ -1,7 +1,8 @@
 # rua for VS Code
 
-Editor support for [rua](../../README.md), a small scripting language with
-Rust-shaped syntax and Lua-shaped semantics.
+Editor support for rua, a small scripting language with Rust-shaped syntax
+and Lua-shaped semantics. It lives in the `editors/vscode` directory of the
+rua repository.
 
 The extension is two halves that work independently:
 
