@@ -1,0 +1,13 @@
+# vsce packages the production dependencies for us; everything below is either
+# a build input or an editor local, and none of it belongs in the .vsix.
+.vscode/**
+.vscode-test/**
+.gitignore
+.vscodeignore
+src/**
+**/*.ts
+**/*.map
+**/tsconfig.json
+**/.eslintrc.json
+node_modules/.bin/**
+*.vsix

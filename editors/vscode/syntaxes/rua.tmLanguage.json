@@ -1,0 +1,349 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "rua",
+  "scopeName": "source.rua",
+  "fileTypes": ["rua"],
+  "patterns": [
+    { "include": "#shebang" },
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#map-literal" },
+    { "include": "#function-definition" },
+    { "include": "#keywords" },
+    { "include": "#module-path" },
+    { "include": "#member" },
+    { "include": "#call" },
+    { "include": "#operators" },
+    { "include": "#punctuation" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "shebang": {
+      "comment": "the lexer skips a leading `#!` line, and only a leading one",
+      "match": "\\A#!.*$",
+      "name": "comment.line.number-sign.shebang.rua"
+    },
+
+    "comments": {
+      "patterns": [
+        { "include": "#line-comment" },
+        { "include": "#block-comment" }
+      ]
+    },
+    "line-comment": {
+      "begin": "//",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.comment.rua" }
+      },
+      "end": "$",
+      "name": "comment.line.double-slash.rua"
+    },
+    "block-comment": {
+      "comment": "the lexer counts depth, so /* */ nests",
+      "begin": "/\\*",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.comment.begin.rua" }
+      },
+      "end": "\\*/",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.comment.end.rua" }
+      },
+      "name": "comment.block.rua",
+      "patterns": [{ "include": "#block-comment" }]
+    },
+
+    "strings": {
+      "comment": "double quotes only; the string runs to the next quote, newlines included",
+      "begin": "\"",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.string.begin.rua" }
+      },
+      "end": "\"",
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.string.end.rua" }
+      },
+      "name": "string.quoted.double.rua",
+      "patterns": [
+        { "include": "#string-escape" },
+        { "include": "#brace-escape" },
+        { "include": "#format-placeholder" },
+        { "include": "#interpolation" }
+      ]
+    },
+    "string-escape": {
+      "comment": "\\n \\t \\r \\0 are translated, any other escape yields the character itself. `{` and `}` are deliberately excluded: escapes are resolved before interpolation runs, so `\\{` does not hide a brace from it - `{{` does.",
+      "patterns": [
+        {
+          "match": "\\\\[nrt0]",
+          "name": "constant.character.escape.rua"
+        },
+        {
+          "match": "\\\\[^nrt0{}]",
+          "name": "constant.character.escape.other.rua"
+        }
+      ]
+    },
+    "brace-escape": {
+      "match": "\\{\\{|\\}\\}",
+      "name": "constant.character.escape.brace.rua"
+    },
+    "format-placeholder": {
+      "comment": "`{}` and `{:.2}` are left for `format`, not interpolated",
+      "match": "\\{\\}|\\{:[^{}\"]*\\}",
+      "name": "constant.other.placeholder.rua"
+    },
+    "interpolation": {
+      "comment": "`{expr}` and `{expr:spec}` are parsed as an expression",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.interpolation.begin.rua" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.interpolation.end.rua" }
+      },
+      "name": "meta.interpolation.rua",
+      "contentName": "meta.embedded.line.rua",
+      "patterns": [
+        {
+          "match": "(?<!:)(:)(?!:)([^{}\"]*)(?=\\})",
+          "captures": {
+            "1": { "name": "punctuation.separator.format-spec.rua" },
+            "2": { "name": "constant.other.format-spec.rua" }
+          }
+        },
+        { "include": "$self" }
+      ]
+    },
+
+    "numbers": {
+      "patterns": [
+        {
+          "comment": "0x hex, underscores allowed anywhere in the digits",
+          "match": "\\b0[xX][0-9a-fA-F_]+\\b",
+          "name": "constant.numeric.integer.hexadecimal.rua"
+        },
+        {
+          "comment": "a `.` only continues the number when a digit follows, so `0..10` is a range",
+          "match": "\\b[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?\\b",
+          "name": "constant.numeric.decimal.rua"
+        }
+      ]
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(break|continue|else|for|if|in|loop|match|return|while)\\b",
+          "name": "keyword.control.rua"
+        },
+        {
+          "match": "\\b(fn)\\b",
+          "name": "storage.type.function.rua"
+        },
+        {
+          "match": "\\b(let)\\b",
+          "name": "storage.type.rua"
+        },
+        {
+          "match": "\\b(mut)\\b",
+          "name": "storage.modifier.rua"
+        },
+        {
+          "match": "\\b(true|false)\\b",
+          "name": "constant.language.boolean.rua"
+        },
+        {
+          "match": "\\bnil\\b",
+          "name": "constant.language.nil.rua"
+        }
+      ]
+    },
+
+    "function-definition": {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.type.function.rua" },
+        "2": { "name": "entity.name.function.rua" }
+      }
+    },
+
+    "map-literal": {
+      "comment": "`#{ name: v, \"s\": v, 0: v, [k]: v }`",
+      "begin": "(#)(\\{)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.map.rua" },
+        "2": { "name": "punctuation.section.map.begin.rua" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.map.end.rua" }
+      },
+      "name": "meta.map.rua",
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=:(?!:))",
+          "name": "variable.other.property.rua"
+        },
+        { "include": "#block" },
+        { "include": "$self" }
+      ]
+    },
+    "block": {
+      "comment": "keeps a nested `{ }` from ending an enclosing map",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.block.begin.rua" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.block.end.rua" }
+      },
+      "patterns": [
+        { "include": "#block" },
+        { "include": "$self" }
+      ]
+    },
+
+    "module-path": {
+      "comment": "`::` reaches into a table; `.` calls a method",
+      "patterns": [
+        {
+          "match": "\\b(math|string|table|os|io|fs|net|ffi|jit)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "support.class.builtin.rua" },
+            "2": { "name": "punctuation.accessor.namespace.rua" },
+            "3": { "name": "support.function.builtin.rua" }
+          }
+        },
+        {
+          "match": "\\b(math|string|table|os|io|fs|net|ffi|jit)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "support.class.builtin.rua" },
+            "2": { "name": "punctuation.accessor.namespace.rua" },
+            "3": { "name": "support.constant.builtin.rua" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "entity.name.namespace.rua" },
+            "2": { "name": "punctuation.accessor.namespace.rua" },
+            "3": { "name": "entity.name.function.rua" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(::)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "entity.name.namespace.rua" },
+            "2": { "name": "punctuation.accessor.namespace.rua" },
+            "3": { "name": "variable.other.member.rua" }
+          }
+        }
+      ]
+    },
+
+    "member": {
+      "comment": "the lookarounds keep `0..10` out of this",
+      "patterns": [
+        {
+          "match": "(?<!\\.)(\\.)(?!\\.)([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "punctuation.accessor.rua" },
+            "2": { "name": "entity.name.function.member.rua" }
+          }
+        },
+        {
+          "match": "(?<!\\.)(\\.)(?!\\.)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.accessor.rua" },
+            "2": { "name": "variable.other.property.rua" }
+          }
+        }
+      ]
+    },
+
+    "call": {
+      "patterns": [
+        {
+          "comment": "globals the runtime registers",
+          "match": "\\b(assert|dofile|error|format|global|globals|num|print|require|str|try)\\s*(?=\\()",
+          "name": "support.function.builtin.rua"
+        },
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "name": "entity.name.function.call.rua"
+        }
+      ]
+    },
+
+    "operators": {
+      "patterns": [
+        {
+          "match": "->|=>",
+          "name": "keyword.operator.arrow.rua"
+        },
+        {
+          "match": "\\+=|-=|\\*=|/=|%=",
+          "name": "keyword.operator.assignment.compound.rua"
+        },
+        {
+          "match": "==|!=|<=|>=|<|>",
+          "name": "keyword.operator.comparison.rua"
+        },
+        {
+          "match": "&&|\\|\\||!",
+          "name": "keyword.operator.logical.rua"
+        },
+        {
+          "match": "\\.\\.=|\\.\\.",
+          "name": "keyword.operator.range.rua"
+        },
+        {
+          "match": "\\+|-|\\*|/|%",
+          "name": "keyword.operator.arithmetic.rua"
+        },
+        {
+          "match": "=",
+          "name": "keyword.operator.assignment.rua"
+        },
+        {
+          "match": "::",
+          "name": "punctuation.accessor.namespace.rua"
+        },
+        {
+          "comment": "closure parameters and the alternatives of a match arm",
+          "match": "\\|",
+          "name": "punctuation.separator.pipe.rua"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "match": ";", "name": "punctuation.terminator.statement.rua" },
+        { "match": ",", "name": "punctuation.separator.comma.rua" },
+        { "match": ":", "name": "punctuation.separator.colon.rua" },
+        { "match": "\\.", "name": "punctuation.accessor.rua" },
+        { "match": "#", "name": "punctuation.definition.map.rua" },
+        { "match": "[()]", "name": "punctuation.section.parens.rua" },
+        { "match": "[\\[\\]]", "name": "punctuation.section.brackets.rua" },
+        { "match": "[{}]", "name": "punctuation.section.braces.rua" }
+      ]
+    },
+
+    "identifiers": {
+      "patterns": [
+        {
+          "match": "\\b_\\b",
+          "name": "variable.language.wildcard.rua"
+        },
+        {
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b",
+          "name": "variable.other.rua"
+        }
+      ]
+    }
+  }
+}

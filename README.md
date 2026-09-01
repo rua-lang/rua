@@ -430,6 +430,20 @@ with a tracing GC, which is a different interpreter rather than a patch to this
 one — and now worth 1.2x, most of it on the two benchmarks the compiler cannot
 take.
 
+## Editors
+
+```sh
+cargo install --path crates/rua-lsp     # the language server
+cd editors/vscode && npm install && npm run compile
+```
+
+The grammar in `editors/vscode` colours a file with nothing installed. The
+server adds what only the real front end can know: every syntax error at once
+rather than the first, `fs::` completing to the twelve names `fs` actually
+holds, and a name coloured by whether it is a call, a module or a field.
+Both halves read the same lexer and parser this interpreter runs on, so
+neither can drift from the language.
+
 ## FFI: calling C
 
 ```rust

@@ -1,0 +1,140 @@
+{
+  "name": "rua",
+  "displayName": "rua",
+  "description": "Syntax highlighting and language server support for rua, a small scripting language with Rust-shaped syntax and Lua-shaped semantics.",
+  "version": "0.1.0",
+  "publisher": "rua-lang",
+  "license": "MIT",
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "rua",
+    "scripting",
+    "lua",
+    "language server"
+  ],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:rua",
+    "workspaceContains:**/*.rua"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rua",
+        "aliases": [
+          "rua",
+          "Rua"
+        ],
+        "extensions": [
+          ".rua"
+        ],
+        "firstLine": "^#!.*\\brua\\b",
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "rua",
+        "scopeName": "source.rua",
+        "path": "./syntaxes/rua.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "rua",
+      "properties": {
+        "rua.server.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run the `rua-lsp` language server. Turn this off to keep syntax highlighting from the bundled grammar and nothing else.",
+          "scope": "window"
+        },
+        "rua.server.path": {
+          "type": "string",
+          "default": "rua-lsp",
+          "markdownDescription": "Path to the `rua-lsp` executable. A bare name is looked up on `PATH`; a path with a separator is used as given.",
+          "scope": "machine-overridable"
+        },
+        "rua.server.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments passed to the language server.",
+          "scope": "machine-overridable"
+        },
+        "rua.server.env": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment variables for the language server process.",
+          "scope": "machine-overridable"
+        },
+        "rua.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the messages between VS Code and the rua language server.",
+          "scope": "window"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "rua.restartServer",
+        "title": "Restart Language Server",
+        "category": "rua"
+      },
+      {
+        "command": "rua.showServerLog",
+        "title": "Show Language Server Output",
+        "category": "rua"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "rua.restartServer",
+          "when": "editorLangId == rua"
+        },
+        {
+          "command": "rua.showServerLog",
+          "when": "editorLangId == rua"
+        }
+      ]
+    },
+    "configurationDefaults": {
+      "[rua]": {
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "typecheck": "tsc -p ./ --noEmit",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}
