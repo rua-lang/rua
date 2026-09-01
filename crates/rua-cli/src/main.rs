@@ -49,6 +49,14 @@ struct Args {
     /// Print the bytecode the compiler generates, and run nothing
     #[arg(long)]
     dump_bytecode: bool,
+
+    /// Lay out the script and print it, or rewrite it in place with --write
+    #[arg(long)]
+    fmt: bool,
+
+    /// With --fmt, write the result back to the file
+    #[arg(long)]
+    write: bool,
 }
 
 /// A rua error, dressed up for miette: the message, the line it happened on,
@@ -137,6 +145,10 @@ fn main() {
     }
     vm.set_global("arg", Value::Table(arg_table));
 
+    if args.fmt {
+        std::process::exit(format_files(&args));
+    }
+
     if args.dump_bytecode {
         let sources = args.eval.iter().cloned().chain(
             args.script
@@ -174,6 +186,48 @@ fn main() {
     if args.interactive || (args.script.is_none() && args.eval.is_empty()) {
         run_repl(&mut vm);
     }
+}
+
+/// `rua --fmt a.rua b.rua`, and `--write` to do it in place.
+///
+/// A file that does not lex is reported and left alone: there is no safe way
+/// to lay out bytes nobody can read.
+fn format_files(args: &Args) -> i32 {
+    let paths: Vec<&String> = args.script.iter().chain(args.script_args.iter()).collect();
+    if paths.is_empty() {
+        eprintln!("rua --fmt: give it a file");
+        return 1;
+    }
+    let mut bad = 0;
+    for path in paths {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rua --fmt: cannot read {path}: {e}");
+                bad = 1;
+                continue;
+            }
+        };
+        match rua::fmt(&src) {
+            Ok(out) if args.write => {
+                if out == src {
+                    continue;
+                }
+                if let Err(e) = std::fs::write(path, &out) {
+                    eprintln!("rua --fmt: cannot write {path}: {e}");
+                    bad = 1;
+                } else {
+                    println!("{path}");
+                }
+            }
+            Ok(out) => print!("{out}"),
+            Err(e) => {
+                eprintln!("rua --fmt {path}: line {}: {}", e.line, e.message);
+                bad = 1;
+            }
+        }
+    }
+    bad
 }
 
 fn run(vm: &mut Vm, src: &str, name: &str) {

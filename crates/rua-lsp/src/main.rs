@@ -45,6 +45,7 @@ fn server_capabilities() -> ServerCapabilities {
         }),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
         // `prepareProvider` is what lets the editor grey the command out on a
@@ -144,6 +145,11 @@ fn answer(world: &mut analysis::World, req: Request) -> Response {
                     .map(GotoDefinitionResponse::Scalar)
             }),
         ),
+        request::Formatting::METHOD => {
+            let out = cast::<request::Formatting>(req)
+                .and_then(|(_, p)| world.format(&p.text_document.uri));
+            reply(id, out)
+        }
         request::References::METHOD => reply(
             id,
             cast::<request::References>(req).map(|(_, p)| {

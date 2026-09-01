@@ -437,6 +437,9 @@ cargo install --path crates/rua-lsp     # the language server
 cd editors/vscode && npm install && npm run compile
 ```
 
+`rua --fmt file.rua` lays a file out, `--write` does it in place, and the
+language server offers the same thing on the editor's format command.
+
 The grammar in `editors/vscode` colours a file with nothing installed. The
 server adds what only the real front end can know: every syntax error at once
 rather than the first, `fs::` completing to the twelve names `fs` actually

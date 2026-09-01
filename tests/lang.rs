@@ -1649,6 +1649,95 @@ fn tokens_know_where_they_were_written() {
     assert_eq!(spans, vec!["let", "hello", "=", "42"], "spans cover the tokens exactly");
 }
 
+/// The formatter moves whitespace between tokens and nothing else, which is
+/// what makes it safe to run on a file you have not read. Every `.rua` file
+/// in the repository is laid out, then lexed again: the tokens have to be the
+/// ones it started with, and laying out the result again has to change
+/// nothing.
+#[test]
+fn formatting_never_changes_what_a_program_says() {
+    fn tokens(src: &str) -> Vec<String> {
+        rua_syntax::lexer::Lexer::scan(src)
+            .tokens
+            .iter()
+            .map(|t| format!("{:?}", t.tok))
+            .collect()
+    }
+    let mut checked = 0;
+    for dir in ["examples", "examples/lib", "bench"] {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rua") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let once = rua::fmt(&src).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert_eq!(tokens(&src), tokens(&once), "{} lexes differently", path.display());
+            let twice = rua::fmt(&once).unwrap();
+            assert_eq!(once, twice, "{} is not settled by one pass", path.display());
+            // a shebang is not a token and not a comment, and still has to survive
+            if src.starts_with("#!") {
+                assert!(once.starts_with("#!"), "{} lost its shebang", path.display());
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 15, "only checked {checked} files");
+}
+
+/// What the layout actually is, on the things worth pinning down.
+#[test]
+fn formatting_lays_out_the_shapes_that_are_easy_to_get_wrong() {
+    let cases = [
+        // a range runs straight from one end to the other
+        ("for i in 0 .. 3 { }\n", "for i in 0..3 {}\n"),
+        ("for i in 0 ..= 3 { }\n", "for i in 0..=3 {}\n"),
+        // a closure's bars hug its parameters
+        ("let f = | x , y | { x }\n", "let f = |x, y| { x }\n"),
+        // a prefix minus belongs to what it negates; a subtraction does not
+        ("let n = - 1\n", "let n = -1\n"),
+        ("let n = a - 1\n", "let n = a - 1\n"),
+        ("let n = f(-1, a - 1)\n", "let n = f(-1, a - 1)\n"),
+        // nothing is written inside an empty one
+        ("let t = #{ }\n", "let t = #{}\n"),
+        ("let a = [ ]\n", "let a = []\n"),
+        // a call sits against its target, a field against its dot
+        ("print ( t . name )\n", "print(t.name)\n"),
+        ("let x = math :: sqrt(2)\n", "let x = math::sqrt(2)\n"),
+        // indentation follows the braces
+        ("fn f() {\nlet a = 1\nif a { a }\n}\n", "fn f() {\n    let a = 1\n    if a { a }\n}\n"),
+        // one blank line survives, several become one
+        ("let a = 1\n\n\n\nlet b = 2\n", "let a = 1\n\nlet b = 2\n"),
+    ];
+    for (input, want) in cases {
+        assert_eq!(rua::fmt(input).unwrap(), want, "laying out {input:?}");
+    }
+}
+
+/// Comments are the thing a formatter built on the tree loses. This one never
+/// holds a tree, and a comment lined up in a column was put there on purpose.
+#[test]
+fn formatting_keeps_comments_where_they_were_put() {
+    let src = "let a = 1        // aligned\nlet bb = 2       // with this\n";
+    assert_eq!(rua::fmt(src).unwrap(), src, "a column of comments is left alone");
+
+    let nested = "/* outer /* inner */ still outer */\nlet a = 1\n";
+    assert_eq!(rua::fmt(nested).unwrap(), nested);
+
+    // a comment on its own line is indented with the code around it
+    let inside = "fn f() {\n// why\nlet a = 1\n}\n";
+    assert_eq!(rua::fmt(inside).unwrap(), "fn f() {\n    // why\n    let a = 1\n}\n");
+}
+
+/// A file nobody can lex is left alone rather than half laid out.
+#[test]
+fn formatting_refuses_what_it_cannot_read() {
+    let out = rua::fmt("let x = @\n");
+    assert!(out.is_err());
+    assert!(out.unwrap_err().message.contains("unexpected character"));
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

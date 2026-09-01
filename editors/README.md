@@ -24,6 +24,7 @@ there, which is correct.
 | Hover | what a keyword does; what a module holds |
 | Completion | the module's real members after `fs::`, plus keywords, globals and names in the file |
 | Outline | the functions in the file, even while it does not parse |
+| Formatting | whitespace between tokens, and nothing else — it cannot lose a comment or change what a program says |
 | Semantic highlighting | a name coloured by whether it is a call, a module or a field |
 
 ## VS Code
@@ -126,6 +127,31 @@ Rust for colours — the same trick `.gitattributes` uses for GitHub:
 ```json
 // ~/.config/zed/settings.json
 { "file_types": { "Rust": ["*.rua"] } }
+```
+
+## Formatting without an editor
+
+```sh
+rua --fmt file.rua              # to standard output
+rua --fmt --write *.rua         # in place, printing what it changed
+```
+
+The same formatter the server uses. It moves whitespace between tokens and
+never looks inside one, so it cannot lose a comment, reorder anything, or
+change what a program means — the test suite lays out every `.rua` file in
+the repository and checks the tokens come back identical. A file that does
+not lex is reported and left alone.
+
+fresh can be told to use it on save:
+
+```jsonc
+"languages": {
+  "rua": {
+    "extensions": ["rua"],
+    "formatter": { "command": "rua", "args": ["--fmt"], "stdin": false },
+    "format_on_save": false
+  }
+}
 ```
 
 ## When it does not work

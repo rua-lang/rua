@@ -96,6 +96,27 @@ impl World {
         out
     }
 
+    /// Lay out a whole document.
+    ///
+    /// One edit replacing everything: the formatter moves whitespace between
+    /// tokens, and working out which of those moves is a minimal edit would
+    /// cost more than the editor spends applying the whole thing.
+    pub fn format(&self, uri: &Url) -> Result<Vec<TextEdit>, String> {
+        let index = self.docs.get(uri).ok_or("no such document")?;
+        let text = index.text();
+        let out = rua_syntax::fmt::format(text).map_err(|e| {
+            format!("line {}: {} — a file that does not parse is left alone", e.line, e.message)
+        })?;
+        if out == text {
+            return Ok(Vec::new());
+        }
+        let end = index.position(text.len() as u32);
+        Ok(vec![TextEdit {
+            range: Range { start: Position { line: 0, character: 0 }, end },
+            new_text: out,
+        }])
+    }
+
     /// Every mention of a name in a document, and what each refers to.
     ///
     /// The resolver works this out to compile the file at all; asking it

@@ -41,6 +41,12 @@ pub use rua_core::{Error, Key, Native, Res, Table, Value, Vm};
 pub use rua_syntax::{parser, resolve};
 
 /// Parse and run a chunk in a fresh VM with the standard library.
+/// Lay out rua source: the same formatter the language server and
+/// `rua --fmt` use, so a file laid out by one is laid out by all of them.
+pub fn fmt(src: &str) -> Result<String, rua_syntax::SyntaxError> {
+    rua_syntax::fmt::format(src)
+}
+
 pub fn eval(src: &str) -> Res<Vec<Value>> {
     Vm::new().eval(src)
 }
