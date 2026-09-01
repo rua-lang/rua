@@ -102,3 +102,122 @@ fn a_token_spanning_lines_is_left_to_the_grammar() {
     let kinds = world.token_kinds(&uri);
     assert!(!kinds.iter().any(|(t, _)| t.contains('\n')), "{kinds:?}");
 }
+
+// ---- go to definition, references and rename -------------------------------
+
+fn at(line: u32, character: u32) -> Position {
+    Position { line, character }
+}
+
+/// The declaration of a local, from a mention of it.
+#[test]
+fn definition_finds_where_a_local_came_into_scope() {
+    let (world, uri) = open("fn f(a) {\n    let total = a + 1\n    total * 2\n}\n");
+    // the `total` on the third line
+    let decl = world.definition_at(&uri, at(2, 5)).expect("a definition");
+    assert_eq!(decl.range.start, at(1, 8), "the `total` in the `let`");
+    assert_eq!(decl.range.end, at(1, 13));
+    // and the parameter, from its use
+    let param = world.definition_at(&uri, at(1, 16)).expect("a definition");
+    assert_eq!(param.range.start, at(0, 5), "the `a` in the parameter list");
+}
+
+/// A top level `fn` is a global, and this file is where it was written, so a
+/// call to it can still be followed — including from above the definition.
+#[test]
+fn definition_finds_a_function_defined_later_in_the_file() {
+    let (world, uri) = open("fn main() {\n    helper(1)\n}\nfn helper(x) { x }\n");
+    let decl = world.definition_at(&uri, at(1, 4)).expect("a definition");
+    assert_eq!(decl.range.start, at(3, 3), "the name in `fn helper`");
+}
+
+/// The thing this has to get right. Two locals spelled the same are not the
+/// same variable, and neither renaming nor go-to-definition may confuse them.
+#[test]
+fn shadowing_is_not_confused_by_a_shared_spelling() {
+    let src = "fn f() {\n    let x = 1\n    {\n        let x = 2\n        print(x)\n    }\n    print(x)\n}\n";
+    let (world, uri) = open(src);
+    // the `x` printed inside the inner block belongs to the inner `let`
+    let inner = world.definition_at(&uri, at(4, 14)).expect("a definition");
+    assert_eq!(inner.range.start, at(3, 12), "the inner `let x`");
+    // the one printed after the block belongs to the outer
+    let outer = world.definition_at(&uri, at(6, 10)).expect("a definition");
+    assert_eq!(outer.range.start, at(1, 8), "the outer `let x`");
+    // and each has exactly two mentions: its declaration and its one use
+    assert_eq!(world.references_at(&uri, at(4, 14)).len(), 2);
+    assert_eq!(world.references_at(&uri, at(6, 10)).len(), 2);
+}
+
+/// Renaming touches every mention of one variable and nothing that merely
+/// shares its name.
+#[test]
+fn rename_changes_one_variable_and_leaves_the_other_alone() {
+    let src = "fn f() {\n    let x = 1\n    {\n        let x = 2\n        print(x)\n    }\n    print(x)\n}\n";
+    let (world, uri) = open(src);
+    let edit = world.rename_at(&uri, at(6, 10), "outer").expect("a rename");
+    let edits = &edit.changes.expect("changes")[&uri];
+    assert_eq!(edits.len(), 2, "the outer declaration and its one use");
+    let mut lines: Vec<u32> = edits.iter().map(|e| e.range.start.line).collect();
+    lines.sort();
+    assert_eq!(lines, vec![1, 6], "not the inner `x` on lines 3 and 4");
+    assert!(edits.iter().all(|e| e.new_text == "outer"));
+}
+
+/// A closure that reads a variable from around it is reading the same
+/// variable, so renaming has to follow it in there.
+#[test]
+fn rename_follows_a_name_captured_by_a_closure() {
+    let src = "fn f() {\n    let count = 0\n    let bump = || { count + 1 }\n    bump()\n}\n";
+    let (world, uri) = open(src);
+    let refs = world.references_at(&uri, at(1, 8));
+    assert_eq!(refs.len(), 2, "the declaration and the use inside the closure");
+    let edit = world.rename_at(&uri, at(1, 8), "n").expect("a rename");
+    let edits = &edit.changes.expect("changes")[&uri];
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().any(|e| e.range.start.line == 2), "the one inside the closure");
+}
+
+/// Renaming what this file did not declare would leave the declaration
+/// behind, so the server declines rather than half-doing it.
+#[test]
+fn a_name_from_outside_the_file_is_not_renamed() {
+    let (world, uri) = open("print(1)\n");
+    assert!(world.prepare_rename_at(&uri, at(0, 2)).is_none(), "`print` is not ours");
+    let refused = world.rename_at(&uri, at(0, 2), "shout");
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(refused.unwrap_err().contains("not declared in this file"));
+}
+
+/// A rename has to produce something rua would lex as a name.
+#[test]
+fn a_new_name_that_is_not_a_name_is_refused() {
+    let (world, uri) = open("fn f() {\n    let x = 1\n    x\n}\n");
+    for bad in ["2x", "a b", "", "let", "x-y"] {
+        let out = world.rename_at(&uri, at(1, 8), bad);
+        assert!(out.is_err(), "`{bad}` should be refused");
+    }
+    assert!(world.rename_at(&uri, at(1, 8), "_ok2").is_ok());
+}
+
+/// A parameter is declared by the function, and renaming it takes the body
+/// with it.
+#[test]
+fn rename_covers_a_parameter_and_its_uses() {
+    let (world, uri) = open("fn add(a, b) {\n    a + b + a\n}\n");
+    let edit = world.rename_at(&uri, at(0, 7), "left").expect("a rename");
+    let edits = &edit.changes.expect("changes")[&uri];
+    assert_eq!(edits.len(), 3, "the parameter and its two uses");
+}
+
+/// Highlighting under the cursor is the same question as references, so it
+/// has to answer the same way when a name is shadowed.
+#[test]
+fn references_of_a_loop_variable_stay_inside_the_loop() {
+    let src = "fn f(xs) {\n    for i in 0..3 { print(i) }\n    let i = 9\n    i\n}\n";
+    let (world, uri) = open(src);
+    let loop_var = world.references_at(&uri, at(1, 8));
+    assert_eq!(loop_var.len(), 2, "the loop's `i` and the one printed");
+    let after = world.references_at(&uri, at(3, 4));
+    assert_eq!(after.len(), 2, "the later `let i` and the tail that reads it");
+    assert!(loop_var.iter().all(|l| l.range.start.line == 1));
+}

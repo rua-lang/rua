@@ -36,6 +36,15 @@ fn server_capabilities() -> ServerCapabilities {
             ..Default::default()
         }),
         document_symbol_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_highlight_provider: Some(OneOf::Left(true)),
+        // `prepareProvider` is what lets the editor grey the command out on a
+        // name this server will not rename, rather than offering and failing
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
         semantic_tokens_provider: Some(
             SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                 legend: SemanticTokensLegend {
@@ -100,6 +109,49 @@ fn answer(world: &mut analysis::World, req: Request) -> Response {
             id,
             cast::<request::SemanticTokensFullRequest>(req).map(|(_, p)| world.semantic_tokens(&p)),
         ),
+        request::GotoDefinition::METHOD => reply(
+            id,
+            cast::<request::GotoDefinition>(req).map(|(_, p)| {
+                let at = p.text_document_position_params;
+                world
+                    .definition_at(&at.text_document.uri, at.position)
+                    .map(GotoDefinitionResponse::Scalar)
+            }),
+        ),
+        request::References::METHOD => reply(
+            id,
+            cast::<request::References>(req).map(|(_, p)| {
+                let at = p.text_document_position;
+                world.references_at(&at.text_document.uri, at.position)
+            }),
+        ),
+        request::DocumentHighlightRequest::METHOD => reply(
+            id,
+            cast::<request::DocumentHighlightRequest>(req).map(|(_, p)| {
+                let at = p.text_document_position_params;
+                let out: Vec<DocumentHighlight> = world
+                    .references_at(&at.text_document.uri, at.position)
+                    .into_iter()
+                    .map(|l| DocumentHighlight { range: l.range, kind: None })
+                    .collect();
+                out
+            }),
+        ),
+        request::PrepareRenameRequest::METHOD => reply(
+            id,
+            cast::<request::PrepareRenameRequest>(req).map(|(_, p)| {
+                world
+                    .prepare_rename_at(&p.text_document.uri, p.position)
+                    .map(PrepareRenameResponse::Range)
+            }),
+        ),
+        request::Rename::METHOD => {
+            let out = cast::<request::Rename>(req).and_then(|(_, p)| {
+                let at = p.text_document_position;
+                world.rename_at(&at.text_document.uri, at.position, &p.new_name)
+            });
+            reply(id, out)
+        }
         _ => Response { id, result: Some(serde_json::Value::Null), error: None },
     }
 }

@@ -102,11 +102,11 @@ impl Parser {
             self.err(format!("expected {t}, found {}", self.peek()))
         }
     }
-    fn name(&mut self) -> PResult<Rc<str>> {
+    fn name(&mut self) -> PResult<Name> {
         let line = self.line();
         let span = self.span();
         match self.bump() {
-            Tok::Name(n) => Ok(n.into()),
+            Tok::Name(n) => Ok(Name::new(n, span)),
             other => self.err_at(format!("expected a name, found {other}"), line, span),
         }
     }
@@ -327,7 +327,7 @@ impl Parser {
         matches!(self.peek(), Tok::RBrace | Tok::Eof)
     }
 
-    fn let_pattern(&mut self) -> PResult<Vec<Rc<str>>> {
+    fn let_pattern(&mut self) -> PResult<Vec<Name>> {
         self.accept(Tok::Mut);
         if self.accept(Tok::LParen) {
             let mut names = Vec::new();
@@ -510,7 +510,7 @@ impl Parser {
                     self.bump();
                     Expr::Num(n)
                 }
-                _ => Expr::Str(self.name()?),
+                _ => Expr::Str(self.name()?.text),
             };
             self.expect(Tok::Colon)?;
             items.push((key, self.expr()?));
@@ -564,8 +564,9 @@ impl Parser {
                 Pattern::Wild
             }
             Tok::Name(n) => {
+                let at = self.span();
                 self.bump();
-                Pattern::Bind(n.into(), None)
+                Pattern::Bind(Name::new(n, at), None)
             }
             Tok::Num(_) | Tok::Str(_) | Tok::True | Tok::False | Tok::Nil => {
                 Pattern::Lit(self.primary(false)?)
@@ -632,8 +633,9 @@ impl Parser {
                 Ok(Expr::Bool(false))
             }
             Tok::Name(n) => {
+                let at = self.span();
                 self.bump();
-                Ok(Expr::Var(n.into()))
+                Ok(Expr::Var(Name::new(n, at)))
             }
             Tok::LParen => {
                 self.bump();
@@ -660,16 +662,16 @@ impl Parser {
                     let k = self.name()?;
                     if *self.peek() == Tok::LParen {
                         let args = self.callargs()?;
-                        e = Expr::Method(Box::new(e), k, args);
+                        e = Expr::Method(Box::new(e), k.text, args);
                     } else {
-                        e = Expr::Index(Box::new(e), Box::new(Expr::Str(k)));
+                        e = Expr::Index(Box::new(e), Box::new(Expr::Str(k.text)));
                     }
                 }
                 // `a::b(x)` is a plain path call, no receiver
                 Tok::ColonColon => {
                     self.bump();
                     let k = self.name()?;
-                    e = Expr::Index(Box::new(e), Box::new(Expr::Str(k)));
+                    e = Expr::Index(Box::new(e), Box::new(Expr::Str(k.text)));
                 }
                 Tok::LBracket => {
                     self.bump();

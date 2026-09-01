@@ -9,7 +9,7 @@
 //! so both sides share it; every other local is a plain value in the frame.
 
 use crate::ast::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// The most locals one function can have: slots are `u16`.
@@ -17,9 +17,17 @@ pub const MAX_SLOTS: usize = u16::MAX as usize - 256;
 
 /// Resolve a chunk, returning it and the number of frame slots it needs.
 pub fn resolve_chunk(block: &Block) -> (Block, usize) {
-    let mut r = Resolver { scopes: vec![FuncScope::new(captured_names(block))] };
+    let mut r = Resolver::new(block, false);
     let out = r.block(block);
     (out, r.scopes[0].n_slots)
+}
+
+/// Resolve a chunk for the sake of the answer rather than the tree: every
+/// name it mentions, and what each one turned out to refer to.
+pub fn occurrences(block: &Block) -> Vec<Occurrence> {
+    let mut r = Resolver::new(block, true);
+    let _ = r.block(block);
+    r.seen
 }
 
 // ---- pre-pass: which names do nested closures capture? ---------------------
@@ -77,14 +85,14 @@ impl Scan<'_> {
             Stat::Let(names, exprs) => {
                 exprs.iter().for_each(|e| self.expr(e, inside));
                 for n in names {
-                    self.declare(n);
+                    self.declare(&n.text);
                 }
             }
             Stat::LetSlots(_, exprs) | Stat::Return(exprs) => {
                 exprs.iter().for_each(|e| self.expr(e, inside))
             }
             Stat::FnDecl(name, e) => {
-                self.declare(name);
+                self.declare(&name.text);
                 self.expr(e, inside);
             }
             Stat::FnSlot(_, e) => self.expr(e, inside),
@@ -105,7 +113,7 @@ impl Scan<'_> {
                 self.expr(start, inside);
                 self.expr(end, inside);
                 if inside {
-                    self.scopes.push(HashSet::from([var.clone()]));
+                    self.scopes.push(HashSet::from([var.text.clone()]));
                 }
                 self.block(body, inside);
                 if inside {
@@ -115,7 +123,7 @@ impl Scan<'_> {
             Stat::ForIn { vars, iter, body, .. } => {
                 self.expr(iter, inside);
                 if inside {
-                    self.scopes.push(vars.iter().cloned().collect());
+                    self.scopes.push(vars.iter().map(|v| v.text.clone()).collect());
                 }
                 self.block(body, inside);
                 if inside {
@@ -130,8 +138,8 @@ impl Scan<'_> {
         match e {
             // a name read inside a nested function, and not bound by it, is
             // read from the enclosing frame
-            Expr::Var(n) if inside && !self.bound(n) => {
-                self.out.insert(n.clone());
+            Expr::Var(n) if inside && !self.bound(&n.text) => {
+                self.out.insert(n.text.clone());
             }
             Expr::Var(_)
             | Expr::Nil
@@ -156,7 +164,7 @@ impl Scan<'_> {
             }
             // everything a nested function reads from outside itself counts
             Expr::Func(def) => {
-                self.scopes.push(def.params.iter().cloned().collect());
+                self.scopes.push(def.params.iter().map(|p| p.text.clone()).collect());
                 self.block(&def.body, true);
                 self.scopes.pop();
             }
@@ -190,11 +198,43 @@ impl Scan<'_> {
     }
 }
 
+// ---- what the resolver saw ------------------------------------------------
+
+/// One place a name is written, and what it turned out to mean.
+///
+/// The resolver already decides this — which `x` an `x` refers to, through
+/// which scopes, past which shadowing. Writing it down as it goes is what
+/// lets an editor answer the same question without a second opinion about
+/// how rua's scopes work.
+#[derive(Debug, Clone)]
+pub struct Occurrence {
+    /// The bytes of this mention of the name.
+    pub span: Span,
+    pub name: Rc<str>,
+    /// Where the name came into scope, when it did so in this file. A global
+    /// has none: it may have been defined anywhere, or nowhere yet.
+    pub decl: Option<Span>,
+    /// Is this the declaration itself?
+    pub is_decl: bool,
+    pub kind: RefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefKind {
+    Local,
+    /// A local of an enclosing function, reached through a closure.
+    Upvalue,
+    Global,
+}
+
 // ---- the resolver ---------------------------------------------------------
 
 struct Local {
     name: Rc<str>,
     binding: Binding,
+    /// Where the name was written when it came into scope, which is what
+    /// go-to-definition answers with.
+    decl: Span,
 }
 
 struct FuncScope {
@@ -221,16 +261,46 @@ impl FuncScope {
     }
 
     fn lookup(&self, name: &str) -> Option<Binding> {
-        self.locals.iter().rev().find(|l| &*l.name == name).map(|l| l.binding)
+        self.find(name).map(|l| l.binding)
+    }
+
+    /// The innermost local of that name, which is the one a mention means.
+    fn find(&self, name: &str) -> Option<&Local> {
+        self.locals.iter().rev().find(|l| &*l.name == name)
     }
 }
 
 /// The stack of functions currently being resolved; the last one is current.
 struct Resolver {
     scopes: Vec<FuncScope>,
+    /// Every name written, with what it referred to. Only filled in when
+    /// somebody asked: the interpreter never looks at it.
+    seen: Vec<Occurrence>,
+    watching: bool,
+    /// Top level `fn`s, which are globals rather than locals, and where each
+    /// was written. Collected before the walk so that a call above the
+    /// function it calls still finds it.
+    top_fns: HashMap<Rc<str>, Span>,
 }
 
 impl Resolver {
+    fn new(block: &Block, watching: bool) -> Resolver {
+        let mut top_fns = HashMap::new();
+        if watching {
+            for st in &block.stats {
+                if let Stat::FnDecl(name, _) = st {
+                    top_fns.insert(name.text.clone(), name.span);
+                }
+            }
+        }
+        Resolver {
+            scopes: vec![FuncScope::new(captured_names(block))],
+            seen: Vec::new(),
+            watching,
+            top_fns,
+        }
+    }
+
     /// Are we in the outermost block of the chunk itself?
     fn at_chunk_top(&self) -> bool {
         self.scopes.len() == 1 && self.scopes[0].marks.len() == 1
@@ -240,13 +310,14 @@ impl Resolver {
         self.scopes.last_mut().expect("a scope is always open")
     }
 
-    fn declare(&mut self, name: &Rc<str>) -> Binding {
+    fn declare(&mut self, name: &Name) -> Binding {
         let s = self.cur();
         assert!(s.next_slot < MAX_SLOTS, "a function may hold at most {MAX_SLOTS} locals");
-        let binding = Binding { slot: s.next_slot as u16, cell: s.captured.contains(name) };
+        let binding = Binding { slot: s.next_slot as u16, cell: s.captured.contains(&name.text) };
         s.next_slot += 1;
         s.n_slots = s.n_slots.max(s.next_slot);
-        s.locals.push(Local { name: name.clone(), binding });
+        s.locals.push(Local { name: name.text.clone(), binding, decl: name.span });
+        self.note(name, Some(name.span), true, RefKind::Local);
         binding
     }
 
@@ -283,14 +354,49 @@ impl Resolver {
         Some((s.upvals.len() - 1) as u16)
     }
 
-    fn var(&mut self, name: &Rc<str>) -> Expr {
+    fn var(&mut self, name: &Name) -> Expr {
         let top = self.scopes.len() - 1;
-        if let Some(b) = self.scopes[top].lookup(name) {
-            return Expr::Local(b, name.clone());
+        if let Some(l) = self.scopes[top].find(name) {
+            let (binding, decl) = (l.binding, l.decl);
+            self.note(name, Some(decl), false, RefKind::Local);
+            return Expr::Local(binding, name.text.clone());
         }
-        match self.capture(top, name) {
-            Some(i) => Expr::Upval(i, name.clone()),
-            None => Expr::Global(name.clone(), GlobalCache::new()),
+        // a local of an enclosing function: the declaration is over there,
+        // and the scope that owns it still knows where
+        let outer = self.declared_outside(&name.text);
+        match self.capture(top, &name.text) {
+            Some(i) => {
+                self.note(name, outer, false, RefKind::Upvalue);
+                Expr::Upval(i, name.text.clone())
+            }
+            None => {
+                // a `fn` at the top of this file is a global, and this file
+                // is where it was written
+                let decl = self.top_fns.get(&name.text).copied();
+                self.note(name, decl, false, RefKind::Global);
+                Expr::Global(name.text.clone(), GlobalCache::new())
+            }
+        }
+    }
+
+    /// Where an enclosing function declared this name, if one did.
+    fn declared_outside(&self, name: &str) -> Option<Span> {
+        self.scopes[..self.scopes.len() - 1]
+            .iter()
+            .rev()
+            .find_map(|s| s.locals.iter().rev().find(|l| &*l.name == name).map(|l| l.decl))
+    }
+
+    /// Write down one mention of a name.
+    fn note(&mut self, name: &Name, decl: Option<Span>, is_decl: bool, kind: RefKind) {
+        if self.watching {
+            self.seen.push(Occurrence {
+                span: name.span,
+                name: name.text.clone(),
+                decl,
+                is_decl,
+                kind,
+            });
         }
     }
 
@@ -324,8 +430,12 @@ impl Resolver {
                 if self.at_chunk_top() {
                     // top level `fn` is a global, the way a Rust item belongs
                     // to its module: that is what embedders reach for by name
+                    self.note(name, Some(name.span), true, RefKind::Global);
                     let f = self.expr(f);
-                    Stat::Assign(vec![Expr::Global(name.clone(), GlobalCache::new())], vec![f])
+                    Stat::Assign(
+                        vec![Expr::Global(name.text.clone(), GlobalCache::new())],
+                        vec![f],
+                    )
                 } else {
                     // bound first, so the body can refer to itself
                     let binding = self.declare(name);

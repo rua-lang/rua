@@ -106,6 +106,106 @@ impl World {
         out
     }
 
+    /// Every mention of a name in a document, and what each refers to.
+    ///
+    /// The resolver works this out to compile the file at all; asking it
+    /// rather than working it out again here is what keeps the editor's idea
+    /// of scope and the interpreter's from ever differing.
+    fn occurrences(&self, uri: &Url) -> Vec<rua_syntax::resolve::Occurrence> {
+        let Some(index) = self.docs.get(uri) else { return Vec::new() };
+        // the tree the parser could recover is enough: a file with a mistake
+        // in it still has names in the rest of it
+        let (block, _) = rua_syntax::parser::parse_recover(index.text());
+        rua_syntax::resolve::occurrences(&block)
+    }
+
+    /// The name written under the cursor, as the resolver understood it.
+    fn at(&self, uri: &Url, at: Position) -> Option<rua_syntax::resolve::Occurrence> {
+        let index = self.docs.get(uri)?;
+        let offset = index.offset(at);
+        self.occurrences(uri)
+            .into_iter()
+            // a cursor resting just past the last character of a name is
+            // still on it, which is where it lands after typing one
+            .find(|o| o.span.contains(offset) || o.span.hi == offset)
+    }
+
+    /// Where the name under the cursor was declared.
+    pub fn definition_at(&self, uri: &Url, at: Position) -> Option<Location> {
+        let index = self.docs.get(uri)?;
+        let decl = self.at(uri, at)?.decl?;
+        Some(Location { uri: uri.clone(), range: index.range(decl.lo, decl.hi) })
+    }
+
+    /// Every mention of the same thing — which is not every mention of the
+    /// same spelling: two locals in different scopes share a name and are not
+    /// the same variable.
+    pub fn references_at(&self, uri: &Url, at: Position) -> Vec<Location> {
+        let Some(index) = self.docs.get(uri) else { return Vec::new() };
+        let Some(target) = self.at(uri, at) else { return Vec::new() };
+        self.same_thing(uri, &target)
+            .into_iter()
+            .map(|o| Location { uri: uri.clone(), range: index.range(o.span.lo, o.span.hi) })
+            .collect()
+    }
+
+    /// The occurrences that mean what this one means. A declaration in this
+    /// file is the identity; a global with none is matched by name, since
+    /// there is nothing else to go on.
+    fn same_thing(
+        &self,
+        uri: &Url,
+        target: &rua_syntax::resolve::Occurrence,
+    ) -> Vec<rua_syntax::resolve::Occurrence> {
+        let all = self.occurrences(uri);
+        match target.decl {
+            Some(decl) => all.into_iter().filter(|o| o.decl == Some(decl)).collect(),
+            None => all
+                .into_iter()
+                .filter(|o| o.name == target.name && o.kind == target.kind)
+                .collect(),
+        }
+    }
+
+    /// May the name under the cursor be renamed, and which bytes are it?
+    ///
+    /// A name declared somewhere this file cannot see — `print`, or a global
+    /// another file defines — is refused: renaming every mention here would
+    /// leave the declaration behind and quietly break the program.
+    pub fn prepare_rename_at(&self, uri: &Url, at: Position) -> Option<Range> {
+        let index = self.docs.get(uri)?;
+        let target = self.at(uri, at)?;
+        target.decl?;
+        Some(index.range(target.span.lo, target.span.hi))
+    }
+
+    /// Rename every mention of one thing.
+    pub fn rename_at(&self, uri: &Url, at: Position, to: &str) -> Result<WorkspaceEdit, String> {
+        if !is_name(to) {
+            return Err(format!("`{to}` is not a name"));
+        }
+        let index = self.docs.get(uri).ok_or("no such document")?;
+        let target = self.at(uri, at).ok_or("there is no name here")?;
+        if target.decl.is_none() {
+            return Err(format!(
+                "`{}` is not declared in this file, so renaming it here would \
+                 leave the declaration behind",
+                target.name
+            ));
+        }
+        let edits: Vec<TextEdit> = self
+            .same_thing(uri, &target)
+            .into_iter()
+            .map(|o| TextEdit {
+                range: index.range(o.span.lo, o.span.hi),
+                new_text: to.to_string(),
+            })
+            .collect();
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(uri.clone(), edits);
+        Ok(WorkspaceEdit { changes: Some(changes), ..Default::default() })
+    }
+
     /// Take in what the editor says changed. Answers the document's uri when
     /// its text moved, since that is when diagnostics are worth resending.
     pub fn apply(&mut self, note: &lsp_server::Notification) -> Option<Url> {
@@ -325,6 +425,14 @@ impl World {
             _ => None,
         }
     }
+}
+
+/// Is this something rua would lex as one name?
+fn is_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !KEYWORDS.contains(&s)
 }
 
 fn item(label: &str, kind: CompletionItemKind, detail: &str) -> CompletionItem {

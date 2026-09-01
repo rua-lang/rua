@@ -79,6 +79,43 @@ impl Span {
     }
 }
 
+/// A name as it was written, and where.
+///
+/// Names are what an editor asks about — where is this declared, what else
+/// refers to it, rename all of them — and none of those questions can be
+/// answered without knowing which bytes each one occupies. It derefs to the
+/// text, so code that only cares what the name is reads as it did before.
+#[derive(Debug, Clone)]
+pub struct Name {
+    pub text: Rc<str>,
+    pub span: Span,
+}
+
+impl Name {
+    pub fn new(text: impl Into<Rc<str>>, span: Span) -> Name {
+        Name { text: text.into(), span }
+    }
+}
+
+impl std::ops::Deref for Name {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<str> for Name {
+    fn eq(&self, other: &str) -> bool {
+        &*self.text == other
+    }
+}
+
 /// `{ stmts...; tail }` — the tail expression is the block's value.
 ///
 /// `lines` runs parallel to `stats`, so a runtime error can say where it
@@ -121,7 +158,7 @@ pub enum Expr {
     Num(f64),
     Str(Rc<str>),
     /// Before resolution. `resolve` rewrites these into the three below.
-    Var(Rc<str>),
+    Var(Name),
     /// A local in the current frame. The name rides along for the JIT.
     Local(Binding, Rc<str>),
     /// An upvalue captured from an enclosing function.
@@ -153,12 +190,12 @@ pub enum Expr {
 #[derive(Debug, Clone)]
 pub enum Stat {
     /// `let a = e;` (and `let mut a = e;` — everything is mutable anyway)
-    Let(Vec<Rc<str>>, Vec<Expr>),
+    Let(Vec<Name>, Vec<Expr>),
     /// `let` after resolution.
     LetSlots(Vec<Binding>, Vec<Expr>),
     /// `fn name(..) {..}` — the name is bound *before* the body is resolved,
     /// so the function can call itself.
-    FnDecl(Rc<str>, Expr),
+    FnDecl(Name, Expr),
     /// `fn` after resolution.
     FnSlot(Binding, Expr),
     Assign(Vec<Expr>, Vec<Expr>),
@@ -172,7 +209,7 @@ pub enum Stat {
     /// `for i in 0..n { }` — kept separate from `ForIn` because it compiles.
     ForRange {
         id: u32,
-        var: Rc<str>,
+        var: Name,
         binding: Option<Binding>,
         start: Expr,
         end: Expr,
@@ -180,7 +217,7 @@ pub enum Stat {
         body: Block,
     },
     /// `for (k, v) in t.iter() { }`
-    ForIn { id: u32, vars: Vec<Rc<str>>, bindings: Vec<Binding>, iter: Expr, body: Block },
+    ForIn { id: u32, vars: Vec<Name>, bindings: Vec<Binding>, iter: Expr, body: Block },
     Return(Vec<Expr>),
     Break,
     Continue,
@@ -201,14 +238,14 @@ pub enum Pattern {
     /// A literal to compare the subject against.
     Lit(Expr),
     /// A name, which binds the subject. `binding` is filled in by `resolve`.
-    Bind(Rc<str>, Option<Binding>),
+    Bind(Name, Option<Binding>),
 }
 
 #[derive(Debug)]
 pub struct FuncDef {
     pub id: usize,
     pub name: String,
-    pub params: Vec<Rc<str>>,
+    pub params: Vec<Name>,
     pub body: Block,
     pub line: u32,
     /// Filled in by `resolve`: frame size, parameter bindings, and where each
@@ -227,7 +264,7 @@ pub fn next_loop_id() -> u32 {
 }
 
 impl FuncDef {
-    pub fn new(name: String, params: Vec<Rc<str>>, body: Block, line: u32) -> Self {
+    pub fn new(name: String, params: Vec<Name>, body: Block, line: u32) -> Self {
         FuncDef {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,

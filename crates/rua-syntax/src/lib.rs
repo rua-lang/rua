@@ -6,7 +6,7 @@ pub mod lexer;
 pub mod parser;
 pub mod resolve;
 
-pub use ast::{BinOp, Binding, Block, Expr, FuncDef, Stat, UnOp, UpvalSrc};
+pub use ast::{BinOp, Binding, Block, Expr, FuncDef, Name, Span, Stat, UnOp, UpvalSrc};
 
 /// Something the front end could not make sense of, and where.
 #[derive(Debug, Clone)]
