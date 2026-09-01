@@ -157,8 +157,9 @@ for name in fs::list(".") { }                  // sorted, so runs compare
 fs::mkdir("out/logs")                          // and its parents
 fs::rename(a, b)
 
-// sockets: TCP, both ends
+// sockets: TCP, both ends, with or without TLS
 let s = net::connect("example.com:80")
+let t = net::connect_tls("example.com:443")    // same handle, same calls
 net::timeout(s, 10)                            // a read that waits forever hangs forever
 net::write(s, "GET / HTTP/1.0\r\n\r\n")
 print(net::read_line(s))                       // or net::read(s) for the rest

@@ -1,0 +1,18 @@
+// Fetch a URL and print it: `rua examples/fetch.rua https://example.com`
+//
+// `serve <dir>` instead runs the other half of the library, a static file
+// server on port 8732.
+let http = require("http")
+
+if arg.len() == 0 {
+    print("usage: fetch <url>   |   fetch serve <directory>")
+    os::exit(1)
+}
+
+if arg[0] == "serve" {
+    http::serve("127.0.0.1:8732", if arg.len() > 1 { arg[1] } else { "." })
+} else {
+    let (code, headers, body) = http::get(arg[0])
+    print("status {code}, {headers.keys().len()} headers, {body.len()} bytes")
+    print(body)
+}

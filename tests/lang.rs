@@ -1526,6 +1526,85 @@ fn interpolation_joins_in_one_pass_without_changing_what_it_means() {
     assert_eq!(s(r#""" + 1 + "" + 2"#), "12", "empty pieces");
 }
 
+/// TLS, without a network. What can be checked here is that a connection that
+/// cannot be made fails as an error rather than a panic or a hang, and that a
+/// name a certificate could never be checked against is refused before any
+/// socket is opened. The live half — that `https://example.com` answers, and
+/// that an expired certificate does not — is in `net_tls_reaches_a_real_host`,
+/// which is ignored by default because it needs the internet.
+#[test]
+fn tls_refuses_what_it_cannot_verify() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        // port 1 on this machine is not listening
+        let refused = try(|| net::connect_tls("127.0.0.1:1"))
+        // an address with no host name has nothing to check a certificate against
+        let unnamed = try(|| net::connect_tls("not a host name:443"))
+        return refused, unnamed;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "false", "a refused connection is an error");
+    assert_eq!(out[1].to_string(), "false", "an unusable name is an error");
+}
+
+/// Plain sockets still work now that a connection may have TLS over it: the
+/// two share one buffered path, and only the socket underneath is different.
+#[test]
+fn a_plain_socket_still_carries_bytes_both_ways() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let srv = net::listen("127.0.0.1:0")
+        let c = net::connect(net::address(srv))
+        let s = net::accept(srv)
+        net::timeout(c, 5)
+        net::write(c, "ping\n")
+        let heard = net::read_line(s)
+        net::write(s, "pong " + heard + "\n")
+        let back = net::read_line(c)
+        let who = net::address(c)
+        net::close(c)
+        net::close(s)
+        net::close(srv)
+        return heard, back, who.starts_with("127.0.0.1:");
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "ping");
+    assert_eq!(out[1].to_string(), "pong ping");
+    assert_eq!(out[2].to_string(), "true", "the peer address survives the change");
+}
+
+/// The live check: a real server, and a certificate that should not pass.
+/// Ignored by default — `cargo test -- --ignored` runs it — because a test
+/// that needs the internet fails for reasons that are nothing to do with rua.
+#[test]
+#[ignore = "needs the internet"]
+fn net_tls_reaches_a_real_host() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let s = net::connect_tls("example.com:443")
+        net::timeout(s, 20)
+        net::write(s, "GET / HTTP/1.0\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+        let status = net::read_line(s)
+        net::close(s)
+        let expired = try(|| net::connect_tls("expired.badssl.com:443"))
+        let wrong_host = try(|| net::connect_tls("wrong.host.badssl.com:443"))
+        return status, expired, wrong_host;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(out[0].to_string().starts_with("HTTP/1."), "got {}", out[0]);
+    assert_eq!(out[1].to_string(), "false", "an expired certificate is refused");
+    assert_eq!(out[2].to_string(), "false", "a certificate for another name is refused");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

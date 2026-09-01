@@ -10,3 +10,9 @@ rua-syntax = { path = "../rua-syntax", version = "0.1.0" }
 rua-jit = { path = "../rua-jit", version = "0.1.0" }
 rua-ffi = { path = "../rua-ffi", version = "0.1.0" }
 smallvec = { version = "1.15.2", features = ["union"] }
+# TLS, so that `net` can reach a server that speaks https — which is most of
+# them. `ring` rather than the default provider: it builds with a C compiler
+# and nothing else, where `aws-lc-rs` wants cmake and an assembler.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1.0"
+rustls-native-certs = "0.8"

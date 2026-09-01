@@ -1141,10 +1141,76 @@ impl Sockets {
     }
 }
 
+/// One end of a connection: a socket, or a socket with TLS over it.
+///
+/// Everything above this reads and writes bytes and does not care which it
+/// has, so `net::read_line` and the rest are written once. What they do need
+/// now and then is the socket underneath — a timeout is set on that, not on
+/// the encryption.
+trait Conn: std::io::Read + std::io::Write {
+    fn tcp(&self) -> &std::net::TcpStream;
+}
+
+impl Conn for std::net::TcpStream {
+    fn tcp(&self) -> &std::net::TcpStream {
+        self
+    }
+}
+
+impl Conn for rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+    fn tcp(&self) -> &std::net::TcpStream {
+        self.get_ref()
+    }
+}
+
 enum Sock {
     /// Buffered, so that reading a line is a line and not a guess.
-    Stream(std::io::BufReader<std::net::TcpStream>),
+    Stream(std::io::BufReader<Box<dyn Conn>>),
     Listener(std::net::TcpListener),
+}
+
+/// A connection, ready to be handed out as a handle.
+fn stream_sock(c: impl Conn + 'static) -> Sock {
+    Sock::Stream(std::io::BufReader::new(Box::new(c) as Box<dyn Conn>))
+}
+
+/// The roots to check a server's certificate against, and the settings to
+/// check it with. Built once: reading the platform's store is a directory
+/// walk and a parse of every file in it.
+fn tls_config() -> Res<Rc<rustls::ClientConfig>> {
+    thread_local! {
+        static CONFIG: RefCell<Option<Rc<rustls::ClientConfig>>> = const { RefCell::new(None) };
+    }
+    CONFIG.with(|c| {
+        if let Some(cfg) = c.borrow().as_ref() {
+            return Ok(cfg.clone());
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        // The platform's own store first, so that a certificate an
+        // administrator installed — a company's own authority, a proxy — is
+        // trusted here as it is everywhere else on the machine.
+        let found = rustls_native_certs::load_native_certs();
+        for cert in found.certs {
+            let _ = roots.add(cert);
+        }
+        // and a bundled set when the machine has none, which is what a
+        // container usually is
+        if roots.is_empty() {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        if roots.is_empty() {
+            return err("net::connect_tls: no certificate authorities to trust");
+        }
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error(format!("net::connect_tls: {e}")))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let cfg = Rc::new(cfg);
+        *c.borrow_mut() = Some(cfg.clone());
+        Ok(cfg)
+    })
 }
 
 fn put_sock(s: Sock) -> Res<Value> {
@@ -1159,7 +1225,7 @@ fn with_sock<T>(h: &Value, what: &str, f: impl FnOnce(&mut Sock) -> Res<T>) -> R
     })
 }
 
-fn stream_of<'a>(s: &'a mut Sock, what: &str) -> Res<&'a mut std::io::BufReader<std::net::TcpStream>> {
+fn stream_of<'a>(s: &'a mut Sock, what: &str) -> Res<&'a mut std::io::BufReader<Box<dyn Conn>>> {
     match s {
         Sock::Stream(s) => Ok(s),
         Sock::Listener(_) => err(format!("net::{what}: that is a listener, not a connection")),
@@ -1177,9 +1243,39 @@ fn net_lib(vm: &mut Vm) {
             ("connect", unary("connect", |addr| {
                 let addr = addr.as_str()?;
                 match std::net::TcpStream::connect(&*addr) {
-                    Ok(s) => put_sock(Sock::Stream(std::io::BufReader::new(s))),
+                    Ok(s) => put_sock(stream_sock(s)),
                     Err(e) => err(format!("net::connect {addr}: {e}")),
                 }
+            })),
+            // The same connection with TLS over it. Everything else in `net`
+            // takes the handle this returns and does not know the difference.
+            ("connect_tls", native("connect_tls", |_vm, args| {
+                let addr = str_arg(args, 0)?;
+                // the name to check the certificate against is the host,
+                // unless the caller says otherwise — an address that is
+                // already an IP has no name of its own
+                let name = match args.get(1) {
+                    Some(v) if !matches!(v, Value::Nil) => str_arg(args, 1)?.to_string(),
+                    _ => match addr.rsplit_once(':') {
+                        Some((host, _)) => host.to_string(),
+                        None => addr.to_string(),
+                    },
+                };
+                let server = rustls::pki_types::ServerName::try_from(name.clone())
+                    .map_err(|_| Error(format!("net::connect_tls: `{name}` is not a host name")))?
+                    .to_owned();
+                let mut conn = rustls::ClientConnection::new(tls_config()?.as_ref().clone().into(), server)
+                    .map_err(|e| Error(format!("net::connect_tls {addr}: {e}")))?;
+                let mut sock = std::net::TcpStream::connect(&*addr)
+                    .map_err(|e| Error(format!("net::connect_tls {addr}: {e}")))?;
+                // Finish the handshake here rather than on the first read, so
+                // that a certificate this machine will not trust is reported
+                // by the call that made the connection.
+                while conn.is_handshaking() {
+                    conn.complete_io(&mut sock)
+                        .map_err(|e| Error(format!("net::connect_tls {addr}: {e}")))?;
+                }
+                one(put_sock(stream_sock(rustls::StreamOwned::new(conn, sock)))?)
             })),
             ("listen", unary("listen", |addr| {
                 let addr = addr.as_str()?;
@@ -1197,7 +1293,7 @@ fn net_lib(vm: &mut Vm) {
                     },
                     Sock::Stream(_) => err("net::accept: that is a connection, not a listener"),
                 })?;
-                put_sock(Sock::Stream(std::io::BufReader::new(stream)))
+                put_sock(stream_sock(stream))
             })),
             ("write", binary("write", |h, text| {
                 let text = text.to_string();
@@ -1250,8 +1346,9 @@ fn net_lib(vm: &mut Vm) {
                     };
                     let s = stream_of(s, "timeout")?;
                     s.get_ref()
+                        .tcp()
                         .set_read_timeout(d)
-                        .and_then(|()| s.get_ref().set_write_timeout(d))
+                        .and_then(|()| s.get_ref().tcp().set_write_timeout(d))
                         .map_err(|e| Error(format!("net::timeout: {e}")))?;
                     Ok(Value::Nil)
                 })
@@ -1259,7 +1356,7 @@ fn net_lib(vm: &mut Vm) {
             ("address", unary("address", |h| {
                 with_sock(h, "address", |s| {
                     let a = match s {
-                        Sock::Stream(s) => s.get_ref().peer_addr(),
+                        Sock::Stream(s) => s.get_ref().tcp().peer_addr(),
                         Sock::Listener(l) => l.local_addr(),
                     };
                     match a {

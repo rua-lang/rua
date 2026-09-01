@@ -1,27 +1,37 @@
 // HTTP over the sockets, in rua: a client that fetches a URL and a server
-// that hands out files from a directory.
+// that hands out files from a directory. A library — see `fetch.rua` for the
+// script that uses it.
 //
-// Plain HTTP only — there is no TLS in the runtime, so `https` is out. What
-// is here is enough to talk to a local service, which is what a script
-// usually wants.
+// `http` and `https` both: a URL that names neither is assumed to be https,
+// since almost everything is. The server end is plain HTTP, which is what a
+// local service wants.
 
 fn split_url(url) {
     let rest = url
-    if rest.starts_with("http://") { rest = rest.slice(7, rest.len()) }
+    let secure = true
+    if rest.starts_with("http://") {
+        secure = false
+        rest = rest.slice(7, rest.len())
+    } else if rest.starts_with("https://") {
+        rest = rest.slice(8, rest.len())
+    }
     let slash = rest.find("/")
     let host = if slash == nil { rest } else { rest.slice(0, slash) }
     let path = if slash == nil { "/" } else { rest.slice(slash, rest.len()) }
-    if !host.contains(":") { host = host + ":80" }
-    return host, path
+    if !host.contains(":") { host = host + (if secure { ":443" } else { ":80" }) }
+    return host, path, secure
 }
 
 // Returns the status number, a map of headers, and the body.
 fn get(url) {
-    let (host, path) = split_url(url)
+    let (host, path, secure) = split_url(url)
     let name = host.split(":")[0]
-    let s = net::connect(host)
+    // the name is checked against the certificate, so it travels separately
+    // from the address that is dialled
+    let s = if secure { net::connect_tls(host, name) } else { net::connect(host) }
     net::timeout(s, 10)
-    net::write(s, "GET {path} HTTP/1.0\r\nHost: {name}\r\nConnection: close\r\n\r\n")
+    // some services answer 403 to a request that does not name itself
+    net::write(s, "GET {path} HTTP/1.0\r\nHost: {name}\r\nUser-Agent: rua\r\nConnection: close\r\n\r\n")
 
     let status = net::read_line(s)
     if status == nil { error("no reply from {host}") }
@@ -79,10 +89,6 @@ fn serve(addr, root) {
     }
 }
 
-if arg.len() > 1 && arg[0] == "serve" {
-    serve("127.0.0.1:8732", arg[1])
-} else if arg.len() > 0 {
-    let (code, headers, body) = get(arg[0])
-    print("status {code}, {headers.keys().len()} headers, {body.len()} bytes")
-    print(body)
-}
+// The file's value is the module, so `let http = require("http")` beside it
+// gets you `http.get` and `http.serve`. `examples/fetch.rua` is the script.
+#{ get: get, serve: serve, split_url: split_url }
