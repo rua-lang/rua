@@ -81,10 +81,15 @@ survives reinstalling the pack:
 Do not put a `"grammar"` key in `languages.rua`: naming a built-in there
 overrides the pack.
 
-When something does not work, fresh says why in
-`~/.local/state/fresh/logs/fresh-*.log`. The two lines worth grepping for are
-`grammar-build` and `Failed to load grammar`; a working server logs
-`LSP server 'rua' initialized for language: rua`.
+fresh keeps the server's own output in
+`~/.local/state/fresh/logs/lsp/rua-*.log`, and its own reasoning in
+`~/.local/state/fresh/logs/fresh-*.log`. In the second, `grammar-build` and
+`Failed to load grammar` are the lines that say why a file has no colours,
+and `LSP server 'rua' initialized for language: rua` says the server
+attached.
+
+A buffer that was open before the grammar loaded keeps the syntax it was
+given, so reopen the file after changing any of this.
 
 [syntect]: https://github.com/trishume/syntect
 
@@ -122,6 +127,23 @@ Rust for colours — the same trick `.gitattributes` uses for GitHub:
 // ~/.config/zed/settings.json
 { "file_types": { "Rust": ["*.rua"] } }
 ```
+
+## When it does not work
+
+The server writes what it is doing to standard error, which is where every
+editor keeps it — fresh under `logs/lsp/`, VS Code in its output channel.
+
+```
+[   0.001] info  opened lisp.rua (17435 bytes)
+[   0.001] info  lisp.rua: no problems (1.2ms)
+[   0.002] error textDocument/rename failed: `print` is not declared in this
+                 file, so renaming it here would leave the declaration behind
+```
+
+`RUA_LSP_LOG=debug` adds a line per request with how long it took;
+`RUA_LSP_LOG=off` silences everything. Pass it through the editor's own
+setting for the server's environment — `rua.server.env` in VS Code, `env` in
+a fresh `lsp` entry.
 
 ## What was checked here
 

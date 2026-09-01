@@ -2,6 +2,7 @@
 //! without a transport in the way.
 
 pub mod analysis;
+pub mod log;
 pub mod docs;
 pub mod index;
 

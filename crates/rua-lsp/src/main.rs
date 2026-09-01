@@ -5,7 +5,7 @@
 //! and a live `Vm` for what the standard library contains. A second, drifting
 //! description of the language is the thing this exists to avoid.
 
-use rua_lsp::analysis;
+use rua_lsp::{analysis, log_debug, log_error, log_info};
 
 use lsp_server::{Connection, ExtractError, Message, Request, RequestId, Response};
 use lsp_types::notification::Notification as _;
@@ -15,12 +15,20 @@ use lsp_types::*;
 fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     // stdio is the transport an editor starts us with; anything printed to
     // stdout that is not a message would corrupt it, so logging goes to stderr
-    eprintln!("rua-lsp {}", env!("CARGO_PKG_VERSION"));
+    rua_lsp::log::init();
+    log_info!("rua-lsp {} starting", env!("CARGO_PKG_VERSION"));
     let (connection, io_threads) = Connection::stdio();
     let caps = serde_json::to_value(server_capabilities())?;
     let init = connection.initialize(caps)?;
-    let _: InitializeParams = serde_json::from_value(init)?;
+    let params: InitializeParams = serde_json::from_value(init)?;
+    let who = params
+        .client_info
+        .map(|c| format!("{} {}", c.name, c.version.unwrap_or_default()))
+        .unwrap_or_else(|| "an editor that did not say".to_string());
+    log_info!("connected to {who}");
+    log_info!("set RUA_LSP_LOG=debug for every request, or =off for silence");
     serve(&connection)?;
+    log_info!("shutting down");
     io_threads.join()?;
     Ok(())
 }
@@ -67,12 +75,30 @@ fn serve(connection: &Connection) -> Result<(), Box<dyn std::error::Error + Sync
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
+                let (method, started) = (req.method.clone(), std::time::Instant::now());
                 let response = answer(&mut world, req);
+                let took = started.elapsed().as_secs_f64() * 1000.0;
+                match &response.error {
+                    Some(e) => log_error!("{method} failed after {took:.1}ms: {}", e.message),
+                    None => log_debug!("{method} in {took:.1}ms"),
+                }
                 connection.sender.send(Message::Response(response))?;
             }
             Message::Notification(note) => {
+                log_debug!("{}", note.method);
                 if let Some(uri) = world.apply(&note) {
+                    let started = std::time::Instant::now();
                     let diagnostics = world.diagnostics(&uri);
+                    let took = started.elapsed().as_secs_f64() * 1000.0;
+                    let name = rua_lsp::log::short(&uri);
+                    match diagnostics.len() {
+                        0 => log_info!("{name}: no problems ({took:.1}ms)"),
+                        n => log_info!(
+                            "{name}: {n} problem{} ({took:.1}ms), first: {}",
+                            if n == 1 { "" } else { "s" },
+                            diagnostics[0].message
+                        ),
+                    }
                     let params = PublishDiagnosticsParams {
                         uri: uri.clone(),
                         diagnostics,

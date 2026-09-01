@@ -6,6 +6,7 @@
 //! the one that runs.
 
 use crate::docs::Docs;
+use crate::{log_debug, log_info};
 use crate::index::LineIndex;
 use lsp_types::*;
 use rua_syntax::lexer::{Lexed, Lexer, Tok};
@@ -41,7 +42,9 @@ pub struct World {
 
 impl World {
     pub fn new() -> World {
-        World { docs: Docs::default(), vm: rua_core::Vm::new() }
+        let vm = rua_core::Vm::new();
+        log_info!("standard library: {} globals", vm.global_names().len());
+        World { docs: Docs::default(), vm }
     }
 
     /// Put a document in, as `didOpen` does. The tests drive the server this
@@ -214,6 +217,11 @@ impl World {
             notification::DidOpenTextDocument::METHOD => {
                 let p: DidOpenTextDocumentParams =
                     serde_json::from_value(note.params.clone()).ok()?;
+                log_info!(
+                    "opened {} ({} bytes)",
+                    crate::log::short(&p.text_document.uri),
+                    p.text_document.text.len()
+                );
                 self.docs.set(p.text_document.uri.clone(), &p.text_document.text);
                 Some(p.text_document.uri)
             }
@@ -222,12 +230,14 @@ impl World {
                     serde_json::from_value(note.params.clone()).ok()?;
                 // full sync: the last change carries the whole document
                 let text = p.content_changes.last()?.text.clone();
+                log_debug!("changed {} ({} bytes)", crate::log::short(&p.text_document.uri), text.len());
                 self.docs.set(p.text_document.uri.clone(), &text);
                 Some(p.text_document.uri)
             }
             notification::DidCloseTextDocument::METHOD => {
                 let p: DidCloseTextDocumentParams =
                     serde_json::from_value(note.params.clone()).ok()?;
+                log_info!("closed {}", crate::log::short(&p.text_document.uri));
                 self.docs.remove(&p.text_document.uri);
                 // one last empty set, so the editor drops what it was showing
                 Some(p.text_document.uri)
