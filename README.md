@@ -209,6 +209,12 @@ loop. The runtime checks on the way in that every element is a table of numbers
 long enough for the constant indexes the body uses, so the body needs no test
 of its own.
 
+**Compiled code can make an array, fill it, and return it.** `let t = []`
+allocates through the runtime, which owns the table for the length of the call
+— so a trap drops it, exactly as an in-place write is discarded and an append
+truncated. A table that escapes into a caller's array, or is returned, is
+handed over at the end.
+
 **Writes go through the view, and a trap takes them back.** While compiled code
 runs, the numeric view *is* the table: a write is one store, and when the call
 ends the runtime copies the view back over the array part. If the call trapped
@@ -305,15 +311,18 @@ does not, rua is its interpreter** — 1.2x to 2.2x slower than Lua 5.4, and 2.8
 to 5.4x off LuaJIT. That gap is the value representation, and it does not have
 an easy answer.
 
-What keeps the last three out of the compiler:
+What keeps the last three out of the compiler is now one thing: **values that
+are not numbers or arrays of them.**
 
-* **Building tables and strings.** Word frequency creates an array per call and
-  joins strings; compiled code can append to a table it was handed but cannot
-  make one, and has nothing to say about strings at all.
-* **Returning a table**, which a compiled entry point cannot: it returns one
-  `f64`.
-* **Closures, maps and allocation** — binary trees and the Scheme are made of
-  them.
+* **Strings.** Word frequency builds an array of words and joins them; the
+  Scheme's reader walks a string a byte at a time. A compiled value is an
+  `f64`, so neither has anything the compiler can hold.
+* **Maps.** Binary trees is made of `#{ left: .., right: .. }` — keyed
+  entries, where the compiler understands the array part.
+* **Closures**, which the Scheme's evaluator is built on.
+
+Making and returning *arrays* is no longer on that list: matrix multiply
+builds a matrix a row at a time and hands it back, and compiles.
 
 
 ### What the interpreter's time actually goes on
