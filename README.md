@@ -148,6 +148,8 @@ fs::write("out.json", body)
 fs::append("log.txt", "done\n")
 if fs::exists(p) && !fs::is_dir(p) { print(fs::size(p)) }
 for name in fs::list(".") { }                  // sorted, so runs compare
+fs::mkdir("out/logs")                          // and its parents
+fs::rename(a, b)
 
 // sockets: TCP, both ends
 let s = net::connect("example.com:80")
@@ -161,6 +163,7 @@ let c = net::accept(srv)                       // blocks
 
 // running things, and the terminal
 let (code, out, err) = os::run("git rev-parse HEAD")
+print(os::date())                              // "2026-09-01 01:50:35", UTC
 let all = io::read_all()                       // stdin, for the end of a pipe
 io::write("no newline")
 

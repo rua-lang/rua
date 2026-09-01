@@ -1522,3 +1522,39 @@ fn a_stale_socket_handle_cannot_reach_the_connection_that_replaced_it() {
     assert_eq!(out[2].to_string(), "mine", "the live socket is unaffected");
     assert_eq!(out[3].to_string(), "true", "the handles differ by generation");
 }
+
+/// A stamp on a line of output, in UTC. The calendar arithmetic has no table
+/// of month lengths in it, so the awkward dates are the ones worth pinning:
+/// the epoch, a leap day, the end of a century that is not a leap year.
+#[test]
+fn a_script_can_print_a_date() {
+    assert_eq!(s("os::date(0)"), "1970-01-01 00:00:00");
+    assert_eq!(s("os::date(1234567890)"), "2009-02-13 23:31:30");
+    assert_eq!(s("os::date(1709208000)"), "2024-02-29 12:00:00");
+    assert_eq!(s("os::date(951825600)"), "2000-02-29 12:00:00", "2000 is a leap year");
+    assert_eq!(s("os::date(4107542400)"), "2100-03-01 00:00:00", "2100 is not");
+    assert_eq!(s("os::date(-86400)"), "1969-12-31 00:00:00", "and before the epoch");
+}
+
+/// A script that writes a report wants the directory it writes into.
+#[test]
+fn a_script_can_make_a_directory() {
+    let root = std::env::temp_dir().join(format!("rua-mkdir-{}", std::process::id()));
+    let p = root.to_string_lossy().replace('\\', "/");
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(&format!(
+            r#"
+        let deep = "{p}/a/b/c"
+        fs::mkdir(deep)                     // and its parents
+        fs::write(deep + "/one.txt", "hi")
+        fs::rename(deep + "/one.txt", deep + "/two.txt")
+        return fs::is_dir(deep), fs::list(deep).join(","), fs::read(deep + "/two.txt");
+        "#
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out[0].to_string(), "true");
+    assert_eq!(out[1].to_string(), "two.txt");
+    assert_eq!(out[2].to_string(), "hi");
+}
