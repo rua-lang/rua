@@ -37,6 +37,15 @@ struct FnCompiler {
     line: u32,
 }
 
+/// The register a plain local already lives in. A captured one does not
+/// count: it is read through its cell, which takes an instruction.
+fn plain_reg(e: &Expr) -> Option<Reg> {
+    match e {
+        Expr::Local(b, _) if !b.cell => Some(b.slot),
+        _ => None,
+    }
+}
+
 /// The pieces of a string interpolation, if this is one: a left leaning chain
 /// of `+` rooted in a string literal, so every step of it concatenates.
 ///
@@ -339,7 +348,11 @@ impl FnCompiler {
             Stat::While(id, cond, body) => {
                 let top = self.here();
                 let mut exits = Vec::new();
-                self.cond_jump(cond, true, &mut exits);
+                // `while true` is how a trampoline is written, and testing a
+                // constant every time round cost two instructions an iteration
+                if !matches!(cond, Expr::Bool(true)) {
+                    self.cond_jump(cond, true, &mut exits);
+                }
                 self.loops.push(LoopCtx { breaks: exits, continues: Vec::new() });
                 self.block(body, None);
                 let ctx = self.loops.pop().expect("pushed above");
@@ -1014,6 +1027,14 @@ impl FnCompiler {
                     _ => None,
                 };
                 match global {
+                    // one argument, already in a register: the call takes it
+                    // from there rather than being handed it by a move
+                    Some(g) if args.len() == 1 && plain_reg(&args[0]).is_some() => {
+                        let a = plain_reg(&args[0]).expect("just checked");
+                        self.alloc(); // the window still reserves the slot
+                        out = direct;
+                        self.emit(Op::CallGlobal1 { base, g, a, nres, dst: direct }, 0);
+                    }
                     Some(g) => {
                         let spread = self.args(args);
                         let nargs = args.len() as u16;
@@ -1141,7 +1162,20 @@ impl FnCompiler {
     fn args(&mut self, args: &[Expr]) -> bool {
         let n = args.len();
         let mut spread = false;
-        for (i, a) in args.iter().enumerate() {
+        let mut i = 0;
+        while i < n {
+            let a = &args[i];
+            // two locals in a row are one instruction, which is most of what
+            // gathering arguments is
+            if i + 2 <= n {
+                if let (Some(s0), Some(s1)) = (plain_reg(a), plain_reg(&args[i + 1])) {
+                    let d0 = self.alloc();
+                    let d1 = self.alloc();
+                    self.emit(Op::Move2 { d0, s0, d1, s1 }, 0);
+                    i += 2;
+                    continue;
+                }
+            }
             let r = self.alloc();
             if i + 1 == n && is_call(a) {
                 self.call_expr(a, r, MULTI);
@@ -1149,6 +1183,7 @@ impl FnCompiler {
             } else {
                 self.expr(a, r);
             }
+            i += 1;
         }
         spread
     }

@@ -290,6 +290,70 @@ impl Vm {
                 unsafe { Value::put(&mut *regs.add($r as usize), v) }
             }};
         }
+        // The body of a call to a global, shared by the plain form and the
+        // one that carries its only argument. Written once as a macro so each
+        // stays its own arm of the dispatch match, rather than a branch
+        // inside a shared one.
+        macro_rules! call_global {
+            ($base:expr, $g:expr, $nargs:expr, $nres:expr, $dst:expr) => {{
+                let (base, g, nargs, nres, dst) = ($base, $g, $nargs, $nres, $dst);
+                    self.set_line(line_at!(pc - 1));
+                    // SAFETY: `g` indexes this proto's own global table.
+                    let entry = unsafe { &*proto.globals.as_ptr().add(g as usize) };
+                    let slot = match entry.slot.get() {
+                        u32::MAX => self.global_ref(proto, g),
+                        slot => slot,
+                    };
+                    // A builtin of one argument is most of what a call to a
+                    // global that is not a rua function is — `type(x)`,
+                    // `num(s)` — and going through `dispatch` for it costs a
+                    // call, a reference count on the callee and a second look
+                    // at the register the argument is in.
+                    //
+                    // SAFETY: the global table's buffer is a separate
+                    // allocation from the VM and from the value stack, and a
+                    // `fast1` builtin is handed nothing it could reach either
+                    // through: it takes one `&Value` and cannot call back in.
+                    // So nothing here can move the table or run rua code while
+                    // this borrow is live.
+                    if let Value::Native(n) = unsafe { &*self.global_ptr(slot) } {
+                        if nres <= 1 && nargs == 1 {
+                            if let Some(fast) = &n.fast1 {
+                                let v =
+                                    fast(at!(base + 1)).map_err(|e| self.at(proto, pc, e))?;
+                                if nres == 1 {
+                                    set!(dst, v);
+                                }
+                                self.multi_at = None;
+                                continue;
+                            }
+                        }
+                    }
+                    match self.global_resolved(slot) {
+                        Value::Func(f) => {
+                            match self
+                                .enter_frame(f, base, nargs, nres, dst, &mut current, pc, frames)
+                            {
+                                Err(e) => return Err(self.here(proto, pc, e)),
+                                Ok(true) => {
+                                    // `enter_frame` put the callee in
+                                    // `current` and the caller in the frame
+                                    // record, without either being counted
+                                    proto = unsafe { &*Rc::as_ptr(&current.proto) };
+                                    pc = 0;
+                                    resync!();
+                                }
+                                Ok(false) => resync!(),
+                            }
+                        }
+                        callee => {
+                            self.dispatch(&callee, base, nargs, nres, dst)
+                                .map_err(|e| self.here(proto, pc, e))?;
+                            resync!();
+                        }
+                    }
+            }};
+        }
         loop {
             debug_assert_eq!(regs, unsafe {
                 self.stack.as_mut_ptr().add(self.base)
@@ -411,6 +475,12 @@ impl Vm {
                     }
                     set!(dst, Value::str(out));
                 }
+                Op::Move2 { d0, s0, d1, s1 } => {
+                    // both read before either is written: the two may overlap
+                    let (a, b) = (get!(s0), get!(s1));
+                    set!(d0, a);
+                    set!(d1, b);
+                }
                 Op::Sub { dst, a, b } => {
                     let v = match (at!(a), at!(b)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
@@ -514,62 +584,15 @@ impl Vm {
                         }
                     }
                 }
+                Op::CallGlobal1 { base, g, a, nres, dst } => {
+                    // the fused form is an ordinary call of one argument once
+                    // the argument is in the window
+                    let v = get!(a);
+                    set!(base + 1, v);
+                    call_global!(base, g, 1, nres, dst);
+                }
                 Op::CallGlobal { base, g, nargs, nres, dst } => {
-                    self.set_line(line_at!(pc - 1));
-                    // SAFETY: `g` indexes this proto's own global table.
-                    let entry = unsafe { &*proto.globals.as_ptr().add(g as usize) };
-                    let slot = match entry.slot.get() {
-                        u32::MAX => self.global_ref(proto, g),
-                        slot => slot,
-                    };
-                    // A builtin of one argument is most of what a call to a
-                    // global that is not a rua function is — `type(x)`,
-                    // `num(s)` — and going through `dispatch` for it costs a
-                    // call, a reference count on the callee and a second look
-                    // at the register the argument is in.
-                    //
-                    // SAFETY: the global table's buffer is a separate
-                    // allocation from the VM and from the value stack, and a
-                    // `fast1` builtin is handed nothing it could reach either
-                    // through: it takes one `&Value` and cannot call back in.
-                    // So nothing here can move the table or run rua code while
-                    // this borrow is live.
-                    if let Value::Native(n) = unsafe { &*self.global_ptr(slot) } {
-                        if nres <= 1 && nargs == 1 {
-                            if let Some(fast) = &n.fast1 {
-                                let v =
-                                    fast(at!(base + 1)).map_err(|e| self.at(proto, pc, e))?;
-                                if nres == 1 {
-                                    set!(dst, v);
-                                }
-                                self.multi_at = None;
-                                continue;
-                            }
-                        }
-                    }
-                    match self.global_resolved(slot) {
-                        Value::Func(f) => {
-                            match self
-                                .enter_frame(f, base, nargs, nres, dst, &mut current, pc, frames)
-                            {
-                                Err(e) => return Err(self.here(proto, pc, e)),
-                                Ok(true) => {
-                                    // `enter_frame` put the callee in
-                                    // `current` and the caller in the frame
-                                    // record, without either being counted
-                                    proto = unsafe { &*Rc::as_ptr(&current.proto) };
-                                    pc = 0;
-                                    resync!();
-                                }
-                                Ok(false) => resync!(),
-                            }
-                        }
-                        callee => {
-                            self.dispatch(&callee, base, nargs, nres, dst)
-                                .map_err(|e| self.here(proto, pc, e))?;
-                            resync!();
-                        }
-                    }
+                    call_global!(base, g, nargs, nres, dst);
                 }
                 Op::Method { base, name, nargs, nres, dst } => {
                     self.set_line(line_at!(pc - 1));
@@ -865,6 +888,12 @@ impl Vm {
                     let (x, y) = (at!(a), konst!(k));
                     let taken = match (x, y) {
                         (Value::Num(x), Value::Num(y)) => num_cmp(kind, *x, *y),
+                        // dispatching on a string — `tag == "sym"` — is what an
+                        // interpreter written in rua does most, and going out
+                        // to the general comparison for it cost a call
+                        (Value::Str(x), Value::Str(y)) if kind.is_eq() => {
+                            (x == y) == (kind == BinKind::Eq)
+                        }
                         (x, y) => match crate::interp::equality(kind, x, y) {
                             Some(b) => b,
                             None => {

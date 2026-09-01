@@ -32,6 +32,16 @@ pub enum BinKind {
     Ge,
 }
 
+impl BinKind {
+    /// Is this `==` or `!=`? Those two are answered by equality alone, for
+    /// values of any type, which lets the interpreter settle a comparison
+    /// without going out to the general one.
+    #[inline]
+    pub fn is_eq(self) -> bool {
+        matches!(self, BinKind::Eq | BinKind::Ne)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Op {
     /// `dst = consts[k]`
@@ -60,6 +70,14 @@ pub enum Op {
     // second time on the operation. A rewrite pass produces these from `Bin`
     // and `BinK`; everything else keeps the generic form, because specialising
     // the whole table measured *worse* — the jump table stops fitting.
+    /// Two moves in one instruction. Arguments are gathered into the call's
+    /// window one register at a time, and a pair of locals is the common
+    /// shape; the dispatch either side of the second move is the whole cost.
+    Move2 { d0: Reg, s0: Reg, d1: Reg, s1: Reg },
+    /// A call to a global with one argument already in a register — `type(x)`,
+    /// `is_pair(p)` — which is the shape most calls to a builtin take. The
+    /// move that would have put the argument in the window is folded in.
+    CallGlobal1 { base: Reg, g: u16, a: Reg, nres: u16, dst: Reg },
     Add { dst: Reg, a: Reg, b: Reg },
     /// Join `n` registers from `base` into one string. An interpolation is a
     /// chain of `+`, and each `+` allocated a string and interned it only for
@@ -203,4 +221,10 @@ mod size {
         // the enum wider makes the whole interpreter slower.
         assert_eq!(std::mem::size_of::<super::Op>(), 16);
     }
+}
+
+#[test]
+fn op_is_small() {
+    // the code array is walked constantly; a wider Op is a slower interpreter
+    assert_eq!(std::mem::size_of::<Op>(), 16, "Op grew");
 }
