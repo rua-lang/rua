@@ -142,8 +142,6 @@ fn write_value(v, indent) {
 
 fn write(v) { write_value(v, 0) }
 
-// Run it on a file if this was started as a script.
-if arg.len() > 0 {
-    let text = fs::read(arg[0])
-    print(write(parse(text)))
-}
+// The file's value is the module, so `let json = require("json")` beside it
+// gets you `json.parse` and `json.write`.
+#{ parse: parse, write: write }

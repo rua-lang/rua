@@ -181,7 +181,9 @@ fn base(vm: &mut Vm) {
     // `let m = require("lib.rua")` — runs the file once and returns its value,
     // which is whatever expression the file ends with
     vm.register("require", |vm, args| {
-        let path = str_arg(args, 0)?;
+        // beside the file asking, then the working directory, with or without
+        // the extension
+        let path = RStr::from(vm.resolve_path(&str_arg(args, 0)?));
         let key = std::fs::canonicalize(&*path)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string());

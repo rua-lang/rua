@@ -151,7 +151,11 @@ fn main() {
     }
     if let Some(path) = &args.script {
         match std::fs::read_to_string(path) {
-            Ok(src) => run(&mut vm, &src, path),
+            Ok(src) => {
+                // what the script requires can sit beside it
+                vm.set_script(path);
+                run(&mut vm, &src, path)
+            }
             Err(e) => {
                 eprintln!("rua: cannot read {path}: {e}");
                 std::process::exit(1);

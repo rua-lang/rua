@@ -174,6 +174,8 @@ pub struct Vm {
     frames: Vec<(*const crate::bytecode::Proto, u32)>,
     /// Modules already loaded by `require`, keyed by canonical path.
     pub modules: HashMap<String, Value>,
+    /// The directory of each file currently being loaded, innermost last.
+    loading: Vec<Option<std::path::PathBuf>>,
     /// Compiled functions that inlined a call to a global, so that assigning to
     /// that global can throw their machine code away. Keyed by global slot, and
     /// walked transitively: a caller two levels up is calling that code too.
@@ -242,6 +244,7 @@ impl Vm {
             line: 0,
             frames: Vec::new(),
             modules: HashMap::new(),
+            loading: Vec::new(),
             jit_deps: HashMap::new(),
             loop_deps: HashMap::new(),
             compiling: std::collections::HashSet::new(),
@@ -437,12 +440,63 @@ impl Vm {
     pub fn eval_file(&mut self, path: &str) -> Res<Vec<Value>> {
         let src = std::fs::read_to_string(path)
             .map_err(|e| Error(format!("cannot read {path}: {e}")))?;
+        // Where a file is is how it finds what it requires, so a library can
+        // sit beside the script that uses it and both can be run from
+        // anywhere.
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf());
+        self.loading.push(dir);
         // a chunk is a call like any other: one file loading another must not
         // walk off the end of the stack
-        self.enter_depth().map_err(|s| s.into_error())?;
-        let out = self.eval(&src);
-        self.leave_depth();
+        let depth = self.enter_depth().map_err(|s| s.into_error());
+        let out = match depth {
+            Ok(_) => {
+                let out = self.eval(&src);
+                self.leave_depth();
+                out
+            }
+            Err(e) => Err(e),
+        };
+        self.loading.pop();
         out
+    }
+
+    /// Say where the script being run lives, so that what it requires can sit
+    /// beside it. An embedder that has no file need not call this.
+    pub fn set_script(&mut self, path: &str) {
+        let dir = std::path::Path::new(path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf());
+        self.loading.clear();
+        self.loading.push(dir);
+    }
+
+    /// Where to look for something a script asks for by relative path: beside
+    /// the file doing the asking, then the working directory.
+    pub fn resolve_path(&self, path: &str) -> String {
+        let given = std::path::Path::new(path);
+        if given.is_absolute() || given.exists() {
+            return path.to_string();
+        }
+        let with_ext = |p: std::path::PathBuf| {
+            if p.exists() {
+                return Some(p);
+            }
+            let ext = p.with_extension("rua");
+            ext.exists().then_some(ext)
+        };
+        if let Some(Some(dir)) = self.loading.last() {
+            if let Some(found) = with_ext(dir.join(given)) {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+        match with_ext(given.to_path_buf()) {
+            Some(found) => found.to_string_lossy().into_owned(),
+            None => path.to_string(),
+        }
     }
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>) -> Res<Vec<Value>> {

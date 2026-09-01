@@ -1442,3 +1442,29 @@ fn a_script_can_talk_over_a_socket() {
         out[3]
     );
 }
+
+/// A library sits beside the script that uses it, and both run from anywhere.
+/// `require` used to resolve against the working directory, so a script only
+/// found its own library when you happened to be standing in the right place.
+#[test]
+fn a_library_is_found_beside_the_script_that_requires_it() {
+    let dir = std::env::temp_dir().join(format!("rua-req-{}", std::process::id()));
+    let tools = dir.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(tools.join("greet.rua"), r#"#{ hello: |who| { "hi " + who } }"#).unwrap();
+    // by name, without the extension, from a sibling file
+    std::fs::write(
+        tools.join("main.rua"),
+        "let g = require(\"greet\")\ng::hello(\"there\")\n",
+    )
+    .unwrap();
+
+    // nothing named `greet` exists anywhere near the working directory, so
+    // finding it means it was found beside the file that asked
+    let mut vm = Vm::new();
+    let out = vm
+        .eval_file(&tools.join("main.rua").to_string_lossy())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out[0].to_string(), "hi there");
+}

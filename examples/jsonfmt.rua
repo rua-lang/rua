@@ -1,0 +1,13 @@
+// Pretty-print a JSON file: `rua examples/jsonfmt.rua some.json`
+//
+// The point of the example is the first line — a library beside the script is
+// found from wherever you run it.
+let json = require("json")
+
+if arg.len() == 0 {
+    print("usage: jsonfmt <file.json>")
+    os::exit(1)
+}
+// `::` reaches a field, `.` calls it as a method with the table as its first
+// argument — a module wants the first.
+print(json::write(json::parse(fs::read(arg[0]))))
