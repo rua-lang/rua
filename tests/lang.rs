@@ -1343,3 +1343,49 @@ fn a_row_pushed_before_a_trap_is_not_pushed_twice() {
     let got: Vec<f64> = out.iter().map(|v| v.as_num().unwrap()).collect();
     assert_eq!(got, vec![120.0, 0.0, 119.0], "one row per call, in order");
 }
+
+/// A script that cannot read or write a file cannot do very much. This is the
+/// whole of `fs` on one file, including what it says when the file is not
+/// there — a script wants to print that, not a number.
+#[test]
+fn a_script_can_read_and_write_files() {
+    let dir = std::env::temp_dir().join(format!("rua-fs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("notes.txt");
+    let p = path.to_string_lossy().replace('\\', "/");
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(&format!(
+            r#"
+        let p = "{p}"
+        fs::write(p, "alpha\nbeta\n")
+        fs::append(p, "gamma\n")
+        let ls = fs::lines(p)
+        let missing = try(|| fs::read(p + ".nope"))
+        let size = fs::size(p)
+        fs::remove(p)
+        return ls.len(), ls[2], missing, size, fs::exists(p);
+        "#
+        ))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out[0].as_num().unwrap(), 3.0, "three lines, no empty fourth");
+    assert_eq!(out[1].to_string(), "gamma");
+    assert_eq!(out[2].to_string(), "false", "a missing file is an error, not nil");
+    assert_eq!(out[3].as_num().unwrap(), 17.0);
+    assert_eq!(out[4].to_string(), "false", "removed");
+}
+
+/// `{` starts an interpolation, so a literal brace is doubled — and `}}` has
+/// to mean one brace whether or not the same string happens to contain a `{`.
+/// Writing JSON out of a script is where that rule gets met.
+#[test]
+fn braces_in_strings_escape_the_same_way_everywhere() {
+    assert_eq!(s(r#""}}""#), "}");
+    assert_eq!(s(r#""{{}}""#), "{}");
+    assert_eq!(s(r#""}""#), "}");
+    assert_eq!(s(r#""{{""#), "{");
+    assert_eq!(s(r#"let n = 2; "{n} {{n}}""#), "2 {n}");
+    // and the format placeholders still are what they are
+    assert_eq!(s(r#"let n = 2; "{}" .format(n)"#), "2");
+}

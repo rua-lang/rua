@@ -98,6 +98,7 @@ pub fn install(vm: &mut Vm) {
     let t = table_lib(vm);
     vm.set_method_table(MethodTable::Table, t);
     os_io(vm);
+    fs_lib(vm);
     ffi_lib(vm);
     jit_lib(vm);
     vm.set_global("VERSION", Value::str("rua 0.1"));
@@ -682,6 +683,99 @@ fn os_io(vm: &mut Vm) {
                     Ok(_) => one(Value::str(line.trim_end_matches('\n'))),
                     Err(e) => err(format!("io::read: {e}")),
                 }
+            })),
+        ],
+    );
+}
+
+/// Files. `io` is the terminal — this is the disk.
+///
+/// Whole files rather than handles: a script reaches for a file to read it, to
+/// write it, or to walk its lines, and a handle is machinery in the way of all
+/// three. Anything that fails says what it was doing and to which path, since
+/// a script that cannot open a file wants to print that, not a number.
+fn fs_lib(vm: &mut Vm) {
+    module(
+        vm,
+        "fs",
+        vec![
+            ("read", unary("read", |p| {
+                let p = p.as_str()?;
+                match std::fs::read_to_string(&*p) {
+                    Ok(text) => Ok(Value::str(text)),
+                    Err(e) => err(format!("fs::read {p}: {e}")),
+                }
+            })),
+            ("lines", unary("lines", |p| {
+                let p = p.as_str()?;
+                match std::fs::read_to_string(&*p) {
+                    Ok(text) => {
+                        let mut t = Table::new();
+                        // a trailing newline ends the last line, it does not
+                        // start an empty one
+                        for line in text.strip_suffix('\n').unwrap_or(&text).split('\n') {
+                            t.push(Value::str(line.strip_suffix('\r').unwrap_or(line)));
+                        }
+                        if text.is_empty() {
+                            t = Table::new();
+                        }
+                        Ok(Value::table(t))
+                    }
+                    Err(e) => err(format!("fs::lines {p}: {e}")),
+                }
+            })),
+            ("write", binary("write", |p, text| {
+                let p = p.as_str()?;
+                match std::fs::write(&*p, text.to_string()) {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(e) => err(format!("fs::write {p}: {e}")),
+                }
+            })),
+            ("append", binary("append", |p, text| {
+                use std::io::Write;
+                let p = p.as_str()?;
+                let opened = std::fs::OpenOptions::new().create(true).append(true).open(&*p);
+                match opened.and_then(|mut f| f.write_all(text.to_string().as_bytes())) {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(e) => err(format!("fs::append {p}: {e}")),
+                }
+            })),
+            ("exists", unary("exists", |p| {
+                Ok(Value::Bool(std::path::Path::new(&*p.as_str()?).exists()))
+            })),
+            ("is_dir", unary("is_dir", |p| {
+                Ok(Value::Bool(std::path::Path::new(&*p.as_str()?).is_dir()))
+            })),
+            ("size", unary("size", |p| {
+                let p = p.as_str()?;
+                match std::fs::metadata(&*p) {
+                    Ok(m) => Ok(Value::Num(m.len() as f64)),
+                    Err(e) => err(format!("fs::size {p}: {e}")),
+                }
+            })),
+            ("remove", unary("remove", |p| {
+                let p = p.as_str()?;
+                match std::fs::remove_file(&*p) {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(e) => err(format!("fs::remove {p}: {e}")),
+                }
+            })),
+            ("list", unary("list", |p| {
+                let p = p.as_str()?;
+                let entries = std::fs::read_dir(&*p)
+                    .map_err(|e| Error(format!("fs::list {p}: {e}")))?;
+                let mut names: Vec<String> = Vec::new();
+                for e in entries {
+                    let e = e.map_err(|e| Error(format!("fs::list {p}: {e}")))?;
+                    names.push(e.file_name().to_string_lossy().into_owned());
+                }
+                // a directory has no order of its own; give the script one
+                names.sort();
+                let mut t = Table::new();
+                for n in names {
+                    t.push(Value::str(n));
+                }
+                Ok(Value::table(t))
             })),
         ],
     );

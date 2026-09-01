@@ -1,0 +1,149 @@
+// A JSON reader and writer, in rua.
+//
+// One honest wart: an empty object and an empty array are the same value in
+// rua, as they are in Lua, so `{}` comes back out as `[]`. Everything else
+// round trips.
+//
+// Written to find out what the language is like to use, and kept because it
+// is the thing most scripts need first. `json::parse` gives you tables and
+// strings and numbers; `json::write` gives you back text, sorted by key so
+// that the output of two runs can be compared.
+
+fn is_space(c) { c == 32 || c == 9 || c == 10 || c == 13 }
+fn is_digit(c) { c >= 48 && c <= 57 }
+
+// A parser is a cursor over the text: every step returns the value it read
+// and where it stopped.
+fn skip_space(s, i) {
+    let at = i
+    while at < s.len() && is_space(s.byte(at)) { at += 1 }
+    at
+}
+
+fn parse_string(s, i) {
+    let at = i + 1                       // past the opening quote
+    let out = ""
+    while at < s.len() {
+        let c = s.byte(at)
+        if c == 34 { return out, at + 1 }
+        if c == 92 {                     // backslash
+            let e = s.byte(at + 1)
+            if e == 110 { out += "\n" }
+            else if e == 116 { out += "\t" }
+            else if e == 114 { out += "\r" }
+            else { out += s.slice(at + 1, at + 2) }
+            at += 2
+        } else {
+            out += s.slice(at, at + 1)
+            at += 1
+        }
+    }
+    error("unterminated string")
+}
+
+fn parse_number(s, i) {
+    let at = i
+    if s.byte(at) == 45 { at += 1 }
+    while at < s.len() {
+        let c = s.byte(at)
+        if is_digit(c) || c == 46 || c == 101 || c == 69 || c == 43 || c == 45 { at += 1 }
+        else { break }
+    }
+    let text = s.slice(i, at)
+    let v = num(text)
+    if v == nil { error("not a number: " + text) }
+    return v, at
+}
+
+fn parse_value(s, i) {
+    let at = skip_space(s, i)
+    if at >= s.len() { error("unexpected end of input") }
+    let c = s.byte(at)
+    if c == 34 { return parse_string(s, at) }
+    if c == 123 { return parse_object(s, at) }
+    if c == 91 { return parse_array(s, at) }
+    if s.slice(at, at + 4) == "true" { return true, at + 4 }
+    if s.slice(at, at + 5) == "false" { return false, at + 5 }
+    if s.slice(at, at + 4) == "null" { return nil, at + 4 }
+    parse_number(s, at)
+}
+
+fn parse_array(s, i) {
+    let out = []
+    let at = skip_space(s, i + 1)
+    if s.byte(at) == 93 { return out, at + 1 }
+    while true {
+        let (v, next) = parse_value(s, at)
+        out.push(v)
+        at = skip_space(s, next)
+        let c = s.byte(at)
+        if c == 44 { at = at + 1 }
+        else if c == 93 { return out, at + 1 }
+        else { error("expected , or ] in array") }
+    }
+}
+
+fn parse_object(s, i) {
+    let out = #{}
+    let at = skip_space(s, i + 1)
+    if s.byte(at) == 125 { return out, at + 1 }
+    while true {
+        at = skip_space(s, at)
+        if s.byte(at) != 34 { error("expected a key") }
+        let (k, after_key) = parse_string(s, at)
+        at = skip_space(s, after_key)
+        if s.byte(at) != 58 { error("expected : after key") }
+        let (v, after_val) = parse_value(s, at + 1)
+        out[k] = v
+        at = skip_space(s, after_val)
+        let c = s.byte(at)
+        if c == 44 { at = at + 1 }
+        else if c == 125 { return out, at + 1 }
+        else { error("expected , or } in object") }
+    }
+}
+
+fn parse(text) {
+    let (v, at) = parse_value(text, 0)
+    let rest = skip_space(text, at)
+    if rest < text.len() { error("trailing input at byte {rest}") }
+    v
+}
+
+fn escape(s) {
+    s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t")
+}
+
+fn write_value(v, indent) {
+    let pad = " ".repeat(indent + 2)
+    let close = " ".repeat(indent)
+    let t = type(v)
+    if v == nil { return "null" }
+    if t == "boolean" { return if v { "true" } else { "false" } }
+    if t == "number" { return str(v) }
+    if t == "string" { return "\"" + escape(v) + "\"" }
+    if t != "table" { error("cannot write a " + t) }
+
+    let keys = v.keys()
+    // an array has 0..n-1 and nothing else; anything else is an object
+    if v.len() == keys.len() {
+        if v.len() == 0 { return "[]" }
+        let parts = []
+        for item in v { parts.push(pad + write_value(item, indent + 2)) }
+        return "[\n" + parts.join(",\n") + "\n" + close + "]"
+    }
+    let names = []
+    for k in keys { names.push(str(k)) }
+    names.sort()
+    let parts = []
+    for k in names { parts.push(pad + "\"" + escape(k) + "\": " + write_value(v[k], indent + 2)) }
+    "{{\n" + parts.join(",\n") + "\n" + close + "}}"
+}
+
+fn write(v) { write_value(v, 0) }
+
+// Run it on a file if this was started as a script.
+if arg.len() > 0 {
+    let text = fs::read(arg[0])
+    print(write(parse(text)))
+}

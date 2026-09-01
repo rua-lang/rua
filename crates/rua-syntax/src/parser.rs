@@ -606,7 +606,11 @@ impl Parser {
 /// `"a {x} b"` becomes `"a " + x + " b"`, and `{x:.2}` routes through
 /// `format`. `{{` and `}}` are literal braces.
 fn interpolate(text: &str, line: u32) -> PResult<Expr> {
-    if !text.contains('{') {
+    // A string with neither brace has nothing to say about either. Skipping
+    // only on `{` made `}}` mean two braces here and one in a string that
+    // happened to contain a `{` elsewhere, which is the kind of rule you meet
+    // while writing JSON out of a script.
+    if !text.contains(['{', '}']) {
         return Ok(Expr::Str(text.into()));
     }
     let mut parts: Vec<Expr> = Vec::new();
@@ -654,7 +658,11 @@ fn interpolate(text: &str, line: u32) -> PResult<Expr> {
                     }
                 }
                 if !closed {
-                    return Err(format!("line {line}: unclosed `{{` in a string"));
+                    // The most likely cause is a `{` that was meant to be a
+                    // brace rather than the start of an interpolation, which
+                    // is what writing JSON or CSS out of a script is made of.
+                    let hint = "write `{{` for a literal brace";
+                    return Err(format!("line {line}: unclosed `{{` in a string ({hint})"));
                 }
                 if !literal.is_empty() {
                     parts.push(Expr::Str(std::mem::take(&mut literal).into()));
