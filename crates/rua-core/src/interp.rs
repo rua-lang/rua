@@ -100,6 +100,8 @@ impl RtCtxHolder {
             spans: hooks.spans,
             spans_mut: hooks.spans_mut,
             note_append: hooks.note_append,
+            new_table: hooks.new_table,
+            push_table: hooks.push_table,
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
@@ -391,6 +393,7 @@ impl Vm {
             param_kinds: RefCell::new(Vec::new()),
             rt: RefCell::new(None),
             returns_nil: std::cell::Cell::new(false),
+            returns_table: std::cell::Cell::new(false),
             upvals: Rc::new(Vec::new()),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -615,6 +618,11 @@ impl Vm {
         let mut out = HashMap::new();
         for (name, slot) in &self.gnames {
             if let Value::Func(g) = &self.gvals[*slot as usize] {
+                // A direct call reads the callee's result out of the `f64` it
+                // returns, and a table does not travel there.
+                if g.returns_table.get() {
+                    continue;
+                }
                 if let Some(code) = g.jit.get() {
                     out.insert(
                         name.to_string(),
@@ -754,12 +762,24 @@ impl Vm {
         // SAFETY: this is the context built for this code, and every table it
         // wrote through is alive until this call returns.
         let mark = dirty_mark();
-        let Some(n) = (unsafe { code.call(&rt_args, ctx) }) else {
+        let Some((n, made)) = (unsafe { code.call(&rt_args, ctx) }) else {
             unsafe { settle_dirty(mark, false) };
             return false;
         };
+        // A table the call made becomes a value here, while the scratch list
+        // still holds it — settling is what lets go.
+        let v = if func.returns_table.get() {
+            if made.is_null() {
+                unsafe { settle_dirty(mark, false) };
+                return false;
+            }
+            Value::Table(unsafe { rc_of(made) })
+        } else if func.returns_nil.get() {
+            Value::Nil
+        } else {
+            Value::Num(n)
+        };
         unsafe { settle_dirty(mark, true) };
-        let v = if func.returns_nil.get() { Value::Nil } else { Value::Num(n) };
         match nres {
             0 => {}
             crate::bytecode::MULTI => {
@@ -879,6 +899,7 @@ impl Vm {
             param_kinds: RefCell::new(Vec::new()),
             rt: RefCell::new(None),
             returns_nil: std::cell::Cell::new(false),
+            returns_table: std::cell::Cell::new(false),
             upvals: Rc::new(cells),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -993,6 +1014,7 @@ impl Vm {
                 func.jit.set(Some(out.code));
                 *func.param_kinds.borrow_mut() = out.param_kinds;
                 func.returns_nil.set(out.returns_nil);
+                func.returns_table.set(out.returns_table);
                 if let Some(old) = func.rt.borrow_mut().replace(ctx) {
                     // someone else's compiled code may still call through it
                     self.retired_ctx.push(old);
@@ -1027,13 +1049,31 @@ impl Vm {
                     if let Some(rt_args) = compiled_args(&args, &func.param_kinds.borrow()) {
                         let ctx = func.rt.borrow().as_ref().map(|c| c.as_ptr());
                         if let Some(ctx) = ctx {
-                            // a trap means the compiled code met something it
-                            // does not handle; it has written nothing, so the
-                            // interpreter can simply run the call instead
+                            // A trap means the compiled code met something it
+                            // does not handle. Settling gives back everything
+                            // it wrote and everything it made, so the
+                            // interpreter can simply run the call instead.
                             // SAFETY: this is the context built for this code.
-                            if let Some(n) = unsafe { code.call(&rt_args, ctx) } {
+                            let mark = dirty_mark();
+                            let out = unsafe { code.call(&rt_args, ctx) };
+                            let v = match out {
+                                // the table it made, while the scratch list
+                                // still holds it
+                                Some((_, made)) if func.returns_table.get() => {
+                                    if made.is_null() {
+                                        None
+                                    } else {
+                                        Some(Value::Table(unsafe { rc_of(made) }))
+                                    }
+                                }
+                                Some(_) if func.returns_nil.get() => Some(Value::Nil),
+                                Some((n, _)) => Some(Value::Num(n)),
+                                None => None,
+                            };
+                            unsafe { settle_dirty(mark, v.is_some()) };
+                            if let Some(v) = v {
                                 self.recycle_vec(args);
-                                return Ok(vec![Value::Num(n)]);
+                                return Ok(vec![v]);
                             }
                         }
                     }
@@ -1294,11 +1334,12 @@ struct Dirty {
     appended_from: Option<usize>,
 }
 
-/// How much of the two scratch lists belongs to calls already under way.
-fn dirty_mark() -> (usize, usize) {
+/// How much of the three scratch lists belongs to calls already under way.
+fn dirty_mark() -> (usize, usize, usize) {
     (
         DIRTY.with(|d| d.borrow().len()),
         SPANS.with(|s| s.borrow().len()),
+        MADE.with(|m| m.borrow().len()),
     )
 }
 
@@ -1328,7 +1369,7 @@ fn note_append(t: *const RefCell<Table>, len: usize) {
 /// # Safety
 /// Every pointer recorded since `mark` still points at a live table, which
 /// holds while the call that handed it to compiled code has not returned.
-unsafe fn settle_dirty(mark: (usize, usize), keep: bool) {
+unsafe fn settle_dirty(mark: (usize, usize, usize), keep: bool) {
     // the element views this call was given die with it, and only those
     SPANS.with(|s| s.borrow_mut().truncate(mark.1));
     DIRTY.with(|d| {
@@ -1347,6 +1388,60 @@ unsafe fn settle_dirty(mark: (usize, usize), keep: bool) {
             }
         }
     });
+    // The tables this call made are the runtime's no longer. What escaped —
+    // pushed into something, or handed back — has an owner by now; what did
+    // not is dropped here, and so is everything a call that trapped made.
+    MADE.with(|m| m.borrow_mut().truncate(mark.2));
+}
+
+thread_local! {
+    /// Tables compiled code made for itself, with `let t = []`.
+    ///
+    /// Nothing else holds one until it escapes, so this list is what owns it
+    /// meanwhile — and what makes creating a table as undoable as everything
+    /// else compiled code does: a trap drops the whole lot.
+    static MADE: RefCell<Vec<Rc<RefCell<Table>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// An empty table for compiled code to fill.
+///
+/// # Safety
+/// Called only from compiled code, on the thread that entered it.
+pub unsafe extern "C" fn rua_rt_new_table() -> *mut std::ffi::c_void {
+    let t = Rc::new(RefCell::new(Table::new()));
+    let addr = Rc::as_ptr(&t) as *mut std::ffi::c_void;
+    MADE.with(|m| m.borrow_mut().push(t));
+    addr
+}
+
+/// The reference behind a table pointer compiled code holds.
+///
+/// # Safety
+/// `p` came from `Rc::as_ptr` on a table that is still alive: every table
+/// address compiled code has was handed to it by the runtime, either from a
+/// caller's argument or from `rua_rt_new_table`, and both outlive the call.
+pub(crate) unsafe fn rc_of(p: *mut std::ffi::c_void) -> Rc<RefCell<Table>> {
+    let p = p as *const RefCell<Table>;
+    Rc::increment_strong_count(p);
+    Rc::from_raw(p)
+}
+
+/// Append a table to a table, which is how a row reaches its matrix.
+///
+/// # Safety
+/// As [`rc_of`], for both pointers.
+pub unsafe extern "C" fn rua_rt_push_table(
+    t: *mut std::ffi::c_void,
+    e: *mut std::ffi::c_void,
+) {
+    debug_assert!(!t.is_null(), "compiled code pushed to a null table");
+    debug_assert!(!e.is_null(), "compiled code pushed a null table");
+    if t.is_null() || e.is_null() {
+        return;
+    }
+    let table = &*(t as *const RefCell<Table>);
+    let v = Value::Table(rc_of(e));
+    (*table.as_ptr()).push(v);
 }
 
 /// A view of a table's numbers that compiled code writes through.
@@ -1524,6 +1619,8 @@ fn hooks() -> RtHooks {
         spans: rua_rt_spans as *const () as usize,
         spans_mut: rua_rt_spans_mut as *const () as usize,
         note_append: rua_rt_note_append as *const () as usize,
+        new_table: rua_rt_new_table as *const () as usize,
+        push_table: rua_rt_push_table as *const () as usize,
     }
 }
 

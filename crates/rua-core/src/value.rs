@@ -366,6 +366,9 @@ pub struct Function {
     /// Whether the compiled entry point's result means nothing, because the
     /// function is a procedure.
     pub returns_nil: Cell<bool>,
+    /// Whether its result is a table it made, which comes back through the
+    /// entry point's out parameter rather than as the `f64`.
+    pub returns_table: Cell<bool>,
     /// Captured variables, in the order `FuncDef::upvals` describes.
     pub upvals: Rc<Vec<CellRef>>,
     pub hits: Cell<u32>,

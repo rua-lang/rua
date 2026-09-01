@@ -92,6 +92,12 @@ pub struct RtCtx {
     /// `fn(table, ok)` — this code is about to append to that table, so
     /// remember how long it was in case the call has to be undone.
     pub note_append: usize,
+    /// `fn() -> table` — an empty table for compiled code to fill. The runtime
+    /// owns it until the call ends.
+    pub new_table: usize,
+    /// `fn(table, elem)` — append a table to a table, which is how a row
+    /// reaches the matrix it belongs to.
+    pub push_table: usize,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -114,6 +120,8 @@ pub struct RtHooks {
     pub spans: usize,
     pub spans_mut: usize,
     pub note_append: usize,
+    pub new_table: usize,
+    pub push_table: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -124,6 +132,12 @@ pub enum Kind {
     Table,
     /// A table compiled code only ever appends to.
     TableOut,
+    /// A table compiled code made itself, with `let t = []`.
+    ///
+    /// It is appended to like a [`Kind::TableOut`], and it may be handed back
+    /// as the call's result. Nothing outside the call knows about it until it
+    /// escapes, which is what makes it cheap to undo: a trap drops it.
+    New,
     /// A local that only ever holds a boolean, carried as 0.0/1.0.
     Bool,
     /// A slot the region defines before it reads: whatever it holds on the way
@@ -146,8 +160,18 @@ pub enum Kind {
 /// `ok` starts at 1. Compiled code sets it to 0 and returns early when it meets
 /// something it cannot handle — a table element that is not a number, say — and
 /// the runtime then re-runs the call in the interpreter. That is sound because
-/// compiled code never writes anything.
-pub type Entry = unsafe extern "C" fn(*const RtArg, *const RtCtx, *mut i32) -> f64;
+/// everything compiled code does to a table undoes itself: writes go through a
+/// view the runtime throws away, appends are truncated back, and a table it
+/// made is dropped.
+///
+/// The fourth argument is where a function whose value is a table it made
+/// writes that table's address; every other function leaves it alone.
+pub type Entry = unsafe extern "C" fn(
+    *const RtArg,
+    *const RtCtx,
+    *mut i32,
+    *mut *mut std::ffi::c_void,
+) -> f64;
 
 #[derive(Clone, Copy)]
 pub struct JitFn {
@@ -172,15 +196,20 @@ impl JitFn {
     /// # Safety
     /// `ctx` must be the context built for this entry point, with live hook
     /// addresses and callee table.
-    pub unsafe fn call(&self, args: &[RtArg], ctx: *const RtCtx) -> Option<f64> {
+    pub unsafe fn call(
+        &self,
+        args: &[RtArg],
+        ctx: *const RtCtx,
+    ) -> Option<(f64, *mut std::ffi::c_void)> {
         let mut ok: i32 = 1;
+        let mut made: *mut std::ffi::c_void = std::ptr::null_mut();
         // SAFETY: `args` has the arity this entry point was compiled for, and
         // every table pointer in it is live for the duration of the call.
-        let out = (self.entry)(args.as_ptr(), ctx, &mut ok);
+        let out = (self.entry)(args.as_ptr(), ctx, &mut ok, &mut made);
         if ok == 0 {
             None
         } else {
-            Some(out)
+            Some((out, made))
         }
     }
 }
@@ -209,6 +238,9 @@ pub struct Compiled {
     /// The function has no value: its `f64` result is meaningless and the
     /// runtime should hand back nil, as the interpreter does.
     pub returns_nil: bool,
+    /// The function's value is a table it made: the `f64` result means
+    /// nothing and the address comes back through the out parameter.
+    pub returns_table: bool,
     /// Globals whose current value was compiled in as a direct call.
     pub inlined: Vec<String>,
     /// What each parameter has to be for the compiled code to apply.
@@ -299,7 +331,7 @@ impl Jit {
         // is both the cache key and what keeps dlopen — which caches by path —
         // honest when a function is recompiled into different code.
         let file_stem = symbol.clone();
-        let (src, inlined, param_kinds) =
+        let (src, inlined, param_kinds, returns_table) =
             self.lower_function(def, &symbol, self_ref, returns_nil)?;
 
         let addr = self.build(&file_stem, &symbol, &src, &def.name)?;
@@ -307,7 +339,7 @@ impl Jit {
         // generated just above, which has exactly the `Entry` signature.
         let entry = unsafe { std::mem::transmute::<*const (), Entry>(addr) };
         let code = JitFn { entry, arity: def.params.len() };
-        Ok(Compiled { code, inlined, param_kinds, returns_nil })
+        Ok(Compiled { code, inlined, param_kinds, returns_nil, returns_table })
     }
 
     /// Compile one hot loop into a function over its live numeric locals.
@@ -354,7 +386,7 @@ impl Jit {
         let bools = boolean_locals(&wrapper, &HashSet::new());
         let usage = table_usage(&wrapper);
         let writes = usage.traps_forbidden();
-        let mutable_views = usage.writes_tables();
+        let mutable_views = usage.writes_tables(&kinds);
         relax_checks(&mut kinds, writes);
         // in a loop there are no parameters, so nothing is stable by that route
         let stable: HashSet<u16> = HashSet::new();
@@ -377,6 +409,13 @@ impl Jit {
                 None => Kind::Num,
             })
             .collect();
+        // A table made inside the loop would have to travel back to the
+        // interpreter in a register, and the register array carries numbers
+        // and table addresses the caller already holds. The function this loop
+        // sits in is the right unit to compile for that.
+        if kind_list.contains(&Kind::New) {
+            return Err("the loop makes a table of its own".into());
+        }
         let mut cx = Ctx {
             known: slots.iter().copied().collect(),
             self_symbol: String::new(),
@@ -399,6 +438,8 @@ impl Jit {
             loop_labels: Vec::new(),
             labels: 0,
             on_trap: quote! { return; },
+            ret_slot: None,
+            returns_table: false,
         };
         // mid-loop entry: the induction variable already holds its current
         // value, so a counted loop lowers to its `while` form without the init
@@ -470,6 +511,7 @@ impl Jit {
                     rua_note_append(rt, #id, ok);
                     if *ok == 0 { return; }
                 },
+                Kind::New => unreachable!("refused above"),
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(*slot);
                     let all = if spans_used.contains(slot) {
@@ -522,7 +564,7 @@ impl Jit {
                     let i = Literal::usize_suffixed(i);
                     Some(quote! { (*regs.add(#i)).num = #id; })
                 }
-                Kind::Table | Kind::TableOut | Kind::Tables { .. } => None,
+                Kind::Table | Kind::TableOut | Kind::New | Kind::Tables { .. } => None,
             }
         });
         let preamble = preamble();
@@ -667,7 +709,7 @@ impl Jit {
         symbol: &str,
         self_ref: SelfRef,
         returns_nil: bool,
-    ) -> Lower<(String, Vec<String>, Vec<Kind>)> {
+    ) -> Lower<(String, Vec<String>, Vec<Kind>, bool)> {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
         }
@@ -679,7 +721,7 @@ impl Jit {
         );
         let usage = table_usage(&def.body);
         let writes = usage.traps_forbidden();
-        let mutable_views = usage.writes_tables();
+        let mutable_views = usage.writes_tables(&kinds);
         relax_checks(&mut kinds, writes);
         // Only parameters may be tables — except an element of an array of
         // arrays, which is a local by construction: `let b = bodies[i]`.
@@ -696,6 +738,30 @@ impl Jit {
             .iter()
             .map(|b| kinds.get(&b.slot).copied().unwrap_or(Kind::Num))
             .collect();
+        // A parameter arrives from the interpreter, so it is never a table
+        // this code made; a slot that says both is one the compiler reused.
+        if param_kinds.contains(&Kind::New) {
+            return Err("a parameter shares a slot with a table made here".into());
+        }
+        // `fn matrix(n) { let m = []; ..; m }`: the value is a table this code
+        // made. It leaves through the out parameter rather than as the `f64`,
+        // which is why every exit has to agree — one path handing back a
+        // number and another a table is two different results in one `f64`.
+        let last_return = match def.body.stats.last() {
+            Some(Stat::Return(es)) => match &es[..] {
+                [Expr::Local(b, _)] => Some(b.slot),
+                _ => None,
+            },
+            _ => None,
+        };
+        let candidate = match def.body.tail.as_deref() {
+            Some(Expr::Local(b, _)) => Some(b.slot),
+            Some(_) => None,
+            None => last_return,
+        };
+        let ret_slot = candidate.filter(|slot| {
+            kinds.get(slot) == Some(&Kind::New) && returns_only(&def.body, *slot)
+        });
         let stable: HashSet<u16> = def
             .param_bindings
             .iter()
@@ -724,6 +790,8 @@ impl Jit {
             loop_labels: Vec::new(),
             labels: 0,
             on_trap: quote! { return 0.0; },
+            ret_slot,
+            returns_table: ret_slot.is_some(),
         };
         let body = if returns_nil {
             let inner = cx.block(&def.body, false)?;
@@ -744,6 +812,7 @@ impl Jit {
                     rua_note_append(rt, #id, ok);
                     if *ok == 0 { return 0.0; }
                 },
+                Kind::New => unreachable!("refused above"),
                 // An array of arrays arrives as an address and a length: the
                 // views of its elements are fetched where they are bound,
                 // which is once per element rather than once per access.
@@ -795,6 +864,27 @@ impl Jit {
             .hoisted
             .iter()
             .map(|(slot, bound)| {
+                // An element of an array of arrays has no length until the
+                // body binds it, so the demand is made of every element at
+                // once, out of the views fetched on the way in. That is one
+                // walk of the array against one loop bound — `for k in 0..n`
+                // reading `a[i][k]` — and it makes every read in the body free.
+                if let Some(outer) = cx.inner_of.get(slot).copied() {
+                    let (sp, spn) = spans_idents(outer);
+                    return quote! {
+                        {
+                            let __need = (#bound).ceil();
+                            let mut __at = 0usize;
+                            while __at < #spn {
+                                if __need > ((*#sp.add(__at)).len as f64) {
+                                    *ok = 0;
+                                    return 0.0;
+                                }
+                                __at += 1;
+                            }
+                        }
+                    };
+                }
                 let (_, len) = span_idents(*slot);
                 quote! {
                     if (#bound).ceil() > (#len as f64) {
@@ -811,13 +901,15 @@ impl Jit {
 
             /// # Safety
             /// `args` points at one `RtArg` per parameter, `rt` at the context
-            /// built for this function, and `ok` at an `i32` that starts
-            /// non-zero.
+            /// built for this function, `ok` at an `i32` that starts non-zero,
+            /// and `__ret` at a table pointer this code writes only if its
+            /// value is a table it made.
             #[no_mangle]
             pub unsafe extern "C" fn #name(
                 args: *const RtArg,
                 rt: *const RtCtx,
                 ok: *mut i32,
+                __ret: *mut *mut c_void,
             ) -> f64 {
                 // Recursion here is real machine recursion, so it has to
                 // respect the interpreter's limit rather than run the process
@@ -843,7 +935,7 @@ impl Jit {
             syn::parse2(file).map_err(|e| format!("generated Rust did not parse: {e}"))?;
         let src = prettyplease::unparse(&parsed);
         let src = self.splice_inlined(src, symbol, &cx.to_inline, hooks)?;
-        Ok((src, cx.inlined, param_kinds))
+        Ok((src, cx.inlined, param_kinds, ret_slot.is_some()))
     }
 }
 
@@ -872,7 +964,7 @@ impl Jit {
                 hooks,
             };
             let returns_nil = d.body.tail.is_none() && !ends_with_return;
-            let (callee_src, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
+            let (callee_src, _, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
             extra.push_str(item_of(&callee_src, &sym));
         }
         let at = item_start(&src, symbol);
@@ -1048,6 +1140,12 @@ struct Kinds {
 fn infer_kinds(b: &Block, callees: &Callees) -> Result<Kinds, String> {
     let mut kinds = HashMap::new();
     let mut bad = None;
+    // A table this code makes for itself is settled before the walk, so that
+    // every later mention of that local reads as the table it is rather than
+    // as the number a bare name would otherwise be taken for.
+    for slot in made_tables(b) {
+        kinds.insert(slot, Kind::New);
+    }
     // `let b = t[i]` says nothing on its own: `b` is a number if it is used as
     // one and an inner table if it is indexed, and which it is decides whether
     // `t` is a flat table or an array of arrays. So the walk records the link
@@ -1099,6 +1197,244 @@ fn infer_kinds(b: &Block, callees: &Callees) -> Result<Kinds, String> {
     match bad {
         Some(why) => Err(why),
         None => Ok(Kinds { kinds, inner_of }),
+    }
+}
+
+/// Slots bound by `let t = []`: the tables compiled code makes for itself.
+///
+/// Only where that binding is the one thing that ever defines the slot. The
+/// compiler reuses a register once its scope closes, so the same slot can be a
+/// loop counter above and a table below; which it is depends on where you
+/// stand, and a kind does not. A slot shared that way is left alone, and the
+/// function is refused for the same reason it was before.
+fn made_tables(b: &Block) -> HashSet<u16> {
+    let mut out = HashSet::new();
+    made_block(b, &mut out);
+    let mut defs: HashMap<u16, usize> = HashMap::new();
+    def_block(b, &mut defs);
+    out.retain(|slot| defs.get(slot) == Some(&1));
+    out
+}
+
+fn made_block(b: &Block, out: &mut HashSet<u16>) {
+    for st in &b.stats {
+        made_stat(st, out);
+    }
+    if let Some(t) = &b.tail {
+        made_expr(t, out);
+    }
+}
+
+fn made_stat(st: &Stat, out: &mut HashSet<u16>) {
+    match st {
+        Stat::LetSlots(bs, es) => {
+            if let ([b], [Expr::Array(_)]) = (&bs[..], &es[..]) {
+                out.insert(b.slot);
+            }
+            es.iter().for_each(|e| made_expr(e, out));
+        }
+        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| made_expr(e, out)),
+        Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => made_expr(e, out),
+        Stat::Assign(ts, es) => ts.iter().chain(es).for_each(|e| made_expr(e, out)),
+        Stat::OpAssign(t, _, e) => {
+            made_expr(t, out);
+            made_expr(e, out);
+        }
+        Stat::While(_, c, b) => {
+            made_expr(c, out);
+            made_block(b, out);
+        }
+        Stat::Loop(_, b) => made_block(b, out),
+        Stat::ForRange { start, end, body, .. } => {
+            made_expr(start, out);
+            made_expr(end, out);
+            made_block(body, out);
+        }
+        Stat::ForIn { iter, body, .. } => {
+            made_expr(iter, out);
+            made_block(body, out);
+        }
+        Stat::Break | Stat::Continue => {}
+    }
+}
+
+fn made_expr(e: &Expr, out: &mut HashSet<u16>) {
+    match e {
+        Expr::Do(b) => made_block(b, out),
+        Expr::If(arms, els) => {
+            for (_, b) in arms {
+                made_block(b, out);
+            }
+            if let Some(b) = els {
+                made_block(b, out);
+            }
+        }
+        Expr::Match(_, arms) => arms.iter().for_each(|a| made_block(&a.body, out)),
+        _ => {}
+    }
+}
+
+/// How many places define each slot: bindings of every sort, and assignments.
+fn def_block(b: &Block, out: &mut HashMap<u16, usize>) {
+    for st in &b.stats {
+        def_stat(st, out);
+    }
+    if let Some(t) = &b.tail {
+        def_expr(t, out);
+    }
+}
+
+fn def_one(slot: u16, out: &mut HashMap<u16, usize>) {
+    *out.entry(slot).or_insert(0) += 1;
+}
+
+fn def_target(e: &Expr, out: &mut HashMap<u16, usize>) {
+    if let Expr::Local(b, _) = e {
+        def_one(b.slot, out);
+    } else {
+        def_expr(e, out);
+    }
+}
+
+fn def_stat(st: &Stat, out: &mut HashMap<u16, usize>) {
+    match st {
+        Stat::LetSlots(bs, es) => {
+            bs.iter().for_each(|b| def_one(b.slot, out));
+            es.iter().for_each(|e| def_expr(e, out));
+        }
+        Stat::FnSlot(b, e) => {
+            def_one(b.slot, out);
+            def_expr(e, out);
+        }
+        Stat::Let(_, es) | Stat::Return(es) => es.iter().for_each(|e| def_expr(e, out)),
+        Stat::FnDecl(_, e) | Stat::Expr(e) => def_expr(e, out),
+        Stat::Assign(ts, es) => {
+            ts.iter().for_each(|t| def_target(t, out));
+            es.iter().for_each(|e| def_expr(e, out));
+        }
+        Stat::OpAssign(t, _, e) => {
+            def_target(t, out);
+            def_expr(e, out);
+        }
+        Stat::While(_, c, b) => {
+            def_expr(c, out);
+            def_block(b, out);
+        }
+        Stat::Loop(_, b) => def_block(b, out),
+        Stat::ForRange { binding, start, end, body, .. } => {
+            if let Some(b) = binding {
+                def_one(b.slot, out);
+            }
+            def_expr(start, out);
+            def_expr(end, out);
+            def_block(body, out);
+        }
+        Stat::ForIn { bindings, iter, body, .. } => {
+            bindings.iter().for_each(|b| def_one(b.slot, out));
+            def_expr(iter, out);
+            def_block(body, out);
+        }
+        Stat::Break | Stat::Continue => {}
+    }
+}
+
+fn def_expr(e: &Expr, out: &mut HashMap<u16, usize>) {
+    match e {
+        Expr::Do(b) => def_block(b, out),
+        Expr::If(arms, els) => {
+            for (c, b) in arms {
+                def_expr(c, out);
+                def_block(b, out);
+            }
+            if let Some(b) = els {
+                def_block(b, out);
+            }
+        }
+        Expr::Match(subject, arms) => {
+            def_expr(subject, out);
+            for a in arms {
+                for pat in &a.patterns {
+                    if let Pattern::Bind(_, Some(b)) = pat {
+                        def_one(b.slot, out);
+                    }
+                }
+                def_block(&a.body, out);
+            }
+        }
+        Expr::Index(a, b) | Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
+            def_expr(a, out);
+            def_expr(b, out);
+        }
+        Expr::Un(_, a) => def_expr(a, out),
+        Expr::Call(f, args) => {
+            def_expr(f, out);
+            args.iter().for_each(|a| def_expr(a, out));
+        }
+        Expr::Method(o, _, args) => {
+            def_expr(o, out);
+            args.iter().for_each(|a| def_expr(a, out));
+        }
+        Expr::Array(items) => items.iter().for_each(|i| def_expr(i, out)),
+        Expr::Map(items) => items.iter().for_each(|(k, v)| {
+            def_expr(k, out);
+            def_expr(v, out);
+        }),
+        _ => {}
+    }
+}
+
+/// Does every `return` in this body hand back the same local?
+///
+/// A table leaves through the out parameter and a number through the `f64`, so
+/// a function cannot do both. Once one exit hands back a made table, they all
+/// have to.
+fn returns_only(b: &Block, slot: u16) -> bool {
+    let mut all = true;
+    ret_block(b, slot, &mut all);
+    all
+}
+
+fn ret_block(b: &Block, slot: u16, all: &mut bool) {
+    for st in &b.stats {
+        ret_stat(st, slot, all);
+    }
+    if let Some(t) = &b.tail {
+        ret_expr(t, slot, all);
+    }
+}
+
+fn ret_stat(st: &Stat, slot: u16, all: &mut bool) {
+    match st {
+        Stat::Return(es) => {
+            let good = matches!(&es[..], [Expr::Local(b, _)] if b.slot == slot);
+            if !good {
+                *all = false;
+            }
+        }
+        Stat::While(_, c, b) => {
+            ret_expr(c, slot, all);
+            ret_block(b, slot, all);
+        }
+        Stat::Loop(_, b) => ret_block(b, slot, all),
+        Stat::ForRange { body, .. } | Stat::ForIn { body, .. } => ret_block(body, slot, all),
+        Stat::Expr(e) | Stat::FnDecl(_, e) | Stat::FnSlot(_, e) => ret_expr(e, slot, all),
+        _ => {}
+    }
+}
+
+fn ret_expr(e: &Expr, slot: u16, all: &mut bool) {
+    match e {
+        Expr::Do(b) => ret_block(b, slot, all),
+        Expr::If(arms, els) => {
+            for (_, b) in arms {
+                ret_block(b, slot, all);
+            }
+            if let Some(b) = els {
+                ret_block(b, slot, all);
+            }
+        }
+        Expr::Match(_, arms) => arms.iter().for_each(|a| ret_block(&a.body, slot, all)),
+        _ => {}
     }
 }
 
@@ -1423,6 +1759,12 @@ fn note_const_index(what: (u16, bool), key: &Expr, longest: &mut HashMap<(u16, b
 }
 
 fn note(slot: u16, kind: Kind, kinds: &mut HashMap<u16, Kind>, bad: &mut Option<String>) {
+    // A table this code made is appended to like any other output table, and
+    // named like any other local where it is handed back. Neither reading
+    // contradicts what `let t = []` already settled about the slot.
+    if kinds.get(&slot) == Some(&Kind::New) && matches!(kind, Kind::Num | Kind::TableOut) {
+        return;
+    }
     match kinds.insert(slot, kind) {
         Some(old) if old != kind => {
             *bad = Some(format!("slot {slot} is used as both {old:?} and {kind:?}"))
@@ -1862,6 +2204,8 @@ fn preamble() -> TokenStream {
             pub spans: usize,
             pub spans_mut: usize,
             pub note_append: usize,
+            pub new_table: usize,
+            pub push_table: usize,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -1914,6 +2258,26 @@ fn preamble() -> TokenStream {
             let f: unsafe extern "C" fn(*mut c_void, *mut i32) =
                 std::mem::transmute((*rt).note_append as *const ());
             f(t, ok)
+        }
+
+        /// # Safety
+        /// `rt` is the context we were called with. The table it hands back is
+        /// the runtime's until this call ends.
+        #[inline(always)]
+        unsafe fn rua_new_table(rt: *const RtCtx) -> *mut c_void {
+            let f: unsafe extern "C" fn() -> *mut c_void =
+                std::mem::transmute((*rt).new_table as *const ());
+            f()
+        }
+
+        /// # Safety
+        /// `t` and `e` are live table pointers, and `e` is one this code was
+        /// given or made.
+        #[inline(always)]
+        unsafe fn rua_push_table(rt: *const RtCtx, t: *mut c_void, e: *mut c_void) {
+            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute((*rt).push_table as *const ());
+            f(t, e)
         }
 
         /// # Safety
@@ -2088,6 +2452,12 @@ struct Ctx {
     /// How to leave this entry point when a table read traps. Functions return
     /// a number; loops return nothing.
     on_trap: TokenStream,
+    /// The slot holding the table this function's last expression hands back,
+    /// taken by the outermost block so that no nested one claims it.
+    ret_slot: Option<u16>,
+    /// Whether this function's value is a table at all. A recursive call
+    /// cannot read one out of an `f64`, so it is refused.
+    returns_table: bool,
 }
 
 /// Does any path in this block return a value? A procedure may contain bare
@@ -2161,10 +2531,14 @@ impl TableUse {
         false
     }
 
-    /// Does this code write to a table at all? Those it writes are handed to
-    /// it as writable views.
-    fn writes_tables(&self) -> bool {
-        !self.written.is_empty()
+    /// Does this code write *through a view*? Only a table it reads that way
+    /// can be. One it appends to — an output, or one it made — is written
+    /// through the runtime, which is why filling a fresh table leaves the
+    /// tables this code reads alone.
+    fn writes_tables(&self, kinds: &HashMap<u16, Kind>) -> bool {
+        self.written
+            .iter()
+            .any(|s| !matches!(kinds.get(s), Some(Kind::TableOut) | Some(Kind::New)))
     }
 }
 
@@ -2396,11 +2770,21 @@ impl Ctx {
         // register: the compiler reuses a register for a flag in one block and
         // a number in another, and both are correct where they stand.
         let saved_bools = self.bools.clone();
+        // Only the function's own block hands its value back through the out
+        // parameter; taking the slot here means a nested block cannot claim it
+        // and write a table where a number was wanted.
+        let ret_here = self.ret_slot.take();
         let mut out = TokenStream::new();
         for st in &b.stats {
             out.extend(self.stat(st)?);
         }
-        let tail = match (&b.tail, want_value) {
+        let tail = match (b.tail.as_deref(), want_value) {
+            // `fn matrix(n) { .. m }`: the table's address leaves through
+            // `__ret`, and the `f64` the caller sees means nothing.
+            (Some(Expr::Local(b, _)), true) if ret_here == Some(b.slot) => {
+                let id = ident(b.slot);
+                quote! { { unsafe { *__ret = #id; } 0.0 } }
+            }
             (Some(e), true) => {
                 let v = self.expr(e)?;
                 quote! { #v }
@@ -2485,6 +2869,35 @@ impl Ctx {
                         unsafe { *ok = 0; }
                         #trap
                     }
+                }
+            }
+            // `let t = []`: a table this code makes for itself. The runtime
+            // owns it until the call ends and then either hands it on — it was
+            // pushed into something, or handed back — or drops it, which is
+            // also how a trap undoes it.
+            Stat::LetSlots(bindings, exprs)
+                if bindings.len() == 1
+                    && exprs.len() == 1
+                    && self.kind_of(bindings[0].slot) == Kind::New
+                    && matches!(exprs.first(), Some(Expr::Array(_))) =>
+            {
+                let b = bindings[0];
+                if b.cell {
+                    return Err("a table made here is captured by a closure".into());
+                }
+                let Some(Expr::Array(items)) = exprs.first() else {
+                    return Err("a table literal with no items".into());
+                };
+                let id = ident(b.slot);
+                let mut fill = TokenStream::new();
+                for it in items {
+                    let v = self.expr(it)?;
+                    fill.extend(quote! { unsafe { rua_push(rt, #id, #v) }; });
+                }
+                self.known.insert(b.slot);
+                quote! {
+                    let #id: *mut c_void = unsafe { rua_new_table(rt) };
+                    #fill
                 }
             }
             Stat::LetSlots(bindings, exprs) => {
@@ -2622,6 +3035,20 @@ impl Ctx {
                     BinOp::Rem => quote! { #id = rua_rem(#id, #v); },
                     _ => return Err("unsupported compound assignment".into()),
                 }
+            }
+            // `return m` where `m` is a table this code made: the same exit
+            // as the tail expression, from the middle of the body.
+            Stat::Return(exprs)
+                if self.returns_table
+                    && matches!(exprs.first(), Some(Expr::Local(b, _))
+                        if self.kind_of(b.slot) == Kind::New && self.known.contains(&b.slot))
+                    && exprs.len() == 1 =>
+            {
+                let Some(Expr::Local(b, _)) = exprs.first() else {
+                    return Err("a return of something other than a local".into());
+                };
+                let id = ident(b.slot);
+                quote! { unsafe { *__ret = #id; } return 0.0; }
             }
             Stat::Return(exprs) => match exprs.len() {
                 // fine in a procedure, which the caller turns back into nil
@@ -2891,6 +3318,12 @@ impl Ctx {
                 if self.bools.contains(&b.slot) {
                     return Err(format!("`{name}` holds a boolean, used as a number"));
                 }
+                // A table's local holds an address, not an `f64`. Saying so
+                // here turns what would be a type error in the generated Rust
+                // into a refusal with a reason.
+                if !matches!(self.kind_of(b.slot), Kind::Num | Kind::Bool | Kind::Dead) {
+                    return Err(format!("`{name}` holds a table, used as a number"));
+                }
                 let id = ident(b.slot);
                 quote! { #id }
             }
@@ -3037,6 +3470,31 @@ impl Ctx {
                             }
                         }
                     },
+                    // A row goes into its matrix by address: the runtime turns
+                    // that back into a reference the table can own.
+                    ("push", 1)
+                        if matches!(&args[0], Expr::Local(b, _)
+                            if !matches!(
+                                self.kind_of(b.slot),
+                                Kind::Num | Kind::Bool | Kind::Dead
+                            )) =>
+                    {
+                        let Expr::Local(b, name) = &args[0] else {
+                            return Err("a push of something other than a local".into());
+                        };
+                        if b.cell || !self.known.contains(&b.slot) {
+                            return Err(format!("`{name}` is captured or declared outside"));
+                        }
+                        // An element of an array of arrays is held as a view of
+                        // its numbers, not as an address, so there is nothing
+                        // to hand the runtime here.
+                        if self.inner_of.contains_key(&b.slot) {
+                            return Err(format!("`{name}` is an element read through a view"));
+                        }
+                        let id = ident(slot);
+                        let elem = ident(b.slot);
+                        quote! { { unsafe { rua_push_table(rt, #id, #elem) }; 0.0 } }
+                    }
                     ("push", 1) => {
                         let id = ident(slot);
                         let v = self.expr(&args[0])?;
@@ -3091,7 +3549,10 @@ impl Ctx {
         matches!(e, Expr::Local(b, _)
             if matches!(
                 self.kinds.get(&b.slot),
-                Some(Kind::Table) | Some(Kind::TableOut) | Some(Kind::Tables { .. })
+                Some(Kind::Table)
+                    | Some(Kind::TableOut)
+                    | Some(Kind::New)
+                    | Some(Kind::Tables { .. })
             ))
     }
 
@@ -3250,6 +3711,11 @@ impl Ctx {
             Expr::Global(name, _) => self.self_ref.global.as_deref() == Some(&**name),
             _ => false,
         };
+        // A recursive call reads its result out of the `f64`, which a table
+        // does not travel in.
+        if is_self && self.returns_table {
+            return Err("a recursive call to a function that hands back a table".into());
+        }
         if is_self && args.len() == self.arity {
             let sym = format_ident!("{}", self.self_symbol);
             // A table passes to the recursive call the way it does to any
@@ -3279,7 +3745,7 @@ impl Ctx {
             return Ok(quote! {
                 {
                     let __args = [#(#cells),*];
-                    let __r = unsafe { #sym(__args.as_ptr(), rt, ok) };
+                    let __r = unsafe { #sym(__args.as_ptr(), rt, ok, std::ptr::null_mut()) };
                     if unsafe { *ok } == 0 { #trap }
                     __r
                 }
@@ -3309,7 +3775,9 @@ impl Ctx {
                                 let __args = [
                                     #(RtArg { num: #a, table: std::ptr::null_mut() }),*
                                 ];
-                                let __r = unsafe { #sym(__args.as_ptr(), rt, ok) };
+                                let __r = unsafe {
+                                    #sym(__args.as_ptr(), rt, ok, std::ptr::null_mut())
+                                };
                                 if unsafe { *ok } == 0 { #trap }
                                 __r
                             }
@@ -3372,7 +3840,7 @@ impl Ctx {
                             },
                             // a flag is never a parameter, so a call never
                             // passes one
-                            Kind::Bool | Kind::Dead | Kind::TableOut => {
+                            Kind::Bool | Kind::Dead | Kind::TableOut | Kind::New => {
                                 ok = false;
                                 break;
                             }
@@ -3398,9 +3866,12 @@ impl Ctx {
                                     *const RtArg,
                                     *const RtCtx,
                                     *mut i32,
+                                    *mut *mut c_void,
                                 ) -> f64 = unsafe { std::mem::transmute(__c.entry as *const ()) };
                                 let __args = [#(#cells),*];
-                                let __r = unsafe { __f(__args.as_ptr(), __c.ctx, ok) };
+                                let __r = unsafe {
+                                    __f(__args.as_ptr(), __c.ctx, ok, std::ptr::null_mut())
+                                };
                                 if unsafe { *ok } == 0 { #trap }
                                 __r
                             }
@@ -3436,6 +3907,11 @@ impl Ctx {
 /// value, since an inlined call is an expression.
 fn worth_inlining(def: &FuncDef) -> bool {
     if !called_globals(def).is_empty() || def.params.len() > 4 {
+        return false;
+    }
+    // A callee that makes a table may hand one back, and an inlined call reads
+    // its result out of the `f64`.
+    if !made_tables(&def.body).is_empty() {
         return false;
     }
     if def.param_bindings.iter().any(|b| b.cell) {
