@@ -98,6 +98,17 @@ pub struct RtCtx {
     /// `fn(table, elem)` — append a table to a table, which is how a row
     /// reaches the matrix it belongs to.
     pub push_table: usize,
+    /// `fn(table, key, ok) -> table` — the table at `t.name`, or null when the
+    /// field is nil. A field holding anything else traps: compiled code has
+    /// nowhere to put a string or a closure.
+    pub field: usize,
+    /// `fn(table, key, value)` — write a table, or nil for a null, into a
+    /// string-keyed field. Only ever called on a table this code made, so a
+    /// trap undoes it by dropping the table.
+    pub set_field: usize,
+    /// The field names this code uses, in the order it refers to them. The
+    /// runtime owns the strings; compiled code only passes the handles back.
+    pub keys: *const *const std::ffi::c_void,
     /// The functions this one calls directly, in the order it refers to them.
     pub callees: *const Callee,
     /// The interpreter's call depth counter, which compiled code keeps up to
@@ -122,6 +133,8 @@ pub struct RtHooks {
     pub note_append: usize,
     pub new_table: usize,
     pub push_table: usize,
+    pub field: usize,
+    pub set_field: usize,
 }
 
 /// What a slot holds, as far as compiled code is concerned.
@@ -153,6 +166,12 @@ pub enum Kind {
     /// safely, so it checks as it goes and the walk is skipped — which matters
     /// when the compiled code is an inner loop entered thousands of times.
     Tables { checked: bool, min: u32 },
+    /// A table this code reaches by name — `node.l` — and never by index.
+    ///
+    /// It arrives as an address and nothing else: no view of an array part is
+    /// fetched, because none is read. Nil travels as a null address, so the
+    /// same kind covers the end of a chain of them.
+    Fields,
 }
 
 /// A compiled entry point: arguments in, one number out.
@@ -245,6 +264,8 @@ pub struct Compiled {
     pub inlined: Vec<String>,
     /// What each parameter has to be for the compiled code to apply.
     pub param_kinds: Vec<Kind>,
+    /// The field names the code reaches by, in callee-table order.
+    pub keys: Vec<String>,
 }
 
 pub struct Jit {
@@ -331,7 +352,7 @@ impl Jit {
         // is both the cache key and what keeps dlopen — which caches by path —
         // honest when a function is recompiled into different code.
         let file_stem = symbol.clone();
-        let (src, inlined, param_kinds, returns_table) =
+        let (src, inlined, keys, param_kinds, returns_table) =
             self.lower_function(def, &symbol, self_ref, returns_nil)?;
 
         let addr = self.build(&file_stem, &symbol, &src, &def.name)?;
@@ -339,7 +360,7 @@ impl Jit {
         // generated just above, which has exactly the `Entry` signature.
         let entry = unsafe { std::mem::transmute::<*const (), Entry>(addr) };
         let code = JitFn { entry, arity: def.params.len() };
-        Ok(Compiled { code, inlined, param_kinds, returns_nil, returns_table })
+        Ok(Compiled { code, inlined, keys, param_kinds, returns_nil, returns_table })
     }
 
     /// Compile one hot loop into a function over its live numeric locals.
@@ -427,6 +448,7 @@ impl Jit {
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
             self_param_kinds: Vec::new(),
+            keys: Vec::new(),
             writes,
             mutable_views: mutable_views.clone(),
             bools,
@@ -517,6 +539,9 @@ impl Jit {
                     if *ok == 0 { return; }
                 },
                 Kind::New => unreachable!("refused above"),
+                Kind::Fields => quote! {
+                    let #id: *mut c_void = (*regs.add(#idx)).table;
+                },
                 Kind::Tables { .. } => {
                     let (_, len) = span_idents(*slot);
                     let all = if spans_used.contains(slot) {
@@ -587,7 +612,7 @@ impl Jit {
                     let i = Literal::usize_suffixed(i);
                     Some(quote! { (*regs.add(#i)).num = #id; })
                 }
-                Kind::Table | Kind::TableOut | Kind::New | Kind::Tables { .. } => None,
+                Kind::Table | Kind::TableOut | Kind::New | Kind::Tables { .. } | Kind::Fields => None,
             }
         });
         let preamble = preamble();
@@ -617,7 +642,7 @@ impl Jit {
         let code = self.build(&symbol, &symbol, &src, "a hot loop")?;
         // SAFETY: `build` returned the address of the `extern "C"` symbol above.
         let code: LoopFn = unsafe { std::mem::transmute::<*const (), LoopFn>(code) };
-        Ok(CompiledLoop { code, slots, kinds: kind_list, inlined: cx.inlined })
+        Ok(CompiledLoop { code, slots, kinds: kind_list, inlined: cx.inlined, keys: cx.keys })
     }
 
     /// Keep the on-disk cache from growing without limit.
@@ -733,7 +758,7 @@ impl Jit {
         symbol: &str,
         self_ref: SelfRef,
         returns_nil: bool,
-    ) -> Lower<(String, Vec<String>, Vec<Kind>, bool)> {
+    ) -> Lower<(String, Vec<String>, Vec<String>, Vec<Kind>, bool)> {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
         }
@@ -786,6 +811,12 @@ impl Jit {
         let ret_slot = candidate.filter(|slot| {
             kinds.get(slot) == Some(&Kind::New) && returns_only(&def.body, *slot)
         });
+        // `fn make(d) { if .. { return #{..} } #{..} }`: the value is a table
+        // built where it is handed back, so there is no slot to name. Every
+        // exit has to agree, as it does for one that names a local.
+        let hands_back_map = ret_slot.is_none()
+            && matches!(def.body.tail.as_deref(), Some(Expr::Map(_)))
+            && every_return_is_map(&def.body);
         let stable: HashSet<u16> = def
             .param_bindings
             .iter()
@@ -799,6 +830,7 @@ impl Jit {
             arity: def.params.len(),
             inlined: Vec::new(),
             self_param_kinds: param_kinds.clone(),
+            keys: Vec::new(),
             writes,
             mutable_views: mutable_views.clone(),
             bools,
@@ -816,7 +848,7 @@ impl Jit {
             labels: 0,
             on_trap: quote! { return 0.0; },
             ret_slot,
-            returns_table: ret_slot.is_some(),
+            returns_table: ret_slot.is_some() || hands_back_map,
         };
         let body = if returns_nil {
             let inner = cx.block(&def.body, false)?;
@@ -838,6 +870,11 @@ impl Jit {
                     if *ok == 0 { return 0.0; }
                 },
                 Kind::New => unreachable!("refused above"),
+                // Reached by name only, so there is no view to fetch: the
+                // address is the whole of it.
+                Kind::Fields => quote! {
+                    let #id: *mut c_void = (*args.add(#idx)).table;
+                },
                 // An array of arrays arrives as an address and a length: the
                 // views of its elements are fetched where they are bound,
                 // which is once per element rather than once per access.
@@ -986,7 +1023,7 @@ impl Jit {
             syn::parse2(file).map_err(|e| format!("generated Rust did not parse: {e}"))?;
         let src = prettyplease::unparse(&parsed);
         let src = self.splice_inlined(src, symbol, &cx.to_inline, hooks)?;
-        Ok((src, cx.inlined, param_kinds, ret_slot.is_some()))
+        Ok((src, cx.inlined, cx.keys, param_kinds, ret_slot.is_some() || hands_back_map))
     }
 }
 
@@ -1015,13 +1052,42 @@ impl Jit {
                 hooks,
             };
             let returns_nil = d.body.tail.is_none() && !ends_with_return;
-            let (callee_src, _, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
+            let (callee_src, _, _, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
             extra.push_str(item_of(&callee_src, &sym));
         }
         let at = item_start(&src, symbol);
         src.insert_str(at, &extra);
         Ok(src)
     }
+}
+
+/// Does every `return` in this body hand back a map literal?
+///
+/// A function whose value is a table it built has to do that on every path:
+/// one exit handing back a number and another a table is two different results
+/// in one `f64`.
+fn every_return_is_map(b: &Block) -> bool {
+    fn stat_ok(st: &Stat) -> bool {
+        match st {
+            Stat::Return(es) => matches!(&es[..], [Expr::Map(_)]),
+            Stat::While(_, _, body) | Stat::Loop(_, body) => every_return_is_map(body),
+            Stat::ForRange { body, .. } | Stat::ForIn { body, .. } => every_return_is_map(body),
+            Stat::Expr(e) | Stat::FnDecl(_, e) | Stat::FnSlot(_, e) => expr_ok(e),
+            _ => true,
+        }
+    }
+    fn expr_ok(e: &Expr) -> bool {
+        match e {
+            Expr::If(arms, els) => {
+                arms.iter().all(|(c, b)| expr_ok(c) && every_return_is_map(b))
+                    && els.as_ref().is_none_or(every_return_is_map)
+            }
+            Expr::Do(b) => every_return_is_map(b),
+            Expr::Match(_, arms) => arms.iter().all(|a| every_return_is_map(&a.body)),
+            _ => true,
+        }
+    }
+    b.stats.iter().all(stat_ok) && b.tail.as_deref().is_none_or(expr_ok)
 }
 
 /// Where a generated file's entry point begins, attribute and all.
@@ -1071,6 +1137,8 @@ pub struct CompiledLoop {
     pub kinds: Vec<Kind>,
     /// Globals it calls directly, in callee-table order.
     pub inlined: Vec<String>,
+    /// Field names it reaches by, in the order the code refers to them.
+    pub keys: Vec<String>,
 }
 
 /// The globals this function calls. The runtime uses this to compile callees
@@ -1932,6 +2000,11 @@ fn kinds_expr(
         // `t[i]` and `t.len()` are what make a slot a table
         Expr::Index(obj, key) => {
             match &**obj {
+                // `node.l` — reached by name, so it is a table of fields and
+                // there is no array part to measure
+                Expr::Local(b, _) if matches!(&**key, Expr::Str(_)) => {
+                    note(b.slot, Kind::Fields, kinds, bad);
+                }
                 Expr::Local(b, _) => {
                     note(b.slot, Kind::Table, kinds, bad);
                     note_const_index((b.slot, false), key, longest);
@@ -2257,6 +2330,9 @@ fn preamble() -> TokenStream {
             pub note_append: usize,
             pub new_table: usize,
             pub push_table: usize,
+            pub field: usize,
+            pub set_field: usize,
+            pub keys: *const *const c_void,
             pub callees: *const Callee,
             pub depth: *mut i64,
             pub max_depth: i64,
@@ -2369,6 +2445,35 @@ fn preamble() -> TokenStream {
             let f: unsafe extern "C" fn(*mut c_void, *mut c_void) =
                 std::mem::transmute((*rt).push_table as *const ());
             f(t, e)
+        }
+
+        /// # Safety
+        /// `t` is a live table pointer and `k` a handle from this code's own
+        /// context, which owns the name it points at.
+        #[inline(always)]
+        unsafe fn rua_field(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            k: *const c_void,
+            ok: *mut i32,
+        ) -> *mut c_void {
+            let f: unsafe extern "C" fn(*mut c_void, *const c_void, *mut i32) -> *mut c_void =
+                std::mem::transmute((*rt).field as *const ());
+            f(t, k, ok)
+        }
+
+        /// # Safety
+        /// As `rua_field`, and `t` is a table this code made.
+        #[inline(always)]
+        unsafe fn rua_set_field(
+            rt: *const RtCtx,
+            t: *mut c_void,
+            k: *const c_void,
+            v: *mut c_void,
+        ) {
+            let f: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) =
+                std::mem::transmute((*rt).set_field as *const ());
+            f(t, k, v)
         }
 
         /// # Safety
@@ -2512,6 +2617,9 @@ struct Ctx {
     self_ref: SelfRef,
     /// Globals compiled in as direct calls.
     inlined: Vec<String>,
+    /// Field names this code reaches by, in the order the generated source
+    /// refers to them. The runtime interns them and hands back handles.
+    keys: Vec<String>,
     arity: usize,
     /// Whether every parameter of this function is a number, which is what a
     /// direct self call is able to pass.
@@ -2919,6 +3027,11 @@ impl Ctx {
                 let id = ident(b.slot);
                 quote! { { unsafe { *__ret = #id; } 0.0 } }
             }
+            // the same exit, for a function whose value is the table itself
+            (Some(e), true) if self.returns_table && ret_here.is_none() => {
+                let v = self.node_expr(e)?;
+                quote! { { unsafe { *__ret = #v; } 0.0 } }
+            }
             (Some(e), true) => {
                 let v = self.expr(e)?;
                 quote! { #v }
@@ -3186,6 +3299,11 @@ impl Ctx {
                 let id = ident(b.slot);
                 quote! { unsafe { *__ret = #id; } return 0.0; }
             }
+            // `return #{ .. }`: the table leaves the same way the tail's does
+            Stat::Return(exprs) if self.returns_table && exprs.len() == 1 => {
+                let v = self.node_expr(&exprs[0])?;
+                quote! { unsafe { *__ret = #v; } return 0.0; }
+            }
             Stat::Return(exprs) => match exprs.len() {
                 // fine in a procedure, which the caller turns back into nil
                 0 => quote! { return 0.0; },
@@ -3414,6 +3532,24 @@ impl Ctx {
                 Ok(quote! { #lit })
             }
             Expr::Bin(op, a, b) => {
+                // `node.l == nil` — the end of a chain of tables. Nil is a
+                // null address here, so the test is on the address and the
+                // field is never fetched as a number.
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    let nil_side = match (&**a, &**b) {
+                        (Expr::Nil, other) | (other, Expr::Nil) => Some(other),
+                        _ => None,
+                    };
+                    if let Some(other) = nil_side {
+                        let p = self.node_expr(other)?;
+                        let test = if *op == BinOp::Eq {
+                            quote! { .is_null() }
+                        } else {
+                            quote! { .is_null() == false }
+                        };
+                        return Ok(quote! { ({ #p } #test) });
+                    }
+                }
                 if let Some(o) = cmp_op(*op) {
                     let (l, r) = (self.expr(a)?, self.expr(b)?);
                     return Ok(quote! { (#l #o #r) });
@@ -3436,6 +3572,130 @@ impl Ctx {
             }
             _ => Err("a condition that is not provably a boolean".into()),
         }
+    }
+
+    /// The handle for a field name, interned once by the runtime and reached
+    /// by index from the generated code.
+    fn key_index(&mut self, name: &str) -> usize {
+        if let Some(i) = self.keys.iter().position(|k| k == name) {
+            return i;
+        }
+        self.keys.push(name.to_string());
+        self.keys.len() - 1
+    }
+
+    /// Lower an expression whose value is a table, or nil.
+    ///
+    /// These do not travel in the `f64` everything else does: they are
+    /// addresses, and nil is a null one. That is what lets compiled code walk
+    /// a tree of tables — `node.l` to the end of a branch — and build one.
+    fn node_expr(&mut self, e: &Expr) -> Lower<TokenStream> {
+        Ok(match e {
+            Expr::Nil => quote! { std::ptr::null_mut::<c_void>() },
+            Expr::Local(b, name) => {
+                if b.cell || !self.known.contains(&b.slot) {
+                    return Err(format!("`{name}` is captured or declared outside this function"));
+                }
+                match self.kind_of(b.slot) {
+                    Kind::Fields | Kind::New => {
+                        let id = ident(b.slot);
+                        quote! { #id }
+                    }
+                    _ => return Err(format!("`{name}` does not hold a table")),
+                }
+            }
+            // `node.l` — a field holding a table, or nil at the end of a chain
+            Expr::Index(obj, key) => {
+                let Expr::Str(name) = &**key else {
+                    return Err("a table reached by a name that is not constant".into());
+                };
+                let base = self.node_expr(obj)?;
+                let k = self.key_handle(name);
+                let trap = self.on_trap.clone();
+                quote! {
+                    {
+                        let __o = #base;
+                        if __o.is_null() { #trap }
+                        let __f = unsafe { rua_field(rt, __o, #k, ok) };
+                        if unsafe { *ok } == 0 { #trap }
+                        __f
+                    }
+                }
+            }
+            // `#{ l: .., r: .. }` — a table this code made, filled in by name
+            Expr::Map(entries) => {
+                let mut sets = Vec::with_capacity(entries.len());
+                for (key, val) in entries {
+                    let Expr::Str(name) = key else {
+                        return Err("a field name that is not constant".into());
+                    };
+                    let k = self.key_handle(name);
+                    let v = self.node_expr(val)?;
+                    sets.push(quote! {
+                        let __v = #v;
+                        unsafe { rua_set_field(rt, __t, #k, __v) };
+                    });
+                }
+                quote! {
+                    {
+                        let __t = unsafe { rua_new_table(rt) };
+                        #({ #sets })*
+                        __t
+                    }
+                }
+            }
+            Expr::Call(f, args) => self.node_call(f, args)?,
+            _ => return Err("a table that is not a field, a call or a map".into()),
+        })
+    }
+
+    /// A call whose value is a table it made.
+    ///
+    /// Only the function's own, for now: another compiled function's result
+    /// comes back through an out parameter this code would have to know the
+    /// shape of, and a recursive one is what builds a tree.
+    fn node_call(&mut self, f: &Expr, args: &[Expr]) -> Lower<TokenStream> {
+        let is_self = match f {
+            Expr::Upval(i, _) => Some(*i) == self.self_ref.upval,
+            Expr::Global(name, _) => self.self_ref.global.as_deref() == Some(&**name),
+            _ => false,
+        };
+        if !is_self || !self.returns_table || args.len() != self.arity {
+            return Err("a call that hands back a table other than this one".into());
+        }
+        let kinds = self.self_param_kinds.clone();
+        let mut cells = Vec::with_capacity(args.len());
+        for (a, kind) in args.iter().zip(&kinds) {
+            match kind {
+                Kind::Num => {
+                    let v = self.expr(a)?;
+                    cells.push(quote! { RtArg { num: #v, table: std::ptr::null_mut() } });
+                }
+                Kind::Fields => {
+                    let p = self.node_expr(a)?;
+                    cells.push(quote! { RtArg { num: 0.0, table: #p } });
+                }
+                _ => return Err("a table argument to a call that hands one back".into()),
+            }
+        }
+        let sym = format_ident!("{}", self.self_symbol);
+        let trap = self.on_trap.clone();
+        self.calls = true;
+        Ok(quote! {
+            {
+                let __args = [#(#cells),*];
+                let mut __made: *mut c_void = std::ptr::null_mut();
+                let _ = unsafe { #sym(__args.as_ptr(), rt, ok, &mut __made) };
+                if unsafe { *ok } == 0 { #trap }
+                __made
+            }
+        })
+    }
+
+    /// The expression that fetches one field name's handle.
+    fn key_handle(&mut self, name: &str) -> TokenStream {
+        let i = Literal::usize_suffixed(self.key_index(name));
+        quote! { unsafe { *(*rt).keys.add(#i) } }
     }
 
     fn expr(&mut self, e: &Expr) -> Lower<TokenStream> {
@@ -3880,6 +4140,13 @@ impl Ctx {
                         let v = self.expr(a)?;
                         cells.push(quote! { RtArg { num: #v, table: std::ptr::null_mut() } });
                     }
+                    // a table reached by name is an address, so any expression
+                    // that produces one will do — `check(node.l)` is how a walk
+                    // over a tree recurses
+                    Kind::Fields => {
+                        let p = self.node_expr(a)?;
+                        cells.push(quote! { RtArg { num: 0.0, table: #p } });
+                    }
                     _ => match a {
                         Expr::Local(b, _)
                             if self.kind_of(b.slot) == *kind && self.known.contains(&b.slot) =>
@@ -3970,6 +4237,15 @@ impl Ctx {
                                     cells.push(quote! { RtArg { num: 0.0, table: #id } });
                                 }
                                 _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            },
+                            // a table reached by name may be any expression
+                            // that produces one, since it is only an address
+                            Kind::Fields => match self.node_expr(a) {
+                                Ok(p) => cells.push(quote! { RtArg { num: 0.0, table: #p } }),
+                                Err(_) => {
                                     ok = false;
                                     break;
                                 }

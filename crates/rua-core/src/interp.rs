@@ -80,14 +80,30 @@ pub struct RtCtxHolder {
     ctx: Box<RtCtx>,
     #[allow(dead_code)]
     callees: Box<[Callee]>,
+    /// The field names compiled code reaches by. It holds handles into this,
+    /// so the strings have to outlive the code and never move.
+    #[allow(dead_code)]
+    keys: Box<[RStr]>,
+    #[allow(dead_code)]
+    key_ptrs: Box<[*const std::ffi::c_void]>,
     /// Kept alive because the context points at its interior.
     #[allow(dead_code)]
     depth: Rc<std::cell::Cell<i64>>,
 }
 
 impl RtCtxHolder {
-    fn new(hooks: RtHooks, callees: Vec<Callee>, depth: Rc<std::cell::Cell<i64>>) -> RtCtxHolder {
+    fn new(
+        hooks: RtHooks,
+        callees: Vec<Callee>,
+        keys: Vec<RStr>,
+        depth: Rc<std::cell::Cell<i64>>,
+    ) -> RtCtxHolder {
         let callees = callees.into_boxed_slice();
+        let keys = keys.into_boxed_slice();
+        let key_ptrs: Box<[*const std::ffi::c_void]> = keys
+            .iter()
+            .map(|k| k as *const RStr as *const std::ffi::c_void)
+            .collect();
         let ctx = Box::new(RtCtx {
             len: hooks.len,
             get: hooks.get,
@@ -102,12 +118,15 @@ impl RtCtxHolder {
             note_append: hooks.note_append,
             new_table: hooks.new_table,
             push_table: hooks.push_table,
+            field: hooks.field,
+            set_field: hooks.set_field,
+            keys: key_ptrs.as_ptr(),
             callees: callees.as_ptr(),
             // `Cell<i64>` is a transparent wrapper, so this is the counter
             depth: depth.as_ptr(),
             max_depth: MAX_DEPTH,
         });
-        RtCtxHolder { ctx, callees, depth }
+        RtCtxHolder { ctx, callees, keys, key_ptrs, depth }
     }
 
     fn as_ptr(&self) -> *const RtCtx {
@@ -607,7 +626,7 @@ impl Vm {
             let req = self.self_ref_for_loop();
             match self.jit.compile_loop(st, req) {
                 Ok(compiled) => {
-                    let ctx = self.build_ctx(&compiled.inlined);
+                    let ctx = self.build_ctx(&compiled.inlined, &compiled.keys);
                     for name in &compiled.inlined {
                         if let Some(slot) = self.gnames.get(name.as_str()).copied() {
                             self.loop_deps.entry(slot).or_default().push(id);
@@ -679,7 +698,7 @@ impl Vm {
 
     /// Build the context a piece of compiled code runs with: the runtime hook
     /// addresses, and the entry points of the functions it calls directly.
-    fn build_ctx(&self, inlined: &[String]) -> RtCtxHolder {
+    fn build_ctx(&self, inlined: &[String], keys: &[String]) -> RtCtxHolder {
         let callees: Vec<Callee> = inlined
             .iter()
             .map(|name| match self.get_global(name) {
@@ -693,7 +712,8 @@ impl Vm {
                 _ => Callee { entry: 0, ctx: std::ptr::null() },
             })
             .collect();
-        RtCtxHolder::new(hooks(), callees, self.depth.clone())
+        let keys: Vec<RStr> = keys.iter().map(|k| RStr::new(k)).collect();
+        RtCtxHolder::new(hooks(), callees, keys, self.depth.clone())
     }
 
     /// Globals that already hold compiled code, with what their parameters
@@ -1123,7 +1143,7 @@ impl Vm {
         let req = SelfRef { upval, global, compiled_globals, hooks: hooks() };
         match self.jit.compile(func.def(), req) {
             Ok(out) => {
-                let ctx = self.build_ctx(&out.inlined);
+                let ctx = self.build_ctx(&out.inlined, &out.keys);
                 func.jit.set(Some(out.code));
                 *func.param_kinds.borrow_mut() = out.param_kinds;
                 func.returns_nil.set(out.returns_nil);
@@ -1564,6 +1584,59 @@ pub unsafe extern "C" fn rua_rt_push_table(
     (*table.as_ptr()).push(v);
 }
 
+/// The table at `t.name`, as an address.
+///
+/// A field holding nil answers null, which is what lets compiled code walk to
+/// the end of a chain of them. Anything else — a number, a string, a closure —
+/// traps: compiled code has nowhere to put it.
+///
+/// # Safety
+/// As [`rc_of`] for `t`, and `key` is one of the handles the runtime put in
+/// this code's context, which owns the string it points at.
+pub unsafe extern "C" fn rua_rt_field(
+    t: *mut std::ffi::c_void,
+    key: *const std::ffi::c_void,
+    ok: *mut i32,
+) -> *mut std::ffi::c_void {
+    debug_assert!(!t.is_null(), "compiled code read a field of a null table");
+    if t.is_null() || key.is_null() {
+        *ok = 0;
+        return std::ptr::null_mut();
+    }
+    let table = &*(t as *const RefCell<Table>);
+    let name = &*(key as *const RStr);
+    match (*table.as_ptr()).get_field(name) {
+        Value::Table(inner) => Rc::as_ptr(&inner) as *mut std::ffi::c_void,
+        Value::Nil => std::ptr::null_mut(),
+        _ => {
+            *ok = 0;
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Write a table, or nil for a null, into `t.name`.
+///
+/// Only ever called on a table the compiled code made, so there is nothing to
+/// undo: a call that traps drops the table and everything it holds.
+///
+/// # Safety
+/// As [`rua_rt_field`], for both addresses.
+pub unsafe extern "C" fn rua_rt_set_field(
+    t: *mut std::ffi::c_void,
+    key: *const std::ffi::c_void,
+    v: *mut std::ffi::c_void,
+) {
+    debug_assert!(!t.is_null(), "compiled code wrote a field of a null table");
+    if t.is_null() || key.is_null() {
+        return;
+    }
+    let table = &*(t as *const RefCell<Table>);
+    let name = &*(key as *const RStr);
+    let value = if v.is_null() { Value::Nil } else { Value::Table(rc_of(v)) };
+    (*table.as_ptr()).set_field(name, &value);
+}
+
 /// A view of a table's numbers that compiled code writes through.
 ///
 /// # Safety
@@ -1750,6 +1823,8 @@ fn hooks() -> RtHooks {
         note_append: rua_rt_note_append as *const () as usize,
         new_table: rua_rt_new_table as *const () as usize,
         push_table: rua_rt_push_table as *const () as usize,
+        field: rua_rt_field as *const () as usize,
+        set_field: rua_rt_set_field as *const () as usize,
     }
 }
 
@@ -1776,6 +1851,12 @@ fn rt_arg(v: &Value, kind: &Kind) -> Option<RtArg> {
         // the compiled code defines this slot before it reads it, so what the
         // register holds now is nobody's business
         (_, Kind::Dead) => RtArg::num(0.0),
+        // A table compiled code reaches by name. It reads fields and never
+        // writes them — only tables it made itself are written — so there is
+        // no view to go stale and nothing to undo.
+        (Value::Table(t), Kind::Fields) => RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void),
+        // the end of a chain of them travels as a null address
+        (Value::Nil, Kind::Fields) => RtArg::table(std::ptr::null_mut()),
         (Value::Table(t), Kind::Table | Kind::TableOut) => {
             RtArg::table(Rc::as_ptr(t) as *mut std::ffi::c_void)
         }

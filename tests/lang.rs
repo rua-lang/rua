@@ -201,6 +201,97 @@ fn jit_handles_recursion_loops_and_math() {
 }
 
 /// Non-numeric functions must stay on the interpreter, silently.
+/// A tree of tables, built and walked by compiled code.
+///
+/// This is the shape binarytrees has: a function whose value is a table it
+/// built by name, and one that walks to the end of a chain of them. Neither
+/// travels in the `f64` everything else does, so both go through the address
+/// path — and the answer has to be the interpreter's either way.
+#[test]
+fn jit_builds_and_walks_a_tree_of_tables() {
+    let src = r#"
+        fn make(depth) {
+            if depth == 0 { return #{ l: nil, r: nil } }
+            #{ l: make(depth - 1), r: make(depth - 1) }
+        }
+        fn check(node) {
+            if node.l == nil { return 1 }
+            1 + check(node.l) + check(node.r)
+        }
+        let total = 0
+        for i in 0..40 { total += check(make(8)) }
+        total
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let a = interp.eval(src).unwrap()[0].as_num().unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    let b = jitted.eval(src).unwrap()[0].as_num().unwrap();
+
+    assert_eq!(a, b, "compiled and interpreted trees disagree");
+    assert_eq!(a, 40.0 * 511.0, "eight levels is 511 nodes");
+    assert!(jitted.jit.compiled >= 2, "make and check should both compile");
+}
+
+/// A field holding something that is not a table stops compiled code, which
+/// has nowhere to put a string. The call then runs in the interpreter, and the
+/// answer is the same one — the point of the trap is that it is invisible.
+#[test]
+fn jit_traps_on_a_field_that_is_not_a_table() {
+    let src = r#"
+        fn walk(node) {
+            if node.l == nil { return 1 }
+            1 + walk(node.l)
+        }
+        fn chain(n) {
+            if n == 0 { return #{ l: nil } }
+            #{ l: chain(n - 1) }
+        }
+        let warm = 0
+        for i in 0..40 { warm += walk(chain(4)) }
+        // the same walk, over a chain that ends in a string instead of nil
+        let odd = #{ l: #{ l: "not a table" } }
+        return warm, walk(odd);
+    "#;
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    let out = jitted.eval(src).unwrap();
+    assert_eq!(out[0].as_num().unwrap(), 40.0 * 5.0, "the warm-up compiled");
+
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let same = interp.eval(src).unwrap();
+    // the trap is meant to be invisible: the walk that met a string is
+    // finished by the interpreter, and answers what it would have anyway
+    assert_eq!(out[1].as_num().unwrap(), same[1].as_num().unwrap());
+    assert_eq!(out[1].as_num().unwrap(), 3.0);
+}
+
+/// The tables a trapping call made are dropped, and the tree it did build is
+/// a real one: reachable by name from the interpreter, with the right shape.
+#[test]
+fn a_tree_compiled_code_made_is_an_ordinary_table() {
+    let src = r#"
+        fn make(depth) {
+            if depth == 0 { return #{ l: nil, r: nil } }
+            #{ l: make(depth - 1), r: make(depth - 1) }
+        }
+        let t = nil
+        for i in 0..40 { t = make(3) }
+        return type(t), type(t.l), type(t.l.r), t.l.r.l.l, type(t.l.r.l);
+    "#;
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm.eval(src).unwrap();
+    assert_eq!(out[0].to_string(), "table");
+    assert_eq!(out[1].to_string(), "table");
+    assert_eq!(out[2].to_string(), "table", "two levels down is still a table");
+    assert_eq!(out[3].to_string(), "nil", "the fourth level is where it ends");
+    assert_eq!(out[4].to_string(), "table");
+}
+
 #[test]
 fn jit_bails_out_without_breaking_anything() {
     let mut vm = Vm::new();
