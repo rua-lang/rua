@@ -713,6 +713,22 @@ fn os_io(vm: &mut Vm) {
                 let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
                 one(Value::Num(t as f64))
             })),
+            // `let (code, out, err) = os::run("ls -l")`
+            ("run", native("run", |_vm, args| {
+                let cmd = str_arg(args, 0)?;
+                // through a shell, because the whole point is to write what
+                // you would have typed
+                let shell = if cfg!(windows) { "cmd" } else { "sh" };
+                let flag = if cfg!(windows) { "/C" } else { "-c" };
+                match std::process::Command::new(shell).arg(flag).arg(&*cmd).output() {
+                    Ok(out) => Ok(vec![
+                        Value::Num(out.status.code().unwrap_or(-1) as f64),
+                        Value::str(String::from_utf8_lossy(&out.stdout)),
+                        Value::str(String::from_utf8_lossy(&out.stderr)),
+                    ]),
+                    Err(e) => err(format!("os::run {cmd}: {e}")),
+                }
+            })),
             ("getenv", native("getenv", |_vm, args| {
                 one(match std::env::var(&*str_arg(args, 0)?) {
                     Ok(v) => Value::str(v),
@@ -734,6 +750,14 @@ fn os_io(vm: &mut Vm) {
                 print!("{}", s.concat());
                 let _ = std::io::stdout().flush();
                 Ok(Vec::new())
+            })),
+            ("read_all", native("read_all", |_vm, _args| {
+                use std::io::Read;
+                let mut text = String::new();
+                match std::io::stdin().read_to_string(&mut text) {
+                    Ok(_) => one(Value::str(text)),
+                    Err(e) => err(format!("io::read_all: {e}")),
+                }
             })),
             ("read", native("read", |_vm, _args| {
                 let mut line = String::new();

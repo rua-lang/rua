@@ -1468,3 +1468,24 @@ fn a_library_is_found_beside_the_script_that_requires_it() {
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(out[0].to_string(), "hi there");
 }
+
+/// A script that cannot run another program cannot glue anything together,
+/// which is most of what scripts are for. The exit status is a value, not an
+/// error, because a command that fails is often the answer.
+#[test]
+fn a_script_can_run_a_command() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let (code, said, complained) = os::run("echo out; echo err >&2")
+        let (bad, _, _) = os::run("exit 3")
+        return code, said.trim(), complained.trim(), bad;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 0.0);
+    assert_eq!(out[1].to_string(), "out");
+    assert_eq!(out[2].to_string(), "err");
+    assert_eq!(out[3].as_num().unwrap(), 3.0, "a failure is a status, not a throw");
+}

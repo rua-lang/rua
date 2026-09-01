@@ -136,6 +136,49 @@ Absent on purpose: static types, traits, borrow checking, destructuring
 patterns beyond `let (a, b)`, integer/float distinction, string patterns,
 coroutines. This is a scripting language that reads like Rust, not Rust.
 
+## The standard library
+
+Enough to write something real, and no more than that.
+
+```rust
+// files: whole ones, because that is what a script wants
+let text = fs::read("notes.md")
+for line in fs::lines("notes.md") { print(line) }
+fs::write("out.json", body)
+fs::append("log.txt", "done\n")
+if fs::exists(p) && !fs::is_dir(p) { print(fs::size(p)) }
+for name in fs::list(".") { }                  // sorted, so runs compare
+
+// sockets: TCP, both ends
+let s = net::connect("example.com:80")
+net::timeout(s, 10)                            // a read that waits forever hangs forever
+net::write(s, "GET / HTTP/1.0\r\n\r\n")
+print(net::read_line(s))                       // or net::read(s) for the rest
+net::close(s)
+
+let srv = net::listen("127.0.0.1:8080")        // port 0 asks for a free one
+let c = net::accept(srv)                       // blocks
+
+// running things, and the terminal
+let (code, out, err) = os::run("git rev-parse HEAD")
+let all = io::read_all()                       // stdin, for the end of a pipe
+io::write("no newline")
+
+// and a library beside your script
+let json = require("json")                     // finds json.rua next to the file
+print(json::write(json::parse(text)))          // `::` reaches a field, `.` calls a method
+```
+
+A socket is a number the runtime owns rather than an object, since there is no
+type here to hang one on: closing it is explicit, and a handle that has been
+closed is an error rather than somebody else's connection. There is no TLS, so
+`https` is out — the runtime has no crypto and pretending otherwise would be
+worse than saying so.
+
+`examples/json.rua` is a JSON reader and writer written in rua, and
+`examples/http.rua` is an HTTP client and a static file server, also in rua.
+Both exist because writing them is how the gaps above were found.
+
 ## The JIT
 
 Three things get compiled, all of them through `rustc`:
