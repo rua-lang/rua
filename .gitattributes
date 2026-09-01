@@ -1,0 +1,7 @@
+# GitHub highlights through Linguist, which carries its own grammars — a
+# grammar in this repository is not something it will read, and a new language
+# is only added there once it is in wide use. rua is Rust-shaped on purpose,
+# so borrowing Rust's colours is close to right: `fn`, `let`, `match`, `//`
+# and the string rules all land. What it gets wrong is `#{`, `::` on a module
+# and the `{}` inside strings.
+*.rua linguist-language=Rust
