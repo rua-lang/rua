@@ -724,7 +724,14 @@ impl Vm {
     /// caller now.
     pub(crate) fn close_frame_from(&mut self, base: usize, from: usize) {
         for slot in &mut self.stack[from.max(base)..self.top] {
-            Value::put(slot, Value::Nil);
+            // A frame is sized for the widest path through it and most calls
+            // take a narrow one, so most of the window being released is
+            // already nil — it was left that way by whoever released it last.
+            // Testing for that is a load and a branch; writing over it is a
+            // load, a branch and two stores.
+            if !matches!(slot, Value::Nil) {
+                Value::put(slot, Value::Nil);
+            }
         }
         self.top = base;
     }
@@ -899,8 +906,26 @@ impl Vm {
         }
     }
 
-    pub(crate) fn global_at(&self, slot: u32) -> Value {
-        self.gvals[slot as usize].clone()
+    /// A resolved global, without taking a reference count on it. The pointer
+    /// is only good until the next write to the global table, which is why the
+    /// callers of this read through it and let go.
+    #[inline]
+    pub(crate) fn global_ptr(&self, slot: u32) -> *const Value {
+        debug_assert!((slot as usize) < self.gvals.len());
+        // SAFETY: as in `global_resolved`.
+        unsafe { self.gvals.as_ptr().add(slot as usize) }
+    }
+
+    /// The same, for a slot that has already been resolved.
+    ///
+    /// Slots are handed out from `gvals`'s length and the table never shrinks,
+    /// so a slot that once existed still does: the bounds check is a load and
+    /// a branch on the hottest instruction in most programs.
+    #[inline]
+    pub(crate) fn global_resolved(&self, slot: u32) -> Value {
+        debug_assert!((slot as usize) < self.gvals.len());
+        // SAFETY: as above.
+        unsafe { self.gvals.get_unchecked(slot as usize).clone() }
     }
 
     pub(crate) fn store_global(&mut self, slot: u32, v: Value) {

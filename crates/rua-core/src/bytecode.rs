@@ -89,10 +89,19 @@ pub enum Op {
     ForLoop { counter: Reg, limit: Reg, to: u32, id: u32, hint: u16, le: bool },
 
     /// Callee at `base`, arguments at `base+1..base+1+nargs`. Results land at
-    /// `base`; `nres` of them, or all of them when it is [`MULTI`].
-    Call { base: Reg, nargs: u16, nres: u16 },
+    /// `dst`; `nres` of them, or all of them when it is [`MULTI`].
+    ///
+    /// `dst` is `base` except when a single result is on its way to a named
+    /// local, which is what `let x = f(y)` is: the call writes it there
+    /// directly rather than into the frame's scratch and out again.
+    Call { base: Reg, nargs: u16, nres: u16, dst: Reg },
+    /// A call to a global by name: `f(x)` where `f` is not a local. The
+    /// callee is nearly always a top-level function, and loading it into a
+    /// register first cost an instruction of its own, a register write and
+    /// the release of whatever that register held.
+    CallGlobal { base: Reg, g: u16, nargs: u16, nres: u16, dst: Reg },
     /// `obj.m(..)`: the receiver is at `base+1` and becomes the first argument.
-    Method { base: Reg, name: u16, nargs: u16, nres: u16 },
+    Method { base: Reg, name: u16, nargs: u16, nres: u16, dst: Reg },
     /// A call whose last argument was itself a call: the fixed arguments are
     /// followed by every value that call produced, as in `print(f())`.
     CallSpread { base: Reg, nargs: u16, nres: u16, method: u16 },
@@ -151,6 +160,10 @@ pub struct Proto {
     pub caches: Vec<Cell<u32>>,
     /// Parameters, in order, with the register each lands in.
     pub params: Vec<ParamSlot>,
+    /// No parameter is captured by a closure. A call that also passes at least
+    /// as many arguments as there are parameters then needs no binding pass at
+    /// all: the arguments are already in the registers the parameters name.
+    pub plain_params: bool,
 }
 
 #[derive(Debug)]

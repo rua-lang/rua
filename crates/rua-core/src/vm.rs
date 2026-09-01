@@ -234,6 +234,44 @@ impl Vm {
                 code = proto.code.as_ptr();
             }};
         }
+        // A loop's back edge can hand the loop to compiled code, which may
+        // grow the stack — but it cannot change which function is running, so
+        // the tables that belong to the proto stay where they are. This is on
+        // the path of every single iteration of every loop.
+        macro_rules! resync_regs {
+            () => {{
+                regs = unsafe { self.stack.as_mut_ptr().add(self.base) };
+            }};
+        }
+        // The tables an instruction reaches into by an index the compiler
+        // emitted against this very proto: constants, the per-instruction line
+        // table, the field caches, the loop counters. The bounds check on each
+        // of those can only ever pass, and it costs a length load and a branch
+        // on more than a third of the instructions in a program.
+        //
+        // The table pointers are *not* hoisted into locals across the loop:
+        // one more live value in `run_frames` competes for a register in every
+        // arithmetic handler, and a numeric loop that never looks at a
+        // constant then pays for it on every iteration. Holding them that way
+        // measured three per cent worse on matmul.
+        macro_rules! konst {
+            ($k:expr) => {
+                // SAFETY: as above.
+                unsafe { &*proto.consts.as_ptr().add($k as usize) }
+            };
+        }
+        macro_rules! line_at {
+            ($pc:expr) => {
+                // SAFETY: one line per instruction, and `pc` is one.
+                unsafe { *proto.lines.as_ptr().add($pc) }
+            };
+        }
+        macro_rules! hint_at {
+            ($h:expr) => {
+                // SAFETY: one counter per loop, allotted by the compiler.
+                unsafe { &*proto.hints.as_ptr().add($h as usize) }
+            };
+        }
         macro_rules! at {
             ($r:expr) => {
                 // SAFETY: the compiler sizes every frame to `n_regs` and never
@@ -264,7 +302,7 @@ impl Vm {
             pc += 1;
             match op {
                 Op::Const { dst, k } => {
-                    let v = proto.consts[k as usize].clone();
+                    let v = konst!(k).clone();
                     set!(dst, v);
                 }
                 Op::Nil { dst } => set!(dst, Value::Nil),
@@ -273,8 +311,17 @@ impl Vm {
                     set!(dst, v);
                 }
                 Op::GetGlobal { dst, g } => {
-                    let slot = self.global_ref(proto, g);
-                    let v = self.global_at(slot);
+                    // Reading a global is a load and a clone once its slot is
+                    // known; the slot is resolved on first touch and never
+                    // moves, so the hit is a `Cell` read and a compare and the
+                    // resolver stays out of line.
+                    // SAFETY: `g` indexes this proto's own global table.
+                    let entry = unsafe { &*proto.globals.as_ptr().add(g as usize) };
+                    let slot = match entry.slot.get() {
+                        u32::MAX => self.global_ref(proto, g),
+                        slot => slot,
+                    };
+                    let v = self.global_resolved(slot);
                     set!(dst, v);
                 }
                 Op::SetGlobal { g, src } => {
@@ -322,7 +369,7 @@ impl Vm {
                 }
                 Op::BinK { kind, dst, a, k } => {
                     let x = at!(a);
-                    let v = match (x, &proto.consts[k as usize]) {
+                    let v = match (x, konst!(k)) {
                         (Value::Num(x), Value::Num(y)) => num_op(kind, *x, *y),
                         (x, y) => match crate::interp::equality(kind, x, y) {
                             Some(b) => Value::Bool(b),
@@ -371,7 +418,7 @@ impl Vm {
                     set!(dst, v);
                 }
                 Op::AddK { dst, a, k } => {
-                    let v = match (at!(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), konst!(k)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                         (x, y) => {
                             arith(BinKind::Add, x, y).map_err(|e| self.at(proto, pc, e))?
@@ -380,7 +427,7 @@ impl Vm {
                     set!(dst, v);
                 }
                 Op::SubK { dst, a, k } => {
-                    let v = match (at!(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), konst!(k)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x - y),
                         (x, y) => {
                             arith(BinKind::Sub, x, y).map_err(|e| self.at(proto, pc, e))?
@@ -389,7 +436,7 @@ impl Vm {
                     set!(dst, v);
                 }
                 Op::MulK { dst, a, k } => {
-                    let v = match (at!(a), &proto.consts[k as usize]) {
+                    let v = match (at!(a), konst!(k)) {
                         (Value::Num(x), Value::Num(y)) => Value::Num(x * y),
                         (x, y) => {
                             arith(BinKind::Mul, x, y).map_err(|e| self.at(proto, pc, e))?
@@ -417,15 +464,16 @@ impl Vm {
                         pc = to as usize;
                     }
                 }
-                Op::Call { base, nargs, nres } => {
-                    self.set_line(proto.lines[pc - 1]);
+                Op::Call { base, nargs, nres, dst } => {
+                    self.set_line(line_at!(pc - 1));
                     // The callee register is dead once the call is under way
                     // — the results land on top of it — so the handle is moved
                     // out rather than copied: no reference count on the way in
                     // and none on the way out.
                     match unsafe { std::mem::take(&mut *regs.add(base as usize)) } {
                         Value::Func(f) => {
-                            match self.enter_frame(f, base, nargs, nres, &mut current, pc, frames)
+                            match self
+                                .enter_frame(f, base, nargs, nres, dst, &mut current, pc, frames)
                             {
                                 Err(e) => return Err(self.here(proto, pc, e)),
                                 Ok(true) => {
@@ -439,31 +487,136 @@ impl Vm {
                             }
                         }
                         callee => {
-                            self.dispatch(&callee, base, nargs, nres)
+                            self.dispatch(&callee, base, nargs, nres, dst)
                                 .map_err(|e| self.here(proto, pc, e))?;
                             resync!();
                         }
                     }
                 }
-                Op::Method { base, name, nargs, nres } => {
-                    self.set_line(proto.lines[pc - 1]);
-                    // The receiver stays in its register — it is the first
-                    // argument — and looking a method up only reads it, so it
-                    // is borrowed rather than counted in and out again.
-                    let recv = at!(base + 1);
-                    // the name is a constant of this function: borrow it
-                    let m = match &proto.consts[name as usize] {
-                        Value::Str(s) => self.method(recv, s),
-                        other => self.method(recv, &RStr::from(other.to_string())),
+                Op::CallGlobal { base, g, nargs, nres, dst } => {
+                    self.set_line(line_at!(pc - 1));
+                    // SAFETY: `g` indexes this proto's own global table.
+                    let entry = unsafe { &*proto.globals.as_ptr().add(g as usize) };
+                    let slot = match entry.slot.get() {
+                        u32::MAX => self.global_ref(proto, g),
+                        slot => slot,
+                    };
+                    // A builtin of one argument is most of what a call to a
+                    // global that is not a rua function is — `type(x)`,
+                    // `num(s)` — and going through `dispatch` for it costs a
+                    // call, a reference count on the callee and a second look
+                    // at the register the argument is in.
+                    //
+                    // SAFETY: the global table's buffer is a separate
+                    // allocation from the VM and from the value stack, and a
+                    // `fast1` builtin is handed nothing it could reach either
+                    // through: it takes one `&Value` and cannot call back in.
+                    // So nothing here can move the table or run rua code while
+                    // this borrow is live.
+                    if let Value::Native(n) = unsafe { &*self.global_ptr(slot) } {
+                        if nres <= 1 && nargs == 1 {
+                            if let Some(fast) = &n.fast1 {
+                                let v =
+                                    fast(at!(base + 1)).map_err(|e| self.at(proto, pc, e))?;
+                                if nres == 1 {
+                                    set!(dst, v);
+                                }
+                                self.multi_at = None;
+                                continue;
+                            }
+                        }
+                    }
+                    match self.global_resolved(slot) {
+                        Value::Func(f) => {
+                            match self
+                                .enter_frame(f, base, nargs, nres, dst, &mut current, pc, frames)
+                            {
+                                Err(e) => return Err(self.here(proto, pc, e)),
+                                Ok(true) => {
+                                    // `enter_frame` put the callee in
+                                    // `current` and the caller in the frame
+                                    // record, without either being counted
+                                    proto = unsafe { &*Rc::as_ptr(&current.proto) };
+                                    pc = 0;
+                                    resync!();
+                                }
+                                Ok(false) => resync!(),
+                            }
+                        }
+                        callee => {
+                            self.dispatch(&callee, base, nargs, nres, dst)
+                                .map_err(|e| self.here(proto, pc, e))?;
+                            resync!();
+                        }
+                    }
+                }
+                Op::Method { base, name, nargs, nres, dst } => {
+                    self.set_line(line_at!(pc - 1));
+                    // the receiver stays in its register: resolving a method
+                    // only reads it, and the call that follows reads it again
+                    // from the same place
+                    let m = match konst!(name) {
+                        Value::Str(s) => self.method(at!(base + 1), s),
+                        other => self.method(at!(base + 1), &RStr::from(other.to_string())),
                     }
                     .map_err(|e| self.at(proto, pc, e))?;
                     // the receiver is the first argument, as in Rust
-                    self.dispatch(&m, base, nargs + 1, nres)
+                    self.dispatch(&m, base, nargs + 1, nres, dst)
                         .map_err(|e| self.here(proto, pc, e))?;
                     resync!();
                 }
                 Op::CallSpread { base, nargs, nres, method } => {
-                    self.set_line(proto.lines[pc - 1]);
+                    self.set_line(line_at!(pc - 1));
+                    // The values the last call produced are usually still in
+                    // the registers directly above the fixed arguments —
+                    // which is exactly where the rest of the argument list
+                    // belongs. When they are, a spread is an ordinary call
+                    // with a longer argument list: `truthy(eval(x))` needs no
+                    // vector at either end, where routing it through one cost
+                    // two pooled vectors, a clone per value and the generic
+                    // entry to a call.
+                    let spread_in_place = match self.multi_in_regs() {
+                        Some((at, k)) => {
+                            (at == self.base + base as usize + 1 + nargs as usize).then_some(k)
+                        }
+                        None => None,
+                    };
+                    if let Some(k) = spread_in_place {
+                        let total = nargs + k;
+                        self.multi_at = None;
+                        if method == u16::MAX {
+                            match unsafe { std::mem::take(&mut *regs.add(base as usize)) } {
+                                Value::Func(f) => {
+                                    match self.enter_frame(
+                                        f, base, total, nres, base, &mut current, pc, frames,
+                                    ) {
+                                        Err(e) => return Err(self.here(proto, pc, e)),
+                                        Ok(true) => {
+                                            proto = unsafe { &*Rc::as_ptr(&current.proto) };
+                                            pc = 0;
+                                            resync!();
+                                        }
+                                        Ok(false) => resync!(),
+                                    }
+                                }
+                                callee => {
+                                    self.dispatch(&callee, base, total, nres, base)
+                                        .map_err(|e| self.here(proto, pc, e))?;
+                                    resync!();
+                                }
+                            }
+                        } else {
+                            let m = match konst!(method) {
+                                Value::Str(s) => self.method(at!(base + 1), s),
+                                other => self.method(at!(base + 1), &RStr::from(other.to_string())),
+                            }
+                            .map_err(|e| self.at(proto, pc, e))?;
+                            self.dispatch(&m, base, total, nres, base)
+                                .map_err(|e| self.here(proto, pc, e))?;
+                            resync!();
+                        }
+                        continue;
+                    }
                     // The callee is found first: for a method call the
                     // receiver is also the first argument, and collecting the
                     // arguments moves it out of its register.
@@ -471,7 +624,7 @@ impl Vm {
                         get!(base)
                     } else {
                         let recv = get!(base + 1);
-                        match &proto.consts[method as usize] {
+                        match konst!(method) {
                             Value::Str(s) => self.method(&recv, s),
                             other => self.method(&recv, &RStr::from(other.to_string())),
                         }
@@ -517,18 +670,36 @@ impl Vm {
                     };
                     let v = match fast {
                         Some(v) => v,
-                        None => self
-                            .index(at!(obj), at!(key))
-                            .map_err(|e| self.at(proto, pc, e))?,
+                        // `t[name]` with the name in a register: an
+                        // environment lookup, and the shape every interpreter
+                        // written in rua spends its time in. Going the long
+                        // way built an owned `Key` — a reference count up and
+                        // down — for what is a borrowed scan.
+                        //
+                        // It is tested here rather than beside the array case
+                        // so that the array case is left exactly as it was: a
+                        // second arm on that match is a second tag test on
+                        // every `t[i]`, and a numeric program is nothing but
+                        // those.
+                        None => match (at!(obj), at!(key)) {
+                            (Value::Table(t), Value::Str(s)) => {
+                                field_of(t, s)
+                            }
+                            _ => {
+                                let (o, k) = (get!(obj), get!(key));
+                                self.index(&o, &k).map_err(|e| self.at(proto, pc, e))?
+                            }
+                        },
                     };
                     set!(dst, v);
                 }
                 Op::GetIndexK { dst, obj, k, ic } => {
-                    let key = &proto.consts[k as usize];
+                    let key = konst!(k);
                     let fast = match (at!(obj), key) {
                         (Value::Table(t), Value::Num(n)) => t.borrow().get_num(*n).cloned(),
                         (Value::Table(t), Value::Str(s)) => {
-                            let at = &proto.caches[ic as usize];
+                            // SAFETY: one cache slot per constant field read, allotted here.
+                            let at = unsafe { &*proto.caches.as_ptr().add(ic as usize) };
                             Some(t.borrow().get_field_cached(s, at))
                         }
                         _ => None,
@@ -544,12 +715,7 @@ impl Vm {
                 Op::SetIndexK { obj, k, val } => {
                     // the constant stays borrowed: cloning it to match on it
                     // is a refcount round trip at every field store
-                    let key = &proto.consts[k as usize];
-                    let done = match (
-                        at!(obj),
-                        key,
-                        at!(val),
-                    ) {
+                    let done = match (at!(obj), konst!(k), at!(val)) {
                         (Value::Table(t), Value::Num(n), v) => t.borrow_mut().set_num(*n, v),
                         (Value::Table(t), Value::Str(s), v) => t.borrow_mut().set_field(s, v),
                         _ => false,
@@ -561,7 +727,8 @@ impl Vm {
                     let v = get!(val);
                     match o {
                         Value::Table(t) => {
-                            let key = Key::from_value(key).map_err(|e| self.at(proto, pc, e))?;
+                            let key =
+                                Key::from_value(konst!(k)).map_err(|e| self.at(proto, pc, e))?;
                             t.borrow_mut().set(key, v);
                         }
                         other => {
@@ -642,7 +809,7 @@ impl Vm {
                     let empty = self.take_vec(0);
                     let mut vals =
                         self.call_value(&it, empty).map_err(|e| self.here(proto, pc, e))?;
-                    resync!();
+                    resync_regs!();
                     if matches!(vals.first(), None | Some(Value::Nil)) {
                         self.recycle_vec(vals);
                         pc = exit as usize;
@@ -674,7 +841,7 @@ impl Vm {
                     }
                 }
                 Op::JumpIfNotK { kind, a, k, to } => {
-                    let (x, y) = (at!(a), &proto.consts[k as usize]);
+                    let (x, y) = (at!(a), konst!(k));
                     let taken = match (x, y) {
                         (Value::Num(x), Value::Num(y)) => num_cmp(kind, *x, *y),
                         (x, y) => match crate::interp::equality(kind, x, y) {
@@ -716,7 +883,7 @@ impl Vm {
                         }
                     };
                     if going {
-                        let hits = &proto.hints[hint as usize];
+                        let hits = hint_at!(hint);
                         let n = hits.get();
                         // when the JIT takes the loop over it runs it out, and
                         // the instruction after this one is where that ends
@@ -725,7 +892,7 @@ impl Vm {
                             if !ran {
                                 // its locals are not what the compiled code
                                 // wants this time: go back to counting
-                                proto.hints[hint as usize].set(0);
+                                hint_at!(hint).set(0);
                             }
                             ran
                         } else {
@@ -734,23 +901,23 @@ impl Vm {
                             let ran = n % LOOP_BATCH == 0
                                 && self.note_loop(proto, &current, id);
                             if ran {
-                                proto.hints[hint as usize].set(LOOP_READY);
+                                hint_at!(hint).set(LOOP_READY);
                             }
                             ran
                         };
                         if !taken {
                             pc = to as usize;
                         }
-                        resync!();
+                        resync_regs!();
                     }
                 }
                 Op::JumpBack { to, id, hint, exit } => {
-                    let counter = &proto.hints[hint as usize];
+                    let counter = hint_at!(hint);
                     let n = counter.get();
                     let taken = if n == LOOP_READY {
                         let ran = self.enter_loop(id);
                         if !ran {
-                            proto.hints[hint as usize].set(0);
+                            hint_at!(hint).set(0);
                         }
                         ran
                     } else {
@@ -758,31 +925,39 @@ impl Vm {
                         counter.set(n);
                         let ran = n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id);
                         if ran {
-                            proto.hints[hint as usize].set(LOOP_READY);
+                            hint_at!(hint).set(LOOP_READY);
                         }
                         ran
                     };
                     pc = if taken { exit as usize } else { to as usize };
-                    resync!();
+                    resync_regs!();
                 }
                 Op::LoopHint { id, hint, exit } => {
                     // counting is a `Cell` bump; only every so often is it
                     // worth asking whether this loop deserves compiling
-                    let counter = &proto.hints[hint as usize];
+                    let counter = hint_at!(hint);
                     let n = counter.get().wrapping_add(1);
                     counter.set(n);
                     if n % LOOP_BATCH == 0 && self.note_loop(proto, &current, id) {
                         pc = exit as usize;
                     }
-                    resync!();
+                    resync_regs!();
                 }
             }
         }
     }
 
     /// Make a call from registers: `callee`, then `nargs` arguments starting
-    /// at `base + 1`, with results written back from `base`.
-    fn dispatch(&mut self, callee: &Value, base: Reg, nargs: u16, nres: u16) -> Eval<()> {
+    /// at `base + 1`, with results written back from `dst` — which is `base`
+    /// unless the caller asked for one result somewhere else.
+    fn dispatch(
+        &mut self,
+        callee: &Value,
+        base: Reg,
+        nargs: u16,
+        nres: u16,
+        dst: Reg,
+    ) -> Eval<()> {
         // a builtin reads the arguments straight out of the registers
         if let Value::Native(n) = callee {
             // the common builtin: one argument in a register, one result into
@@ -791,12 +966,12 @@ impl Vm {
                 let start = self.base + base as usize + 1;
                 if nargs == 1 {
                     if let Some(fast) = &n.fast1 {
-                        // the builtin only reads its argument, and it cannot
-                        // reach the stack to move it: borrow the register
-                        // rather than taking a reference count round trip
+                        // the argument is read where it lies: the builtin only
+                        // borrows it, and a reference count round trip on
+                        // every `type(x)` is not free
                         let v = fast(&self.stack[start])?;
                         if nres == 1 {
-                            self.set_reg(base, v);
+                            self.set_reg(dst, v);
                         }
                         self.multi_at = None;
                         return Ok(());
@@ -805,7 +980,7 @@ impl Vm {
                     if let Some(fast) = &n.fast2 {
                         let v = fast(&self.stack[start], &self.stack[start + 1])?;
                         if nres == 1 {
-                            self.set_reg(base, v);
+                            self.set_reg(dst, v);
                         }
                         self.multi_at = None;
                         return Ok(());
@@ -825,7 +1000,7 @@ impl Vm {
             let out = (n.f)(self, &args);
             self.recycle_vec(args);
             let vals = out?;
-            self.place(base, nres, vals);
+            self.place(dst, nres, vals);
             return Ok(());
         }
         // a plain rua function needs no argument vector at all, and the callee
@@ -833,7 +1008,7 @@ impl Vm {
         if let Value::Func(func) = callee {
             if self.enter_depth()? {
                 let arg_start = self.base + base as usize + 1;
-                let ret_to = self.base + base as usize;
+                let ret_to = self.base + dst as usize;
                 let out = self.call_compiled_or_run(func, arg_start, nargs, ret_to, nres);
                 self.leave_depth();
                 return out;
@@ -841,7 +1016,7 @@ impl Vm {
         }
         let args = self.take_args(base + 1, nargs);
         let vals = self.call_value(callee, args)?;
-        self.place(base, nres, vals);
+        self.place(dst, nres, vals);
         Ok(())
     }
 
@@ -857,12 +1032,13 @@ impl Vm {
         base: Reg,
         nargs: u16,
         nres: u16,
+        dst: Reg,
         current: &mut Rc<Function>,
         pc: usize,
         frames: &mut Vec<CallFrame>,
     ) -> Eval<bool> {
         let arg_start = self.base + base as usize + 1;
-        let ret_to = self.base + base as usize;
+        let ret_to = self.base + dst as usize;
         self.enter_depth()?;
         // A function the JIT has refused is the common case — every function
         // that is not numeric, and every function at all when the JIT is off —
@@ -892,9 +1068,13 @@ impl Vm {
         // the right register — which every one of them is, since parameters
         // take the first registers in order — needs no move at all.
         let base = arg_start;
-        let n_regs = f.proto.n_regs;
-        self.open_frame_at(base, n_regs);
-        self.bind_params(&current.proto, base, nargs);
+        let proto = &f.proto;
+        self.open_frame_at(base, proto.n_regs);
+        // The ordinary call needs no binding pass: every argument is already
+        // in the register its parameter names, and none of them is captured.
+        if !proto.plain_params || (nargs as usize) < proto.params.len() {
+            self.bind_params(proto, base, nargs);
+        }
         self.base = base;
         Ok(true)
     }
@@ -1072,6 +1252,7 @@ impl Vm {
         self.locate_signal(line, e)
     }
 }
+
 
 #[inline]
 fn num_cmp(kind: BinKind, x: f64, y: f64) -> bool {

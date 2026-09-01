@@ -77,12 +77,13 @@ impl FnCompiler {
 
     fn finish(mut self) -> Proto {
         Self::specialise(&mut self.code);
-        let params = self
+        let params: Vec<ParamSlot> = self
             .def
             .param_bindings
             .iter()
             .map(|b| ParamSlot { reg: b.slot, cell: b.cell })
             .collect();
+        let plain_params = params.iter().all(|p| !p.cell);
         Proto {
             name: Rc::from(self.def.name.as_str()),
             def: self.def,
@@ -95,6 +96,7 @@ impl FnCompiler {
             hints: (0..self.hints).map(|_| std::cell::Cell::new(0)).collect(),
             caches: (0..self.caches).map(|_| std::cell::Cell::new(0)).collect(),
             params,
+            plain_params,
         }
     }
 
@@ -434,6 +436,20 @@ impl FnCompiler {
                         let r = self.alloc();
                         self.call_expr(&exprs[0], r, MULTI);
                         self.emit(Op::Ret { base: r, n: MULTI }, 0);
+                    }
+                    1 => {
+                        // as in `block_ret`: `return x` for a plain local is
+                        // the register it already lives in
+                        if let Expr::Local(b, _) = &exprs[0] {
+                            if !b.cell {
+                                self.emit(Op::Ret { base: b.slot, n: 1 }, 0);
+                                self.release(mark);
+                                return;
+                            }
+                        }
+                        let r = self.alloc();
+                        self.expr(&exprs[0], r);
+                        self.emit(Op::Ret { base: r, n: 1 }, 0);
                     }
                     n => {
                         let base = self.free;
@@ -950,15 +966,52 @@ impl FnCompiler {
             debug_assert!(nres <= 1, "several results must go to scratch registers");
             self.alloc()
         };
+        // A single result on its way to a named local goes there directly;
+        // everything else lands at the frame base and is moved afterwards.
+        // A spread has no room in its instruction to say so, so it does not.
+        let direct = if nres == 1 && base != dst { dst } else { base };
+        let mut out = base;
         match e {
             Expr::Call(f, args) => {
-                self.expr(f, base);
-                let spread = self.args(args);
-                let nargs = args.len() as u16;
-                if spread {
-                    self.emit(Op::CallSpread { base, nargs: nargs - 1, nres, method: u16::MAX }, 0);
-                } else {
-                    self.emit(Op::Call { base, nargs, nres }, 0);
+                // A call to a global needs no register for its callee: the
+                // call reads the global itself. A spread still does, since it
+                // goes the long way round.
+                let global = match &**f {
+                    Expr::Global(name, _) => Some(self.global(name)),
+                    _ => None,
+                };
+                match global {
+                    Some(g) => {
+                        let spread = self.args(args);
+                        let nargs = args.len() as u16;
+                        if spread {
+                            self.emit(Op::GetGlobal { dst: base, g }, 0);
+                            self.emit(
+                                Op::CallSpread { base, nargs: nargs - 1, nres, method: u16::MAX },
+                                0,
+                            );
+                        } else {
+                            out = direct;
+                            self.emit(
+                                Op::CallGlobal { base, g, nargs, nres, dst: direct },
+                                0,
+                            );
+                        }
+                    }
+                    None => {
+                        self.expr(f, base);
+                        let spread = self.args(args);
+                        let nargs = args.len() as u16;
+                        if spread {
+                            self.emit(
+                                Op::CallSpread { base, nargs: nargs - 1, nres, method: u16::MAX },
+                                0,
+                            );
+                        } else {
+                            out = direct;
+                            self.emit(Op::Call { base, nargs, nres, dst: direct }, 0);
+                        }
+                    }
                 }
             }
             Expr::Method(obj, name, args) => {
@@ -973,12 +1026,13 @@ impl FnCompiler {
                         0,
                     );
                 } else {
-                    self.emit(Op::Method { base, name: k, nargs, nres }, 0);
+                    out = direct;
+                    self.emit(Op::Method { base, name: k, nargs, nres, dst: direct }, 0);
                 }
             }
             _ => unreachable!("not a call"),
         }
-        if nres > 0 && base != dst {
+        if nres > 0 && base != dst && out != dst {
             self.emit(Op::Move { dst, src: base }, 0);
         }
         // keep the result registers reserved: they are what the caller reads
@@ -1013,6 +1067,12 @@ impl FnCompiler {
             }
             Some(Expr::Do(inner)) => self.block_ret(inner),
             Some(Expr::If(arms, els)) => self.if_ret(arms, els.as_ref()),
+            // A function whose tail is a plain local returns that register:
+            // copying it into a scratch one first is an instruction and a
+            // reference count for nothing.
+            Some(Expr::Local(b, _)) if !b.cell => {
+                self.emit(Op::Ret { base: b.slot, n: 1 }, 0);
+            }
             Some(e) => {
                 let mark = self.mark();
                 let r = self.alloc();
