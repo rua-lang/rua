@@ -1,20 +1,25 @@
 {
   "name": "rua",
-  "displayName": "rua",
   "version": "0.1.0",
-  "description": "Language support for Fresh: syntax highlighting and the rua language server",
-  "grammar": {
-    "file": "grammars/syntax.sublime-syntax",
-    "extensions": ["rua"]
-  },
-  "language": {
-    "commentPrefix": "//",
-    "tabSize": 4,
-    "autoIndent": true
-  },
-  "lsp": {
-    "command": "rua-lsp",
-    "args": [],
-    "autoStart": true
+  "type": "language",
+  "description": "rua: syntax highlighting and the rua language server",
+  "fresh": {
+    "grammar": {
+      "file": "grammars/syntax.sublime-syntax",
+      "extensions": ["rua"],
+      "firstLine": "^#!.*\\brua\\b"
+    },
+    "language": {
+      "commentPrefix": "//",
+      "blockCommentStart": "/*",
+      "blockCommentEnd": "*/",
+      "tabSize": 4,
+      "autoIndent": true
+    },
+    "lsp": {
+      "command": "rua-lsp",
+      "args": [],
+      "autoStart": true
+    }
   }
 }
