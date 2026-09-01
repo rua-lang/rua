@@ -1223,3 +1223,12 @@ mod size {
         assert_eq!(std::mem::size_of::<super::Value>(), 16);
     }
 }
+
+#[test]
+fn table_sizes() {
+    eprintln!("Table={} Key={} Value={} pair={}",
+        std::mem::size_of::<Table>(), std::mem::size_of::<Key>(),
+        std::mem::size_of::<Value>(), std::mem::size_of::<(Key, Value)>());
+    eprintln!("Rc<RefCell<Table>> alloc = {}",
+        std::mem::size_of::<std::cell::RefCell<Table>>() + 16);
+}

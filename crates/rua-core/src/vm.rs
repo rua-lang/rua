@@ -1242,7 +1242,19 @@ impl Vm {
     /// where the caller left off.
     #[inline(never)]
     fn leave_frame(&mut self, base: Reg, n: u16, fr: CallFrame) -> (Rc<Function>, usize) {
-        let written = self.return_values(base, n, fr.ret_to as usize, fr.nres);
+        // One value returned to a caller that wants one is almost every
+        // return there is, and it is two moves; the general form is a call.
+        let written = if n == 1 && fr.nres == 1 {
+            let start = self.base + base as usize;
+            debug_assert!(start < self.stack.len() && (fr.ret_to as usize) < self.stack.len());
+            // the frame is about to be released, so the value is moved, and
+            // the destination is always below the source
+            let v = std::mem::take(&mut self.stack[start]);
+            Value::put(&mut self.stack[fr.ret_to as usize], v);
+            1
+        } else {
+            self.return_values(base, n, fr.ret_to as usize, fr.nres)
+        };
         self.close_frame_from(self.base, fr.ret_to as usize + written);
         self.base = fr.base as usize;
         self.top = fr.top as usize;
