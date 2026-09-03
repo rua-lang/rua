@@ -46,6 +46,65 @@ fn plain_reg(e: &Expr) -> Option<Reg> {
     }
 }
 
+/// Does this expression read that local anywhere inside it?
+fn mentions_local(e: &Expr, slot: Reg) -> bool {
+    fn block(b: &Block, slot: Reg) -> bool {
+        b.stats.iter().any(|s| stat(s, slot))
+            || b.tail.as_deref().is_some_and(|t| mentions_local(t, slot))
+    }
+    fn stat(s: &Stat, slot: Reg) -> bool {
+        match s {
+            Stat::Let(_, es) | Stat::LetSlots(_, es) | Stat::Return(es) => {
+                es.iter().any(|e| mentions_local(e, slot))
+            }
+            Stat::FnDecl(_, e) | Stat::FnSlot(_, e) | Stat::Expr(e) => mentions_local(e, slot),
+            Stat::Assign(ts, es) => {
+                ts.iter().chain(es).any(|e| mentions_local(e, slot))
+            }
+            Stat::OpAssign(t, _, e) => mentions_local(t, slot) || mentions_local(e, slot),
+            Stat::While(_, c, b) => mentions_local(c, slot) || block(b, slot),
+            Stat::Loop(_, b) => block(b, slot),
+            Stat::ForRange { start, end, body, .. } => {
+                mentions_local(start, slot)
+                    || mentions_local(end, slot)
+                    || block(body, slot)
+            }
+            Stat::ForIn { iter, body, .. } => {
+                mentions_local(iter, slot) || block(body, slot)
+            }
+            _ => false,
+        }
+    }
+    match e {
+        Expr::Local(b, _) => b.slot == slot,
+        Expr::Index(a, b) | Expr::Bin(_, a, b) | Expr::Range(a, b, _) => {
+            mentions_local(a, slot) || mentions_local(b, slot)
+        }
+        Expr::Un(_, a) => mentions_local(a, slot),
+        Expr::Call(f, args) => {
+            mentions_local(f, slot) || args.iter().any(|a| mentions_local(a, slot))
+        }
+        Expr::Method(o, _, args) => {
+            mentions_local(o, slot) || args.iter().any(|a| mentions_local(a, slot))
+        }
+        Expr::Array(items) => items.iter().any(|i| mentions_local(i, slot)),
+        Expr::Map(entries) => {
+            entries.iter().any(|(k, v)| mentions_local(k, slot) || mentions_local(v, slot))
+        }
+        Expr::If(arms, els) => {
+            arms.iter().any(|(c, b)| mentions_local(c, slot) || block(b, slot))
+                || els.as_ref().is_some_and(|b| block(b, slot))
+        }
+        Expr::Match(subject, arms) => {
+            mentions_local(subject, slot) || arms.iter().any(|a| block(&a.body, slot))
+        }
+        Expr::Do(b) => block(b, slot),
+        // a closure reads it through a cell, which is a different register
+        Expr::Func(_) => false,
+        _ => false,
+    }
+}
+
 /// The pieces of a string interpolation, if this is one: a left leaning chain
 /// of `+` rooted in a string literal, so every step of it concatenates.
 ///
@@ -727,6 +786,23 @@ impl FnCompiler {
 
     fn assign(&mut self, target: &Expr, e: &Expr) {
         match target {
+            // A container is built where it is going: the table is made
+            // first and filled afterwards. Writing one straight into the
+            // local it reads from — `head = #{ next: head }` — would have it
+            // read the table being built, and make a ring where a list was
+            // meant. Somewhere else to build it costs one move, and only
+            // where the two actually meet.
+            Expr::Local(b, _)
+                if !b.cell
+                    && matches!(e, Expr::Map(..) | Expr::Array(..))
+                    && mentions_local(e, b.slot) =>
+            {
+                let mark = self.mark();
+                let tmp = self.alloc();
+                self.expr(e, tmp);
+                self.emit(Op::Move { dst: b.slot, src: tmp }, 0);
+                self.release(mark);
+            }
             // a plain local can be written in place
             Expr::Local(b, _) if !b.cell => self.expr(e, b.slot),
             _ => {

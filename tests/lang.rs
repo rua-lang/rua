@@ -2316,6 +2316,42 @@ fn the_checker_is_quiet_about_every_program_here() {
     assert!(checked >= 15, "only checked {checked}");
 }
 
+/// A container is built where it is going: the table is made first and
+/// filled afterwards. Assigning one straight into the local it reads from had
+/// it read the table being built, and made a ring where a list was meant —
+/// silently, so a walk over it never ended.
+#[test]
+fn a_container_may_be_built_from_what_it_replaces() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        let a = 1
+        a = #{ v: a }
+        let b = 2
+        b = [b, 3]
+        // the shape this was found by: a list built one node at a time
+        let head = nil
+        let i = 0
+        while i < 3 { head = #{ n: i, next: head }; i += 1 }
+        let walked = 0
+        let e = head
+        while e != nil { walked += 1; e = e.next }
+        return a.v, b[0], b[1], head.n, head.next.n, head.next.next.n,
+               head.next.next.next, walked;
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 1.0, "the old value, not the new table");
+    assert_eq!(out[1].as_num().unwrap(), 2.0);
+    assert_eq!(out[2].as_num().unwrap(), 3.0);
+    assert_eq!(out[3].as_num().unwrap(), 2.0, "a chain, not a ring");
+    assert_eq!(out[4].as_num().unwrap(), 1.0);
+    assert_eq!(out[5].as_num().unwrap(), 0.0);
+    assert_eq!(out[6].to_string(), "nil", "and it ends");
+    assert_eq!(out[7].as_num().unwrap(), 3.0);
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.
