@@ -682,7 +682,35 @@ fn {}
                 out.extend(self.in_scope(&scan, index.text()));
                 out
             }
-            Where::Member(module) => match self.members(&module) {
+            Where::Member(module) => {
+                let types = self.types_of(index.text());
+                let own = types.methods_of(&module);
+                if !own.is_empty() {
+                    return Some(CompletionResponse::Array(
+                        own.iter()
+                            .map(|(m, def)| {
+                                let params: Vec<String> = def
+                                    .params
+                                    .iter()
+                                    .map(|p| match &p.ty {
+                                        Some(t) => format!("{p}: {t}"),
+                                        None => p.to_string(),
+                                    })
+                                    .collect();
+                                let ret = match &def.ret {
+                                    Some(r) => format!(" -> {r}"),
+                                    None => String::new(),
+                                };
+                                item(
+                                    m,
+                                    CompletionItemKind::FUNCTION,
+                                    &format!("{m}({}){ret}", params.join(", ")),
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+                match self.members(&module) {
                 Some(mut names) => {
                     names.sort();
                     names
@@ -690,10 +718,11 @@ fn {}
                         .map(|n| item(&n, CompletionItemKind::FUNCTION, &module))
                         .collect()
                 }
-                // not a module this runtime has: better to say nothing than to
-                // offer every global as though it were inside it
+                // not a module this runtime has: better to say nothing than
+                // to offer every global as though it were inside it
                 None => Vec::new(),
-            },
+                }
+            }
             Where::Method(receiver) => {
                 // A file being completed in does not parse: `v.` is half an
                 // expression, and the function holding it is lost with it —
@@ -740,6 +769,11 @@ fn {}
                 // is already supplying it
                 if let rua_syntax::ast::Type::Named(shape, _, _) = &t {
                     for (m, def) in types.methods_of(shape) {
+                        // `Vec2::new(..)` makes one; it is not something you
+                        // call on one you already have
+                        if def.params.first().map(|p| &*p.text) != Some("self") {
+                            continue;
+                        }
                         let params: Vec<String> = def
                             .params
                             .iter()

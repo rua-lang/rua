@@ -187,12 +187,18 @@ than on every value of it:
 
 ```rust
 impl Vec2 {
+    fn new(x: number, y: number) -> Vec2 { #{ x: x, y: y } }   // no receiver: makes one
     fn len(self) -> number { math::sqrt(self.x * self.x + self.y * self.y) }
 }
 
-let v: Vec2 = #{ x: 3, y: 4 }
+let v = Vec2::new(3, 4)
 print(v.len())          // becomes `Vec2::len(v)`, which you may also write
 ```
+
+A function with no `self` is what makes one, as in Rust. There is no `new`
+keyword and nothing special about the name: it is a function on the shape,
+and what it hands back says what shape that is — so the binding needs no
+annotation for `v.len()` to find its way.
 
 Where the receiver's shape is known — written down, or read off what a
 function returns — the call resolves to that one, the way Rust's does, and

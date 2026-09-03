@@ -2049,6 +2049,47 @@ fn impl_methods_resolve_to_a_call_on_the_type() {
     assert_eq!(out[3].as_num().unwrap(), 25.0, "`Vec2::len(v)` is what it became");
 }
 
+/// A function in an `impl` that takes no receiver is what makes one — the
+/// constructor, reached through the shape's own name.
+#[test]
+fn an_impl_function_without_a_receiver_makes_one() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Vec2 = #{ x: number, y: number }
+        impl Vec2 {
+            fn new(x: number, y: number) -> Vec2 { #{ x: x, y: y } }
+            fn zero() -> Vec2 { Vec2::new(0, 0) }
+            fn len(self) -> number { self.x * self.x + self.y * self.y }
+        }
+        // what it hands back is a Vec2, so the methods are found on it with
+        // nothing written down at the binding
+        let v = Vec2::new(3, 4)
+        let z = Vec2::zero()
+        return v.len(), z.len(), typeof(v);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 25.0);
+    assert_eq!(out[1].as_num().unwrap(), 0.0, "one made by another of its own");
+    assert_eq!(out[2].to_string(), "table", "an instance is an ordinary table");
+}
+
+/// And the checker holds a constructor to its signature the same way.
+#[test]
+fn the_checker_checks_a_constructor() {
+    let head = "type Vec2 = #{ x: number, y: number }\n\
+                impl Vec2 { fn new(x: number, y: number) -> Vec2 { #{ x: x, y: y } } }\n";
+    let complaints = |body: &str| -> Vec<String> {
+        rua::check(&format!("{head}{body}")).into_iter().map(|e| e.message).collect()
+    };
+    assert!(complaints("let a = Vec2::new(3, 4)\n").is_empty());
+    assert!(complaints("let a = Vec2::new(3)\n")[0].contains("`new` takes 2 arguments, given 1"));
+    assert!(complaints("let a = Vec2::new(3, \"x\")\n")[0].contains("`y` expects number"));
+    assert!(complaints("let a: number = Vec2::new(1, 2)\n")[0].contains("expected number"));
+}
+
 /// A receiver whose shape nobody wrote down keeps the dispatch it always had.
 #[test]
 fn a_method_on_an_unknown_shape_is_left_alone() {

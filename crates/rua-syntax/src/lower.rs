@@ -100,17 +100,26 @@ impl Lower {
             Expr::Call(f, _) => match &**f {
                 // `make(3, 4)` where `fn make(..) -> Vec2`
                 Expr::Var(n) => self.returns.get(&n.text).cloned(),
-                // `Vec2::scaled(v, 2)` — including the one a `.` just became,
-                // which is how a chain of them keeps its footing
-                Expr::Index(base, key) => match (&**base, &**key) {
-                    (Expr::Global(shape, _), Expr::Str(m)) => self
-                        .methods
-                        .get(shape)
-                        .and_then(|ms| ms.iter().find(|(n, _)| n == m))
-                        .and_then(|(_, ret)| ret.as_ref())
-                        .and_then(|r| self.shape_of(r)),
-                    _ => None,
-                },
+                // `Vec2::new(3, 4)` and `Vec2::scaled(v, 2)` — including the
+                // one a `.` just became, which is how a chain keeps its
+                // footing. This pass runs before names are resolved, so the
+                // shape is still written as an ordinary name.
+                Expr::Index(base, key) => {
+                    let shape = match &**base {
+                        Expr::Var(n) => Some(&n.text),
+                        Expr::Global(n, _) => Some(n),
+                        _ => None,
+                    };
+                    match (shape, &**key) {
+                        (Some(shape), Expr::Str(m)) => self
+                            .methods
+                            .get(shape)
+                            .and_then(|ms| ms.iter().find(|(n, _)| n == m))
+                            .and_then(|(_, ret)| ret.as_ref())
+                            .and_then(|r| self.shape_of(r)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             },
             _ => None,

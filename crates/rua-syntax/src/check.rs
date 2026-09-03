@@ -571,6 +571,23 @@ impl Checker {
                         )
                     })
                 }),
+            // `Vec2::new(3, 4)` — an `impl` function reached through its
+            // shape's name, which is what a constructor is here
+            Expr::Index(base, key) => {
+                let shape = match &**base {
+                    Expr::Var(n) => Some(n.text.clone()),
+                    Expr::Global(n, _) => Some(n.clone()),
+                    _ => None,
+                };
+                match (shape, &**key) {
+                    (Some(shape), Expr::Str(m)) => self
+                        .impls
+                        .get(&shape)
+                        .and_then(|ms| ms.iter().find(|(n, _)| n == m))
+                        .map(|(_, t)| t.clone()),
+                    _ => None,
+                }
+            }
             other => Some(self.expand(&self.infer_ref(other), 0)),
         };
         let Some(Type::Fn(params, ret, _)) = signature else {
@@ -579,6 +596,10 @@ impl Checker {
         if params.len() != given.len() {
             let name = match f {
                 Expr::Var(n) => format!("`{}`", n.text),
+                Expr::Index(_, k) => match &**k {
+                    Expr::Str(m) => format!("`{m}`"),
+                    _ => "this".to_string(),
+                },
                 _ => "this".to_string(),
             };
             self.say(

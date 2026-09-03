@@ -695,3 +695,34 @@ fn impl_methods_are_offered_on_the_receiver() {
     assert_eq!(detail(&world, &uri, at(6, 2), "scaled"), "scaled(k: number) -> Vec2");
     assert_eq!(detail(&world, &uri, at(6, 2), "len"), "len() -> number");
 }
+
+
+/// `Vec2::` offers everything the shape implements; a value of it offers only
+/// what can be called on one, since a constructor makes one rather than
+/// acting on one.
+#[test]
+fn a_constructor_is_offered_on_the_type_and_not_on_a_value() {
+    let src = "type Vec2 = #{ x: number, y: number }\n\
+               impl Vec2 {\n\
+               fn new(x: number, y: number) -> Vec2 { #{ x: x, y: y } }\n\
+               fn len(self) -> number { self.x }\n\
+               }\n\
+               fn f(v: Vec2) -> number {\n\
+               v.\n\
+               }\n";
+    let (world, uri) = open(src);
+    let on_value = labels(&world, &uri, at(6, 2));
+    assert_eq!(on_value.first().map(String::as_str), Some("len"));
+    assert!(!on_value.contains(&"new".to_string()), "`new` makes one: {on_value:?}");
+    assert_eq!(detail(&world, &uri, at(6, 2), "len"), "len() -> number", "no receiver");
+
+    // and on the type itself, both, with the receiver shown
+    let src = format!("{src}let a = Vec2::\n");
+    let (world, uri) = open(&src);
+    let on_type = labels(&world, &uri, at(8, 14));
+    assert_eq!(on_type, vec!["new", "len"], "{on_type:?}");
+    assert_eq!(
+        detail(&world, &uri, at(8, 14), "new"),
+        "new(x: number, y: number) -> Vec2"
+    );
+}
