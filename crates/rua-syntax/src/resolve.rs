@@ -94,6 +94,9 @@ impl Scan<'_> {
             // a type declares nothing that runs, so there is nothing here to
             // capture and nothing to declare
             Stat::TypeAlias(..) => {}
+            Stat::Impl(_, methods) => {
+                methods.iter().for_each(|(_, f)| self.expr(f, inside));
+            }
             Stat::FnDecl(name, e) => {
                 self.declare(&name.text);
                 self.expr(e, inside);
@@ -500,6 +503,19 @@ impl Resolver {
             // name. That is what lets the same declaration guard a marshall
             // at run time as well as answer the editor — one shape written
             // once, rather than a type and a validator that drift apart.
+            // `impl Vec2 { fn len(self) .. }` is `Vec2.len = fn .. `, which
+            // needs nothing new to run and is what anybody may write by hand
+            Stat::Impl(name, methods) => {
+                let (mut targets, mut values) = (Vec::new(), Vec::new());
+                for (m, f) in methods {
+                    targets.push(Expr::Index(
+                        Box::new(Expr::Global(name.text.clone(), GlobalCache::new())),
+                        Box::new(Expr::Str(m.text.clone())),
+                    ));
+                    values.push(self.expr(f));
+                }
+                Stat::Assign(targets, values)
+            }
             Stat::TypeAlias(name, params, t) => {
                 if params.is_empty() {
                     Stat::Assign(

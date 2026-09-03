@@ -182,6 +182,24 @@ let (ok, why) = typeis(body, Order)
 // rejected — `items[0].qty`: expected number, found string
 ```
 
+`impl` gives a shape methods, and they live on the shape's own table rather
+than on every value of it:
+
+```rust
+impl Vec2 {
+    fn len(self) -> number { math::sqrt(self.x * self.x + self.y * self.y) }
+}
+
+let v: Vec2 = #{ x: 3, y: 4 }
+print(v.len())          // becomes `Vec2::len(v)`, which you may also write
+```
+
+Where the receiver's shape is known — written down, or read off what a
+function returns — the call resolves to that one, the way Rust's does, and
+costs what writing it by hand costs. Where it is not known, the ordinary
+dispatch happens instead. Carrying three methods on every instance instead
+was 1.9x the time and 2.7x the memory.
+
 `typeis` answers the way `try` does: the yes or no first, so `if typeis(v, T)`
 reads plainly, and why not after it when that is wanted. It follows a name
 when it reaches one, so types may refer to each other and a tree may contain

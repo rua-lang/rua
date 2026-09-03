@@ -285,6 +285,12 @@ pub enum Stat {
     /// parameters. Nothing runs it; it is read by the checker and by the
     /// editor, and the compiler steps over it.
     TypeAlias(Name, Vec<Name>, Type),
+    /// `impl Name { fn m(self, ..) { .. } }` — methods belonging to a shape.
+    ///
+    /// The resolver puts each one on the type's own table, so `Vec2::len(v)`
+    /// is what it becomes and what anybody may write by hand. A `v.len()`
+    /// whose receiver is known becomes the same call.
+    Impl(Name, Vec<(Name, Expr)>),
     Assign(Vec<Expr>, Vec<Expr>),
     /// A compound assignment such as `x += 1`.
     OpAssign(Expr, BinOp, Expr),

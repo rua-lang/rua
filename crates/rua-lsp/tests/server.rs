@@ -675,3 +675,23 @@ fn a_receiver_with_no_type_offers_what_the_runtime_has() {
     assert!(got.contains(&"push".to_string()), "{got:?}");
     assert!(got.contains(&"len".to_string()), "{got:?}");
 }
+
+
+/// `impl` methods are offered on a value of that shape, written the way you
+/// would call them — the receiver left out, since the `.` supplies it.
+#[test]
+fn impl_methods_are_offered_on_the_receiver() {
+    let src = "type Vec2 = #{ x: number, y: number }\n\
+               impl Vec2 {\n\
+               fn len(self) -> number { self.x }\n\
+               fn scaled(self, k: number) -> Vec2 { self }\n\
+               }\n\
+               fn use_it(v: Vec2) -> number {\n\
+               v.\n\
+               }\n";
+    let (world, uri) = open(src);
+    let got = labels(&world, &uri, at(6, 2));
+    assert_eq!(&got[..4], &["len", "scaled", "x", "y"], "methods, then fields: {got:?}");
+    assert_eq!(detail(&world, &uri, at(6, 2), "scaled"), "scaled(k: number) -> Vec2");
+    assert_eq!(detail(&world, &uri, at(6, 2), "len"), "len() -> number");
+}

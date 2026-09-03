@@ -65,6 +65,8 @@ pub struct Types {
     aliases: HashMap<Rc<str>, Type>,
     /// What each takes, for the ones that take anything.
     params: HashMap<Rc<str>, Vec<Name>>,
+    /// The methods declared for a shape with `impl`.
+    methods: HashMap<Rc<str>, Vec<(Name, Rc<FuncDef>)>>,
     /// The type written beside a binding, by the name's own span.
     at_decl: HashMap<(u32, u32), Type>,
     /// Functions written in this file.
@@ -142,6 +144,11 @@ impl Types {
         substitute(body, &bound)
     }
 
+    /// The methods `impl` gave this shape.
+    pub fn methods_of(&self, name: &str) -> &[(Name, Rc<FuncDef>)] {
+        self.methods.get(name).map(|v| &v[..]).unwrap_or(&[])
+    }
+
     pub fn function(&self, name: &str) -> Option<&Signature> {
         self.functions.iter().find(|f| &*f.name == name)
     }
@@ -176,6 +183,19 @@ impl Types {
 
     fn stat(&mut self, s: &Stat) {
         match s {
+            // the methods a shape has, kept beside its fields so that the
+            // editor can offer them on a value of that type
+            Stat::Impl(name, methods) => {
+                for (m, f) in methods {
+                    if let Expr::Func(def) = f {
+                        self.methods
+                            .entry(name.text.clone())
+                            .or_default()
+                            .push((m.clone(), def.clone()));
+                    }
+                    self.expr(f);
+                }
+            }
             Stat::TypeAlias(name, params, t) => {
                 self.params.insert(name.text.clone(), params.clone());
                 self.aliases.insert(name.text.clone(), t.clone());

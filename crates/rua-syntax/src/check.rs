@@ -19,6 +19,7 @@ pub fn check(block: &Block) -> Vec<SyntaxError> {
     let mut cx = Checker::default();
     cx.collect_types(block);
     cx.scopes.push(HashMap::new());
+    cx.collect_impls(block);
     cx.collect_functions(block);
     cx.block(block);
     cx.found.sort_by_key(|e| (e.line, e.span.lo, e.span.hi));
@@ -47,6 +48,9 @@ struct Checker {
     scopes: Vec<HashMap<Rc<str>, Type>>,
     /// What each function this file declares takes and gives back.
     signatures: HashMap<Rc<str>, (Vec<Option<Type>>, Option<Type>)>,
+    /// The methods `impl` gave a shape: not fields of it, but reached the
+    /// same way, so they are checked the same way.
+    impls: HashMap<Rc<str>, Vec<(Rc<str>, Type)>>,
     /// What the function being checked promised to return.
     returning: Vec<Option<Type>>,
     /// The line of the statement being checked. Most expressions carry no
@@ -87,6 +91,34 @@ impl Checker {
             self.known(&body);
             self.open.clear();
         }
+    }
+
+    fn collect_impls(&mut self, b: &Block) {
+        for s in &b.stats {
+            let Stat::Impl(name, methods) = s else { continue };
+            let found: Vec<(Rc<str>, Type)> = methods
+                .iter()
+                .filter_map(|(m, f)| match f {
+                    Expr::Func(def) => Some((m.text.clone(), self.signature_of(def))),
+                    _ => None,
+                })
+                .collect();
+            self.impls.entry(name.text.clone()).or_default().extend(found);
+        }
+    }
+
+    /// A method reached on a shape: `impl` first, then a field holding a
+    /// function, since both are written `v.len()`.
+    fn method_type(&self, receiver: &Type, name: &str) -> Option<Type> {
+        if let Type::Named(n, _, _) = receiver {
+            if let Some(found) =
+                self.impls.get(n).and_then(|ms| ms.iter().find(|(m, _)| &**m == name))
+            {
+                return Some(found.1.clone());
+            }
+        }
+        let Type::Record(fields, _) = self.expand(receiver, 0) else { return None };
+        fields.iter().find(|(n, _)| &*n.text == name).map(|(_, t)| self.expand(t, 0))
     }
 
     fn collect_functions(&mut self, b: &Block) {
@@ -243,6 +275,11 @@ impl Checker {
     fn stat(&mut self, s: &Stat) {
         match s {
             Stat::TypeAlias(..) => {}
+            Stat::Impl(_, methods) => {
+                for (_, f) in methods {
+                    self.infer(f);
+                }
+            }
             Stat::Let(names, exprs) => {
                 // one name to one value is the case worth checking; the rest
                 // spread a call's results and nothing here knows how many
@@ -390,16 +427,13 @@ impl Checker {
                 let receiver = self.infer(obj);
                 let given: Vec<(Type, Span)> =
                     args.iter().map(|a| (self.infer(a), span_of(a))).collect();
-                let Type::Record(fields, _) = self.expand(&receiver, 0) else {
+                // the runtime answers `len` on any table, so a name neither
+                // `impl` nor the shape mentions is not an error — a shape
+                // says what it has, not what it lacks
+                let Some(found) = self.method_type(&receiver, name) else {
                     return any(span_of(e));
                 };
-                let Some((_, found)) = fields.iter().find(|(n, _)| n.text == *name) else {
-                    // the runtime answers `len` on any table, so a name that
-                    // is not a field is only wrong if we knew every field —
-                    // and a shape says what it has, not what it lacks
-                    return any(span_of(e));
-                };
-                let Type::Fn(params, ret, _) = self.expand(found, 0) else {
+                let Type::Fn(params, ret, _) = found else {
                     return any(span_of(e));
                 };
                 // the receiver takes the first parameter

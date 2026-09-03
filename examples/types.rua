@@ -41,6 +41,24 @@ print(describe(#{ id: 1, items: [#{ sku: "a", qty: 2 }] }))
 print(describe(#{ id: 1, items: [#{ sku: "a", qty: "two" }] }))
 print(describe(#{ id: 1 }))
 
+// ------------------------------------------------------------------ methods
+// `impl` gives a shape methods without giving every value of it a copy of
+// them. `v.len()` becomes `Vec2::len(v)` where the shape is known — one table
+// of methods for the type, nothing carried on the instance.
+type Vec2 = #{ x: number, y: number }
+
+impl Vec2 {
+    fn len(self) -> number { math::sqrt(self.x * self.x + self.y * self.y) }
+    fn scaled(self, k: number) -> Vec2 { #{ x: self.x * k, y: self.y * k } }
+}
+
+fn vec(x: number, y: number) -> Vec2 { #{ x: x, y: y } }
+
+let a: Vec2 = #{ x: 3, y: 4 }
+let b = vec(6, 8)                      // the shape comes from what `vec` returns
+print("len {a.len()}, {b.len()}, scaled {a.scaled(2).len()}")
+print("the long way round: {Vec2::len(a)}")
+
 // The shapes are ordinary tables, so a type can be passed like any value.
 fn guard(shape) { |v| { typeis(v, shape) } }
 let is_point = guard(Point)

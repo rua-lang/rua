@@ -735,9 +735,40 @@ fn {}
                 .and_then(|o| o.decl)
                 .and_then(|d| types.at(d).cloned());
             if let Some(t) = declared {
+                // what `impl` gave the shape, shown as the signature you
+                // would write it with, the receiver left out because the `.`
+                // is already supplying it
+                if let rua_syntax::ast::Type::Named(shape, _, _) = &t {
+                    for (m, def) in types.methods_of(shape) {
+                        let params: Vec<String> = def
+                            .params
+                            .iter()
+                            .skip(1)
+                            .map(|p| match &p.ty {
+                                Some(t) => format!("{p}: {t}"),
+                                None => p.to_string(),
+                            })
+                            .collect();
+                        let ret = match &def.ret {
+                            Some(r) => format!(" -> {r}"),
+                            None => String::new(),
+                        };
+                        seen.push(m.to_string());
+                        let mut it = item(
+                            m,
+                            CompletionItemKind::METHOD,
+                            &format!("{m}({}){ret}", params.join(", ")),
+                        );
+                        it.sort_text = Some(format!("0{m}"));
+                        out.push(it);
+                    }
+                }
                 let filled = types.instantiate(&t);
                 if let Some(fields) = types.fields(&filled).or_else(|| types.fields(&t)) {
                     for (field, ft) in fields {
+                        if seen.iter().any(|s| s == &field.to_string()) {
+                            continue;
+                        }
                         seen.push(field.to_string());
                         let kind = match ft {
                             rua_syntax::ast::Type::Fn(..) => CompletionItemKind::METHOD,
@@ -1289,7 +1320,7 @@ fn token_kind(toks: &[Lexed], i: usize) -> Option<u32> {
         },
         Tok::Break | Tok::Continue | Tok::Else | Tok::False | Tok::Fn | Tok::For | Tok::If
         | Tok::In | Tok::Let | Tok::Loop | Tok::Match | Tok::Mut | Tok::Nil | Tok::Return
-        | Tok::True | Tok::Type | Tok::While => KEYWORD,
+        | Tok::True | Tok::Type | Tok::Impl | Tok::While => KEYWORD,
         Tok::LParen | Tok::RParen | Tok::LBrace | Tok::RBrace | Tok::LBracket | Tok::RBracket
         | Tok::Semi | Tok::Comma | Tok::Hash => return None,
         _ => OPERATOR,
@@ -1298,7 +1329,7 @@ fn token_kind(toks: &[Lexed], i: usize) -> Option<u32> {
 
 const KEYWORDS: &[&str] = &[
     "break", "continue", "else", "false", "fn", "for", "if", "in", "let", "loop", "match", "mut",
-    "nil", "return", "true", "type", "while",
+    "impl", "nil", "return", "true", "type", "while",
 ];
 
 /// The types that need no declaring, offered where a type is written.
@@ -1321,6 +1352,7 @@ fn keyword_doc(t: &Tok) -> Option<&'static str> {
         Tok::Nil => "`nil` — the absence of a value.",
         Tok::In => "`in` — what a `for` walks.",
         Tok::Mut => "`mut` — allowed on a `let`, and means nothing: every binding is assignable.",
+        Tok::Impl => "`impl` — give a shape methods: `impl Vec2 { fn len(self) -> number { .. } }`.\n\nThey live on the type's own table, so `v.len()` and `Vec2::len(v)` are the same call.",
         Tok::Type => "`type` — give a name to a shape: `type Point = #{ x: number, y: number }`.",
         Tok::True | Tok::False => "A boolean.",
         _ => return None,

@@ -203,7 +203,7 @@
           "name": "storage.type.function.rua"
         },
         {
-          "match": "\\b(let|type)\\b",
+          "match": "\\b(let|type|impl)\\b",
           "name": "storage.type.rua"
         },
         {

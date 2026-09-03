@@ -94,7 +94,7 @@ contexts:
   keywords:
     - match: '\b(if|else|match|while|for|loop|in|return|break|continue)\b'
       scope: keyword.control.rua
-    - match: '\b(let|mut|fn|type)\b'
+    - match: '\b(let|mut|fn|type|impl)\b'
       scope: storage.type.rua
     - match: '\b(true|false)\b'
       scope: constant.language.boolean.rua

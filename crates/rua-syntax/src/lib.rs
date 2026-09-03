@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod lower;
 pub mod fmt;
 pub mod lexer;
 pub mod parser;
@@ -37,5 +38,8 @@ impl SyntaxError {
 /// Parse and resolve a chunk, returning it with the frame size it needs.
 pub fn compile(src: &str) -> Result<(Block, usize), SyntaxError> {
     let parsed = parser::parse(src)?;
+    // `v.len()` becomes `Vec2::len(v)` where the shape is known, before
+    // anything else looks at the tree
+    let parsed = lower::lower(&parsed);
     Ok(resolve::resolve_chunk(&parsed))
 }

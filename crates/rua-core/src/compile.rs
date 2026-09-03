@@ -510,8 +510,10 @@ impl FnCompiler {
                     None => self.code[at] = Op::Nil { dst: 0 },
                 }
             }
-            // a type is checked, not run
+            // a type is checked, not run; an `impl` is rewritten by the
+            // resolver into the assignments that put its methods in place
             Stat::TypeAlias(..) => {}
+            Stat::Impl(..) => unreachable!("the resolver rewrites these"),
             Stat::Let(..) | Stat::FnDecl(..) => {
                 unreachable!("the resolver rewrites these")
             }

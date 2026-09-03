@@ -212,6 +212,23 @@ impl Parser {
                 self.accept(Tok::Semi);
                 Ok(Item::Stat(Stat::Let(names, exprs)))
             }
+            // `impl Vec2 { fn len(self) -> number { .. } }`
+            Tok::Impl => {
+                self.bump();
+                let name = self.name()?;
+                self.expect(Tok::LBrace)?;
+                let mut methods = Vec::new();
+                while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+                    let line = self.line();
+                    self.expect(Tok::Fn)?;
+                    let m = self.name()?;
+                    let f = self.funcbody(format!("{name}::{m}"), line)?;
+                    methods.push((m, f));
+                    self.accept(Tok::Semi);
+                }
+                self.expect(Tok::RBrace)?;
+                Ok(Item::Stat(Stat::Impl(name, methods)))
+            }
             // `type Point = #{ x: number, y: number }`
             Tok::Type => {
                 self.bump();

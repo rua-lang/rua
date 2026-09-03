@@ -2016,6 +2016,77 @@ fn the_checker_checks_a_method_written_as_a_field() {
     assert!(complaints("fn f(v: Vec2) { v.wobble(1) }\n").is_empty());
 }
 
+/// `impl` gives a shape methods without giving every value of it a copy of
+/// them. `v.len()` becomes `Vec2::len(v)` where the shape is known, which is
+/// a call anybody could have written and costs what writing it costs.
+#[test]
+fn impl_methods_resolve_to_a_call_on_the_type() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Vec2 = #{ x: number, y: number }
+        impl Vec2 {
+            fn len(self) -> number { self.x * self.x + self.y * self.y }
+            fn scaled(self, k: number) -> Vec2 { #{ x: self.x * k, y: self.y * k } }
+        }
+        fn make(x: number, y: number) -> Vec2 { #{ x: x, y: y } }
+
+        let written: Vec2 = #{ x: 3, y: 4 }
+        // no annotation: the shape comes from what `make` says it returns
+        let inferred = make(3, 4)
+        return written.len(), inferred.len(),
+               // a chain: the second method is found on what the first gave back
+               written.scaled(2).len(),
+               // and the long way round is the same function
+               Vec2::len(written);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 25.0);
+    assert_eq!(out[1].as_num().unwrap(), 25.0, "inferred from the return type");
+    assert_eq!(out[2].as_num().unwrap(), 100.0, "a chain keeps its footing");
+    assert_eq!(out[3].as_num().unwrap(), 25.0, "`Vec2::len(v)` is what it became");
+}
+
+/// A receiver whose shape nobody wrote down keeps the dispatch it always had.
+#[test]
+fn a_method_on_an_unknown_shape_is_left_alone() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Vec2 = #{ x: number }
+        impl Vec2 { fn len(self) -> number { 99 } }
+        // no type written and no `-> Vec2` to infer from
+        fn make(x) { #{ x: x } }
+        let v = make(1)
+        // the runtime's `len` on a table, not the one `impl` declared
+        return v.len(), [7, 8, 9].len();
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 0.0, "an ordinary table's array length");
+    assert_eq!(out[1].as_num().unwrap(), 3.0);
+}
+
+/// The checker holds an `impl` method to its signature, the receiver being
+/// the first parameter and the `.` supplying it.
+#[test]
+fn the_checker_checks_an_impl_method() {
+    let head = "type Vec2 = #{ x: number }\n\
+                impl Vec2 { fn scaled(self, k: number) -> Vec2 { self } }\n";
+    let complaints = |body: &str| -> Vec<String> {
+        rua::check(&format!("{head}{body}")).into_iter().map(|e| e.message).collect()
+    };
+    assert!(complaints("fn f(v: Vec2) -> Vec2 { v.scaled(2) }\n").is_empty());
+    assert!(complaints("fn f(v: Vec2) -> Vec2 { v.scaled() }\n")[0].contains("takes 1 argument"));
+    assert!(complaints("fn f(v: Vec2) -> Vec2 { v.scaled(\"x\") }\n")[0].contains("expects number"));
+    assert!(complaints("fn f(v: Vec2) -> number { v.scaled(2) }\n")[0].contains("expected number"));
+    // a name the shape does not mention is the runtime's business
+    assert!(complaints("fn f(v: Vec2) { v.wobble(1) }\n").is_empty());
+}
+
 /// A shape with a method on it names itself, and comparing two of them must
 /// not follow that name forever.
 #[test]

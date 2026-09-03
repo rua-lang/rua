@@ -10,7 +10,7 @@ pub enum Tok {
     Str(String),
     Name(String),
     // keywords
-    Break, Continue, Else, False, Fn, For, If, In, Let, Loop, Match, Mut, Nil, Return, True, Type, While,
+    Break, Continue, Else, False, Fn, For, If, Impl, In, Let, Loop, Match, Mut, Nil, Return, True, Type, While,
     // operators
     Plus, Minus, Star, Slash, Percent,
     Bang, AndAnd, OrOr,
@@ -38,6 +38,7 @@ impl std::fmt::Display for Tok {
             Tok::Fn => "fn",
             Tok::For => "for",
             Tok::If => "if",
+            Tok::Impl => "impl",
             Tok::In => "in",
             Tok::Let => "let",
             Tok::Loop => "loop",
@@ -517,6 +518,7 @@ impl<'a> Lexer<'a> {
             "fn" => Tok::Fn,
             "for" => Tok::For,
             "if" => Tok::If,
+            "impl" => Tok::Impl,
             "in" => Tok::In,
             "let" => Tok::Let,
             "loop" => Tok::Loop,
