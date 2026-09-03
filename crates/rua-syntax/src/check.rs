@@ -153,7 +153,22 @@ impl Checker {
     /// May a value of `from` be used where `to` is wanted? Silent whenever
     /// either side is unknown, which is what makes this gradual.
     fn fits(&self, from: &Type, to: &Type) -> bool {
+        self.fits_at(from, to, 0)
+    }
+
+    fn fits_at(&self, from: &Type, to: &Type, depth: usize) -> bool {
         if is_any(from) || is_any(to) {
+            return true;
+        }
+        // The same name on both sides needs no following, and following it
+        // would not stop: a shape with a method on it names itself, which is
+        // what `fn(self: Vec2) -> Vec2` is.
+        if let (Type::Named(a, aa, _), Type::Named(b, bb, _)) = (from, to) {
+            if a == b && aa.len() == bb.len() {
+                return aa.iter().zip(bb).all(|(x, y)| self.fits_at(x, y, depth + 1));
+            }
+        }
+        if depth > 24 {
             return true;
         }
         let (f, t) = (self.expand(from, 0), self.expand(to, 0));
@@ -176,19 +191,19 @@ impl Checker {
             (Type::Record(..) | Type::Array(..), Type::Named(b, _, _)) => &**b == "table",
             (Type::Fn(..), Type::Named(b, _, _)) => &**b == "function",
             (Type::Named(a, _, _), _) => &**a == "table" || &**a == "function",
-            (Type::Array(a, _), Type::Array(b, _)) => self.fits(a, b),
+            (Type::Array(a, _), Type::Array(b, _)) => self.fits_at(a, b, depth + 1),
             // every field the shape asks for, and of the right type. More
             // than that is fine: a bigger table is still that shape.
             (Type::Record(have, _), Type::Record(want, _)) => want.iter().all(|(n, wt)| {
                 have.iter()
                     .find(|(hn, _)| hn.text == n.text)
-                    .is_some_and(|(_, ht)| self.fits(ht, wt))
+                    .is_some_and(|(_, ht)| self.fits_at(ht, wt, depth + 1))
             }),
             (Type::Fn(fa, fr, _), Type::Fn(ta, tr, _)) => {
                 fa.len() == ta.len()
-                    && fa.iter().zip(ta).all(|((_, a), (_, b))| self.fits(b, a))
+                    && fa.iter().zip(ta).all(|((_, a), (_, b))| self.fits_at(b, a, depth + 1))
                     && match (fr, tr) {
-                        (Some(a), Some(b)) => self.fits(a, b),
+                        (Some(a), Some(b)) => self.fits_at(a, b, depth + 1),
                         _ => true,
                     }
             }
@@ -368,12 +383,48 @@ impl Checker {
                 self.signature_of(def)
             }
             Expr::Call(f, args) => self.call(f, args, span_of(e)),
-            Expr::Method(obj, _, args) => {
-                self.infer(obj);
-                args.iter().for_each(|a| {
-                    self.infer(a);
-                });
-                any(span_of(e))
+            // `v.len()` — the receiver is the first argument, so a method's
+            // type names it, and one type describes both `v.len()` and
+            // `vec2::len(v)` because they are the same call written twice.
+            Expr::Method(obj, name, args) => {
+                let receiver = self.infer(obj);
+                let given: Vec<(Type, Span)> =
+                    args.iter().map(|a| (self.infer(a), span_of(a))).collect();
+                let Type::Record(fields, _) = self.expand(&receiver, 0) else {
+                    return any(span_of(e));
+                };
+                let Some((_, found)) = fields.iter().find(|(n, _)| n.text == *name) else {
+                    // the runtime answers `len` on any table, so a name that
+                    // is not a field is only wrong if we knew every field —
+                    // and a shape says what it has, not what it lacks
+                    return any(span_of(e));
+                };
+                let Type::Fn(params, ret, _) = self.expand(found, 0) else {
+                    return any(span_of(e));
+                };
+                // the receiver takes the first parameter
+                let wanted = params.len().saturating_sub(1);
+                if wanted != given.len() {
+                    self.say(
+                        format!(
+                            "`{name}` takes {wanted} argument{}, given {}",
+                            if wanted == 1 { "" } else { "s" },
+                            given.len()
+                        ),
+                        span_of(e),
+                    );
+                    return ret.map(|r| *r).unwrap_or_else(|| any(span_of(e)));
+                }
+                for ((pname, want), (got, span)) in params.iter().skip(1).zip(&given) {
+                    if !self.fits(got, want) {
+                        let which = match pname {
+                            Some(n) => format!("`{n}` expects {want}"),
+                            None => format!("expected {want}"),
+                        };
+                        self.say(format!("{which}, found {got}"), *span);
+                    }
+                }
+                ret.map(|r| *r).unwrap_or_else(|| any(span_of(e)))
             }
             Expr::Index(obj, key) => {
                 let base = self.infer(obj);

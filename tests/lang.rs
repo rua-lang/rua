@@ -1994,6 +1994,40 @@ fn the_checker_says_nothing_about_what_was_not_promised() {
     }
 }
 
+/// A method is a field whose type is a function, and the receiver takes its
+/// first parameter — so one type describes both `v.scale(2)` and
+/// `vec2::scale(v, 2)`, which are the same call written twice.
+#[test]
+fn the_checker_checks_a_method_written_as_a_field() {
+    let shape = "type Vec2 = #{ x: number, scale: fn(self: Vec2, by: number) -> Vec2 }\n";
+    let complaints = |body: &str| -> Vec<String> {
+        rua::check(&format!("{shape}{body}"))
+            .into_iter()
+            .map(|e| e.message)
+            .collect()
+    };
+    assert!(complaints("fn f(v: Vec2) -> Vec2 { v.scale(2) }\n").is_empty(), "the right call");
+    let few = complaints("fn f(v: Vec2) -> Vec2 { v.scale() }\n");
+    assert!(few[0].contains("`scale` takes 1 argument, given 0"), "{few:?}");
+    let wrong = complaints("fn f(v: Vec2) -> Vec2 { v.scale(\"two\") }\n");
+    assert!(wrong[0].contains("`by` expects number, found string"), "{wrong:?}");
+    // a shape says what it has, not what it lacks: the runtime answers `len`
+    // on any table, so an unknown name is not an error
+    assert!(complaints("fn f(v: Vec2) { v.wobble(1) }\n").is_empty());
+}
+
+/// A shape with a method on it names itself, and comparing two of them must
+/// not follow that name forever.
+#[test]
+fn a_type_that_refers_to_itself_does_not_run_away() {
+    let src = "type Node = #{ next: Node, walk: fn(self: Node) -> Node }\n\
+               fn step(n: Node) -> Node { n.walk() }\n\
+               fn wrong(n: Node) -> number { n.walk() }\n";
+    let found = rua::check(src);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("expected number"), "{}", found[0].message);
+}
+
 /// Generics are filled in where they are used, which is what lets a checker
 /// say something concrete about them.
 #[test]

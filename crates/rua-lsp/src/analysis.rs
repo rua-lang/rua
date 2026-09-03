@@ -694,7 +694,19 @@ fn {}
                 // offer every global as though it were inside it
                 None => Vec::new(),
             },
-            Where::Method => self.methods(&scan),
+            Where::Method(receiver) => {
+                // A file being completed in does not parse: `v.` is half an
+                // expression, and the function holding it is lost with it —
+                // along with the annotation on the very parameter being asked
+                // about. Standing a name where the missing one goes gets the
+                // tree back. Only names are read from it, never spans.
+                let text = index.text();
+                let mut repaired = String::with_capacity(text.len() + 1);
+                repaired.push_str(&text[..offset as usize]);
+                repaired.push('_');
+                repaired.push_str(&text[offset as usize..]);
+                self.methods(&scan, &repaired, receiver.as_deref())
+            }
             Where::Require(prefix) => self.modules_beside(uri, &prefix),
             Where::Expression => self.in_scope(&scan, index.text()),
         };
@@ -703,10 +715,41 @@ fn {}
 
     /// The methods a `.` could be followed by: what the runtime answers for
     /// strings, tables and numbers, plus the field names this file uses.
-    fn methods(&self, scan: &rua_syntax::lexer::Scan) -> Vec<CompletionItem> {
+    fn methods(
+        &self,
+        scan: &rua_syntax::lexer::Scan,
+        text: &str,
+        receiver: Option<&str>,
+    ) -> Vec<CompletionItem> {
         use rua_core::MethodTable;
         let mut out = Vec::new();
         let mut seen: Vec<String> = Vec::new();
+        // what this value's own type says it has comes first, and says what
+        // each one is — a method written as a field carries its signature
+        if let Some(name) = receiver {
+            let (block, _) = rua_syntax::parser::parse_recover(text);
+            let types = crate::types::Types::read(&block);
+            let declared = rua_syntax::resolve::occurrences(&block)
+                .into_iter()
+                .find(|o| o.name.as_ref() == name)
+                .and_then(|o| o.decl)
+                .and_then(|d| types.at(d).cloned());
+            if let Some(t) = declared {
+                let filled = types.instantiate(&t);
+                if let Some(fields) = types.fields(&filled).or_else(|| types.fields(&t)) {
+                    for (field, ft) in fields {
+                        seen.push(field.to_string());
+                        let kind = match ft {
+                            rua_syntax::ast::Type::Fn(..) => CompletionItemKind::METHOD,
+                            _ => CompletionItemKind::FIELD,
+                        };
+                        let mut it = item(field, kind, &ft.to_string());
+                        it.sort_text = Some(format!("0{field}"));
+                        out.push(it);
+                    }
+                }
+            }
+        }
         for (kind, what) in [
             (MethodTable::Str, "string"),
             (MethodTable::Table, "table"),
@@ -872,7 +915,11 @@ fn {}
                 Some(Tok::Name(module)) => Where::Member(module.clone()),
                 _ => Where::Expression,
             },
-            Tok::Dot => Where::Method,
+            // whose fields these are, if the receiver is a name
+            Tok::Dot => Where::Method(match b.checked_sub(1).map(|j| &toks[j].tok) {
+                Some(Tok::Name(n)) => Some(n.clone()),
+                _ => None,
+            }),
             // `fn here`, `let here`, `let mut here` — a name being invented
             Tok::Fn | Tok::Let => Where::Naming,
             Tok::Mut if b > 0 && toks[b - 1].tok == Tok::Let => Where::Naming,
@@ -963,6 +1010,9 @@ fn {}
                     // `#{ ` — the shape comes from what it is being given to
                     return self.shape_of_map_at(toks, i - 1).map(Where::Field);
                 }
+                // a bare `{` at this depth opens a body, and a body is not
+                // inside the argument list of the function that owns it
+                Tok::LBrace if depth == 0 => return None,
                 Tok::LParen if depth == 0 => {
                     let Some(Tok::Name(callee)) = i.checked_sub(1).map(|j| &toks[j].tok) else {
                         return None;
@@ -1036,8 +1086,9 @@ enum Where {
     Require(String),
     /// After `mod::`.
     Member(String),
-    /// After a `.`.
-    Method,
+    /// After a `.` — the receiver's own fields when its type says, then the
+    /// methods the runtime answers. Never keywords.
+    Method(Option<String>),
     /// Naming something that does not exist yet, after `fn` or `let`.
     Naming,
     /// Where a type is written: after a `:`, after a `->`, or in a `type`.

@@ -647,3 +647,31 @@ fn a_map_literals_values_are_not_coloured_as_types() {
         "a value in a map is not a type: {got:?}"
     );
 }
+
+/// A method written as a field of a shape: `v.` offers what that shape says
+/// it has, with each one's type, before the methods the runtime answers.
+#[test]
+fn a_receiver_offers_the_fields_its_type_declares() {
+    let src = "type Vec2 = #{ x: number, y: number, scale: fn(self: Vec2, by: number) -> Vec2 }\n\
+               fn use_it(v: Vec2) -> number {\n\
+               v.\n\
+               }\n";
+    let (world, uri) = open(src);
+    let got = labels(&world, &uri, at(2, 2));
+    // its own first, in the order the shape declares them
+    assert_eq!(&got[..3], &["x", "y", "scale"], "{got:?}");
+    assert_eq!(detail(&world, &uri, at(2, 2), "scale"), "fn(self: Vec2, by: number) -> Vec2");
+    assert_eq!(detail(&world, &uri, at(2, 2), "x"), "number");
+    // the runtime's own are still there, after
+    assert!(got.contains(&"push".to_string()), "{got:?}");
+    assert!(!got.contains(&"break".to_string()), "still not keywords");
+}
+
+/// A value with no declared type falls back to what the runtime answers.
+#[test]
+fn a_receiver_with_no_type_offers_what_the_runtime_has() {
+    let (world, uri) = open("let plain = [1, 2]\nlet n = plain.\n");
+    let got = labels(&world, &uri, at(1, 14));
+    assert!(got.contains(&"push".to_string()), "{got:?}");
+    assert!(got.contains(&"len".to_string()), "{got:?}");
+}
