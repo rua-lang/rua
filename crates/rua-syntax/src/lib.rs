@@ -2,6 +2,7 @@
 //! frame slots. Nothing here knows what a value is at runtime.
 
 pub mod ast;
+pub mod check;
 pub mod fmt;
 pub mod lexer;
 pub mod parser;

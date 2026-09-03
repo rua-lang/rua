@@ -340,8 +340,8 @@ impl World {
     /// first one.
     pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
         let Some(index) = self.docs.get(uri) else { return Vec::new() };
-        let (_, errors) = rua_syntax::parser::parse_recover(index.text());
-        errors
+        let (block, syntax) = rua_syntax::parser::parse_recover(index.text());
+        let mut out: Vec<Diagnostic> = syntax
             .iter()
             .map(|e| Diagnostic {
                 range: span_range(index, e.span, e.line),
@@ -350,7 +350,19 @@ impl World {
                 message: e.message.clone(),
                 ..Default::default()
             })
-            .collect()
+            .collect();
+        // Only once it parses. A tree the parser had to guess at says little
+        // about types, and a wrong answer here is worse than none.
+        if syntax.is_empty() {
+            out.extend(rua_syntax::check::check(&block).iter().map(|e| Diagnostic {
+                range: span_range(index, e.span, e.line),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("rua".to_string()),
+                message: e.message.clone(),
+                ..Default::default()
+            }));
+        }
+        out
     }
 
     pub fn semantic_tokens(&self, p: &SemanticTokensParams) -> Option<SemanticTokensResult> {

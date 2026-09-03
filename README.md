@@ -138,9 +138,8 @@ coroutines. This is a scripting language that reads like Rust, not Rust.
 
 ## Types
 
-Optional, and written where Rust would write them. Nothing checks them yet —
-they parse, they are kept, and the editor reads them; a program means the
-same with them as without.
+Optional, and written where Rust would write them. What is written is
+checked; what is not written is `any`, and `any` fits everywhere.
 
 ```rust
 type Point   = #{ x: number, y: number }
@@ -191,6 +190,16 @@ itself. A gate that throws is two lines of rua:
 ```rust
 fn must(v, shape) { let (ok, why) = typeis(v, shape); if !ok { error(why) } v }
 ```
+
+```sh
+rua --check script.rua
+# script.rua:7: `p` expects Point, found #{ x: number }
+```
+
+The editor reports the same thing as you type. It is gradual and quiet: a
+program that wrote nothing down is held to nothing, a table with more fields
+than a shape asks for is still that shape, and a complaint only appears where
+both sides are known. Every program in this repository passes.
 
 The editor follows those down. Writing `serve("0.0.0.0:80", ` offers
 `handle` first, as *second of serve(..) — Handler<Body, Reply> =

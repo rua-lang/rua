@@ -1937,6 +1937,92 @@ fn a_type_is_a_value_like_any_other() {
     assert_eq!(out[6].to_string(), "false");
 }
 
+/// The checker holds a program to the promises it made itself, and says
+/// nothing about the ones it did not make.
+#[test]
+fn the_checker_catches_a_broken_promise() {
+    let complaints = |src: &str| -> Vec<String> {
+        rua::check(src).into_iter().map(|e| format!("{}: {}", e.line, e.message)).collect()
+    };
+
+    let bad = "type Point = #{ x: number, y: number }\n\
+               fn dist(p: Point, scale: number) -> number { p.x * scale }\n\
+               let a: number = \"hello\"\n\
+               let b = dist(#{ x: 1 }, 3)\n\
+               let c = dist(#{ x: 1, y: 2 }, \"three\")\n\
+               let d = dist(#{ x: 1, y: 2 })\n\
+               fn wrong(a: number) -> string { a }\n\
+               let e: Nope = 1\n";
+    let found = complaints(bad);
+    assert_eq!(found.len(), 6, "{found:#?}");
+    assert!(found[0].contains("3: expected number, found string"), "{found:#?}");
+    assert!(found[1].contains("`p` expects Point"), "the field `y` is missing: {found:#?}");
+    assert!(found[2].contains("`scale` expects number, found string"), "{found:#?}");
+    assert!(found[3].contains("takes 2 arguments, given 1"), "{found:#?}");
+    assert!(found[4].contains("expected string, found number"), "the return: {found:#?}");
+    assert!(found[5].contains("`Nope` is not a type"), "{found:#?}");
+}
+
+/// Gradual means quiet. A program that wrote nothing down is held to nothing,
+/// and a bigger table is still the shape a smaller one asked for.
+#[test]
+fn the_checker_says_nothing_about_what_was_not_promised() {
+    for src in [
+        // nothing written at all
+        "fn f(a, b) { a + b }\nlet x = f(1, \"two\")\n",
+        // written, and right
+        "type P = #{ x: number }\nfn f(p: P) -> number { p.x }\nlet n = f(#{ x: 1 })\n",
+        // more fields than the shape asks for is still that shape
+        "type P = #{ x: number }\nfn f(p: P) -> number { p.x }\nlet n = f(#{ x: 1, y: 2 })\n",
+        // `any` fits in both directions
+        "fn f(a: any) -> any { a }\nlet n: number = f(\"s\")\n",
+        // a record and an array are both tables
+        "fn f(t: table) -> number { 1 }\nlet a = f(#{ x: 1 })\nlet b = f([1, 2])\n",
+        // `+` joins strings as well as adding numbers
+        "let s: string = \"a\" + \"b\"\nlet n: number = 1 + 2\n",
+        // a name the runtime provides, which this file knows nothing about
+        "let n = print(1)\nlet t = typeof(2)\n",
+    ] {
+        let found = rua::check(src);
+        assert!(found.is_empty(), "complained about {src:?}: {found:?}");
+    }
+}
+
+/// Generics are filled in where they are used, which is what lets a checker
+/// say something concrete about them.
+#[test]
+fn the_checker_fills_in_a_generic_at_its_use() {
+    let src = "type Box<T> = #{ item: T }\n\
+               fn open_it(b: Box<number>) -> number { b.item }\n\
+               let good = open_it(#{ item: 1 })\n\
+               let bad = open_it(#{ item: \"s\" })\n";
+    let found = rua::check(src);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].line, 4);
+    assert!(found[0].message.contains("expects Box<number>"), "{}", found[0].message);
+}
+
+/// Every file in the repository passes, which is the property that decides
+/// whether a checker is used or turned off.
+#[test]
+fn the_checker_is_quiet_about_every_program_here() {
+    let mut checked = 0;
+    for dir in ["examples", "examples/lib", "bench"] {
+        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("rua") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            let found = rua::check(&src);
+            assert!(found.is_empty(), "{}: {found:?}", path.display());
+            checked += 1;
+        }
+    }
+    assert!(checked >= 15, "only checked {checked}");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

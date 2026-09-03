@@ -47,6 +47,16 @@ pub fn fmt(src: &str) -> Result<String, rua_syntax::SyntaxError> {
     rua_syntax::fmt::format(src)
 }
 
+/// Check the types a program wrote down. Empty when it has nothing to say,
+/// which is the usual answer: a name with no type is `any`, and `any` fits.
+pub fn check(src: &str) -> Vec<rua_syntax::SyntaxError> {
+    let (block, syntax) = rua_syntax::parser::parse_recover(src);
+    if !syntax.is_empty() {
+        return syntax;
+    }
+    rua_syntax::check::check(&block)
+}
+
 pub fn eval(src: &str) -> Res<Vec<Value>> {
     Vm::new().eval(src)
 }

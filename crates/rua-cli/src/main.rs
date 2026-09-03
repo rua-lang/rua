@@ -55,6 +55,10 @@ struct Args {
     #[arg(long)]
     fmt: bool,
 
+    /// Report what the types say is wrong, and run nothing
+    #[arg(long)]
+    check: bool,
+
     /// With --fmt, write the result back to the file
     #[arg(long)]
     write: bool,
@@ -150,6 +154,10 @@ fn main() {
         std::process::exit(format_files(&args));
     }
 
+    if args.check {
+        std::process::exit(check_files(&args));
+    }
+
     if args.dump_bytecode {
         let sources = args.eval.iter().cloned().chain(
             args.script
@@ -187,6 +195,31 @@ fn main() {
     if args.interactive || (args.script.is_none() && args.eval.is_empty()) {
         run_repl(&mut vm);
     }
+}
+
+/// `rua --check a.rua` — what the types say is wrong, and nothing run.
+fn check_files(args: &Args) -> i32 {
+    let paths: Vec<&String> = args.script.iter().chain(args.script_args.iter()).collect();
+    if paths.is_empty() {
+        eprintln!("rua --check: give it a file");
+        return 1;
+    }
+    let mut bad = 0;
+    for path in paths {
+        let src = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rua --check: cannot read {path}: {e}");
+                bad = 1;
+                continue;
+            }
+        };
+        for e in rua::check(&src) {
+            println!("{path}:{}: {}", e.line, e.message);
+            bad = 1;
+        }
+    }
+    bad
 }
 
 /// `rua --fmt a.rua b.rua`, and `--write` to do it in place.
