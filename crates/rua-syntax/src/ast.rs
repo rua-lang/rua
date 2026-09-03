@@ -290,7 +290,7 @@ pub enum Stat {
     /// The resolver puts each one on the type's own table, so `Vec2::len(v)`
     /// is what it becomes and what anybody may write by hand. A `v.len()`
     /// whose receiver is known becomes the same call.
-    Impl(Name, Vec<(Name, Expr)>),
+    Impl(Name, Vec<Name>, Vec<(Name, Expr)>),
     Assign(Vec<Expr>, Vec<Expr>),
     /// A compound assignment such as `x += 1`.
     OpAssign(Expr, BinOp, Expr),

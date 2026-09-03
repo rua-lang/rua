@@ -94,8 +94,20 @@ impl Checker {
     }
 
     fn collect_impls(&mut self, b: &Block) {
-        for s in &b.stats {
-            let Stat::Impl(name, methods) = s else { continue };
+        for (i, s) in b.stats.iter().enumerate() {
+            let Stat::Impl(name, params, methods) = s else { continue };
+            self.line = b.lines.get(i).copied().unwrap_or(0);
+            // the names a generic's methods may use stand for anything
+            let outer = std::mem::replace(&mut self.open, params.iter().map(|p| p.text.clone()).collect());
+            self.known(&Type::Named(name.text.clone(), Vec::new(), name.span));
+            self.open = outer;
+            // two of a name means one of them never runs, and which is not
+            // something a reader should have to work out
+            for (a, (m, _)) in methods.iter().enumerate() {
+                if methods[..a].iter().any(|(earlier, _)| earlier.text == m.text) {
+                    self.say(format!("`{m}` is implemented twice for `{name}`"), m.span);
+                }
+            }
             let found: Vec<(Rc<str>, Type)> = methods
                 .iter()
                 .filter_map(|(m, f)| match f {
@@ -275,10 +287,17 @@ impl Checker {
     fn stat(&mut self, s: &Stat) {
         match s {
             Stat::TypeAlias(..) => {}
-            Stat::Impl(_, methods) => {
+            Stat::Impl(_, params, methods) => {
+                // inside an `impl Box<T>`, `T` is a name that stands for
+                // whatever the shape was given
+                let outer = std::mem::replace(
+                    &mut self.open,
+                    params.iter().map(|p| p.text.clone()).collect(),
+                );
                 for (_, f) in methods {
                     self.infer(f);
                 }
+                self.open = outer;
             }
             Stat::Let(names, exprs) => {
                 // one name to one value is the case worth checking; the rest

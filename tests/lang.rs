@@ -2210,6 +2210,65 @@ fn a_method_is_found_wherever_its_receiver_came_from() {
     assert_eq!(out[2].as_num().unwrap(), 4.0, "declared inside the function using it");
 }
 
+/// A shape that takes parameters may have methods too, and inside them the
+/// parameters stand for whatever it was given.
+#[test]
+fn a_generic_shape_may_be_implemented() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Box<T> = #{ item: T }
+        impl Box<T> {
+            fn new(item: T) -> Box<T> { #{ item: item } }
+            fn get(self) -> T { self.item }
+            fn swap(self, item: T) -> Box<T> { Box::new(item) }
+        }
+        let b = Box::new(7)
+        let s: Box<string> = #{ item: "hi" }
+        return b.get(), b.swap(9).get(), s.get();
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 7.0);
+    assert_eq!(out[1].as_num().unwrap(), 9.0, "a chain through a generic");
+    assert_eq!(out[2].to_string(), "hi", "the same methods, filled in differently");
+}
+
+/// Implementing something nobody declared used to run until it could not,
+/// and say `cannot index a nil value` when it got there.
+#[test]
+fn implementing_an_undeclared_shape_is_reported() {
+    let found = rua::check("type P = #{ x: number }\nimpl P { fn a(self) -> number { 1 } }\nimpl Nope { fn b(self) -> number { 2 } }\n");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].line, 3);
+    assert!(found[0].message.contains("`Nope` is not a type"), "{}", found[0].message);
+    // and a method's body is held to its promise, generic or not
+    let generic = rua::check("type Box<T> = #{ item: T }\nimpl Box<T> { fn bad(self) -> number { \"no\" } }\n");
+    assert_eq!(generic.len(), 1, "{generic:?}");
+    assert!(generic[0].message.contains("expected number, found string"));
+}
+
+/// Two methods of a name means one of them never runs, and which is not
+/// something a reader should have to work out.
+#[test]
+fn a_method_implemented_twice_is_reported() {
+    let found = rua::check(
+        "type P = #{ x: number }\nimpl P { fn f(self) -> number { 1 } fn f(self) -> number { 2 } }\n",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].message.contains("`f` is implemented twice for `P`"), "{}", found[0].message);
+}
+
+/// Reading a field a shape does not mention is not an error, and that follows
+/// from the rule that a bigger table still fits: a value of this shape may
+/// have more than the shape says, so nothing here is provably wrong.
+#[test]
+fn reading_an_undeclared_field_is_not_an_error() {
+    assert!(rua::check("type P = #{ x: number }\nfn f(p: P) { p.extra }\n").is_empty());
+    assert!(rua::check("type P = #{ x: number }\nfn f(p: P) -> number { p.x }\nlet n = f(#{ x: 1, y: 2 })\n").is_empty());
+}
+
 /// A shape with a method on it names itself, and comparing two of them must
 /// not follow that name forever.
 #[test]

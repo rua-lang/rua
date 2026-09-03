@@ -216,6 +216,18 @@ impl Parser {
             Tok::Impl => {
                 self.bump();
                 let name = self.name()?;
+                // `impl Box<T>` — the names its methods may use, which stand
+                // for whatever the shape was given when it was written down
+                let mut params = Vec::new();
+                if self.accept(Tok::Lt) {
+                    while *self.peek() != Tok::Gt && *self.peek() != Tok::Eof {
+                        params.push(self.name()?);
+                        if !self.accept(Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(Tok::Gt)?;
+                }
                 self.expect(Tok::LBrace)?;
                 let mut methods = Vec::new();
                 while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
@@ -227,7 +239,7 @@ impl Parser {
                     self.accept(Tok::Semi);
                 }
                 self.expect(Tok::RBrace)?;
-                Ok(Item::Stat(Stat::Impl(name, methods)))
+                Ok(Item::Stat(Stat::Impl(name, params, methods)))
             }
             // `type Point = #{ x: number, y: number }`
             Tok::Type => {

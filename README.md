@@ -195,6 +195,18 @@ let v = Vec2::new(3, 4)
 print(v.len())          // becomes `Vec2::len(v)`, which you may also write
 ```
 
+A shape that takes parameters may be implemented too, and inside its methods
+the parameters stand for whatever it was given:
+
+```rust
+type Box<T> = #{ item: T }
+impl Box<T> {
+    fn new(item: T) -> Box<T> { #{ item: item } }
+    fn get(self) -> T { self.item }
+}
+let b = Box::new(7)     // b.get() is a number; a Box<string>'s is a string
+```
+
 A function with no `self` is what makes one, as in Rust. There is no `new`
 keyword and nothing special about the name: it is a function on the shape,
 and what it hands back says what shape that is — so the binding needs no

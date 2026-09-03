@@ -94,7 +94,7 @@ impl Scan<'_> {
             // a type declares nothing that runs, so there is nothing here to
             // capture and nothing to declare
             Stat::TypeAlias(..) => {}
-            Stat::Impl(_, methods) => {
+            Stat::Impl(_, _, methods) => {
                 methods.iter().for_each(|(_, f)| self.expr(f, inside));
             }
             Stat::FnDecl(name, e) => {
@@ -526,7 +526,7 @@ impl Resolver {
             // once, rather than a type and a validator that drift apart.
             // `impl Vec2 { fn len(self) .. }` is `Vec2.len = fn .. `, which
             // needs nothing new to run and is what anybody may write by hand
-            Stat::Impl(name, methods) => {
+            Stat::Impl(name, _params, methods) => {
                 let (mut targets, mut values) = (Vec::new(), Vec::new());
                 for (m, f) in methods {
                     targets.push(Expr::Index(
@@ -551,9 +551,13 @@ impl Resolver {
                         )])],
                     )
                 } else {
-                    // one that takes parameters describes nothing on its own;
-                    // it is a shape with holes until they are filled
-                    Stat::TypeAlias(name.clone(), params.clone(), t.clone())
+                    // One that takes parameters describes nothing on its own
+                    // — it is a shape with holes until they are filled — but
+                    // it still needs somewhere for `impl` to put its methods.
+                    Stat::Assign(
+                        vec![Expr::Global(name.text.clone(), GlobalCache::new())],
+                        vec![Expr::Map(Vec::new())],
+                    )
                 }
             }
             Stat::Assign(targets, exprs) => Stat::Assign(

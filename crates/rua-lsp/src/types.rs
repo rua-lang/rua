@@ -185,7 +185,7 @@ impl Types {
         match s {
             // the methods a shape has, kept beside its fields so that the
             // editor can offer them on a value of that type
-            Stat::Impl(name, methods) => {
+            Stat::Impl(name, _, methods) => {
                 for (m, f) in methods {
                     if let Expr::Func(def) = f {
                         self.methods

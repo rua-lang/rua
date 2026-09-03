@@ -58,7 +58,7 @@ impl Lower {
                 Stat::TypeAlias(name, _, t) => {
                     self.aliases.insert(name.text.clone(), t.clone());
                 }
-                Stat::Impl(name, ms) => {
+                Stat::Impl(name, _, ms) => {
                     let entry = self.methods.entry(name.text.clone()).or_default();
                     for (m, f) in ms {
                         let ret = match f {
@@ -189,8 +189,9 @@ impl Lower {
                 }
                 Stat::Let(names.clone(), exprs)
             }
-            Stat::Impl(name, ms) => Stat::Impl(
+            Stat::Impl(name, params, ms) => Stat::Impl(
                 name.clone(),
+                params.clone(),
                 ms.iter().map(|(m, f)| (m.clone(), self.expr(f))).collect(),
             ),
             Stat::FnDecl(name, f) => Stat::FnDecl(name.clone(), self.expr(f)),
