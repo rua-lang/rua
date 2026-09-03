@@ -1720,6 +1720,12 @@ fn formatting_lays_out_the_shapes_that_are_easy_to_get_wrong() {
         ),
         // and a line that begins by closing belongs with the one that opened
         ("if a {\nb\n} else {\nc\n}\n", "if a {\n    b\n} else {\n    c\n}\n"),
+        // a function type has no name between `fn` and what it takes
+        ("type H = fn (a: number) -> number\n", "type H = fn(a: number) -> number\n"),
+        // `<` is a comparison and a generic's bracket, and which one cannot
+        // be told without parsing, so the spacing written is the spacing kept
+        ("type B<T> = #{ item: T }\n", "type B<T> = #{ item: T }\n"),
+        ("let ok = a < b\n", "let ok = a < b\n"),
     ];
     for (input, want) in cases {
         assert_eq!(rua::fmt(input).unwrap(), want, "laying out {input:?}");

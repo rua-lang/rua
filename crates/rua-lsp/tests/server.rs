@@ -610,3 +610,40 @@ fn hover_says_what_a_name_and_a_type_and_a_function_are() {
     let b = world.hover_at(&uri, at(0, 6)).expect("hover on `Body`");
     assert!(b.contains("type Body = #{ path: string, bytes: number }"), "{b}");
 }
+
+
+/// A name standing where a type goes is a type, whatever it would have been
+/// in a value — and a name before a `:` inside a shape is the field, not one.
+#[test]
+fn a_type_is_coloured_as_a_type() {
+    let (world, uri) = open("type Point = #{ x: number }\nfn f(p: Point) -> number { p.x }\n");
+    let got: Vec<(String, String)> = world
+        .token_kinds(&uri)
+        .into_iter()
+        .map(|(t, k)| (t, k.as_str().to_string()))
+        .collect();
+    let of = |name: &str| -> String {
+        got.iter().find(|(t, _)| t == name).map(|(_, k)| k.clone()).unwrap_or_default()
+    };
+    assert_eq!(of("Point"), "type", "the name a shape is given");
+    assert_eq!(of("number"), "type", "and the words that need no declaring");
+    assert_eq!(of("x"), "property", "a field of the shape is not a type");
+    assert_eq!(of("f"), "function", "and the type does not leak past its end");
+    assert_eq!(of("p"), "variable", "nor onto the parameter it describes");
+}
+
+/// A `:` writes a type in a binding and a value in a map, and the colours
+/// have to tell them apart too.
+#[test]
+fn a_map_literals_values_are_not_coloured_as_types() {
+    let (world, uri) = open("let total = 1\nlet m = #{ count: total }\n");
+    let got: Vec<(String, String)> = world
+        .token_kinds(&uri)
+        .into_iter()
+        .map(|(t, k)| (t, k.as_str().to_string()))
+        .collect();
+    assert!(
+        got.iter().any(|(t, k)| t == "total" && k == "variable"),
+        "a value in a map is not a type: {got:?}"
+    );
+}

@@ -253,11 +253,22 @@ fn needs_space(pieces: &[Piece], i: usize) -> bool {
     if matches!(a, Tok::Dot | Tok::ColonColon) || matches!(b, Tok::Dot | Tok::ColonColon) {
         return false;
     }
-    // `f(`, `t[`, `name(` — a call or an index sits against its target
+    // `f(`, `t[`, `name(` — a call or an index sits against its target, and
+    // `fn(A) -> B` is a type whose `fn` sits against its arguments the same
+    // way, where `fn name(..)` has a name in between
     if matches!(b, Tok::LParen | Tok::LBracket)
-        && matches!(a, Tok::Name(_) | Tok::RParen | Tok::RBracket)
+        && matches!(a, Tok::Name(_) | Tok::RParen | Tok::RBracket | Tok::Fn)
     {
         return false;
+    }
+    // `<` and `>` are a comparison and a generic's brackets, and telling
+    // which without parsing is guesswork. The author already decided: keep
+    // the spacing they wrote.
+    if matches!(a, Tok::Lt | Tok::Gt) {
+        return cur.gap > 0;
+    }
+    if matches!(b, Tok::Lt | Tok::Gt) {
+        return cur.gap > 0;
     }
     // `#{` is one thing written as two tokens
     if matches!(a, Tok::Hash) {

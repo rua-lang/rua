@@ -23,6 +23,7 @@ pub const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::FUNCTION,
     SemanticTokenType::NAMESPACE,
     SemanticTokenType::PROPERTY,
+    SemanticTokenType::TYPE,
 ];
 
 const COMMENT: u32 = 0;
@@ -34,6 +35,7 @@ const VARIABLE: u32 = 5;
 const FUNCTION: u32 = 6;
 const NAMESPACE: u32 = 7;
 const PROPERTY: u32 = 8;
+const TYPE: u32 = 9;
 
 pub struct World {
     docs: Docs,
@@ -393,8 +395,15 @@ impl World {
     fn coloured(&self, index: &LineIndex) -> Vec<(rua_syntax::ast::Span, u32)> {
         use rua_syntax::ast::Span;
         let scan = Lexer::scan(index.text());
+        let types = type_positions(&scan.tokens);
         let mut out: Vec<(Span, u32)> = Vec::new();
         for (i, t) in scan.tokens.iter().enumerate() {
+            // a name standing where a type goes is a type, whatever it would
+            // have been in a value
+            if let (Some(kind), Tok::Name(_)) = (types[i], &t.tok) {
+                out.push((t.span, kind));
+                continue;
+            }
             if let Some(kind) = token_kind(&scan.tokens, i) {
                 out.push((t.span, kind));
             }
@@ -1099,6 +1108,116 @@ fn span_range(index: &LineIndex, span: rua_syntax::ast::Span, line: u32) -> Rang
         start: Position { line, character: 0 },
         end: Position { line, character: u32::MAX },
     }
+}
+
+/// Which tokens stand where a type is written.
+///
+/// A type begins after `type X =`, after a `->`, and after a `:` that
+/// introduces one rather than a map's value. It ends where the thing holding
+/// it does: at the `=` of a `let`, at the `,` before the next parameter, at
+/// the `{` that opens a body, or at the bracket that closes around it.
+fn type_positions(toks: &[Lexed]) -> Vec<Option<u32>> {
+    let mut out: Vec<Option<u32>> = vec![None; toks.len()];
+    let (mut depth, mut base, mut inside) = (0i32, 0i32, false);
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = &toks[i].tok;
+        // `type X` and `type X<T, U>` — the name and its parameters are types
+        if *tok == Tok::Type {
+            let mut j = i + 1;
+            if matches!(toks.get(j).map(|t| &t.tok), Some(Tok::Name(_))) {
+                out[j] = Some(TYPE);
+                j += 1;
+            }
+            if toks.get(j).map(|t| &t.tok) == Some(&Tok::Lt) {
+                j += 1;
+                while j < toks.len() && toks[j].tok != Tok::Gt {
+                    if matches!(toks[j].tok, Tok::Name(_)) {
+                        out[j] = Some(TYPE);
+                    }
+                    j += 1;
+                }
+                j += 1;
+            }
+            if toks.get(j).map(|t| &t.tok) == Some(&Tok::Assign) {
+                inside = true;
+                base = depth;
+                i = j + 1;
+                continue;
+            }
+            i = j;
+            continue;
+        }
+        if !inside {
+            let opens = match tok {
+                Tok::Arrow => true,
+                Tok::Colon => colon_before_a_type(toks, i),
+                _ => false,
+            };
+            if opens {
+                inside = true;
+                base = depth;
+                i += 1;
+                continue;
+            }
+        }
+        // a bare `{` inside a type is not part of it: it opens a body
+        if inside && *tok == Tok::LBrace && (i == 0 || toks[i - 1].tok != Tok::Hash) {
+            inside = false;
+        }
+        let closing = matches!(tok, Tok::RParen | Tok::RBracket | Tok::RBrace | Tok::Gt);
+        match tok {
+            Tok::LParen | Tok::LBracket | Tok::LBrace | Tok::Lt => depth += 1,
+            _ if closing => depth -= 1,
+            _ => {}
+        }
+        if inside {
+            match tok {
+                // the type is over: a value follows, or the next parameter
+                Tok::Assign | Tok::Semi => inside = false,
+                Tok::Comma if depth == base => inside = false,
+                // a bracket that closes back to where the type began ends it
+                _ if closing && depth <= base => inside = false,
+                // `x: number` inside a shape names a field, and `route:
+                // string` inside a function type names an argument — neither
+                // is a type, however much it looks like one
+                Tok::Name(_)
+                    if toks.get(i + 1).map(|t| &t.tok) == Some(&Tok::Colon) =>
+                {
+                    out[i] = Some(PROPERTY)
+                }
+                Tok::Name(_) => out[i] = Some(TYPE),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Does this `:` introduce a type, or a map literal's value?
+fn colon_before_a_type(toks: &[Lexed], colon: usize) -> bool {
+    let (mut depth, mut i) = (0i32, colon);
+    while i > 0 {
+        i -= 1;
+        match toks[i].tok {
+            Tok::RParen | Tok::RBrace | Tok::RBracket => depth += 1,
+            // `fn f(a: T)` — a parameter list belongs to a `fn`
+            Tok::LParen if depth == 0 => {
+                return i >= 2
+                    && matches!(toks[i - 1].tok, Tok::Name(_))
+                    && toks[i - 2].tok == Tok::Fn;
+            }
+            // `#{ x: T }` is a shape only inside a type
+            Tok::LBrace if depth == 0 => return false,
+            Tok::LBracket if depth == 0 => return false,
+            Tok::LParen | Tok::LBrace | Tok::LBracket => depth -= 1,
+            Tok::Let if depth == 0 => return true,
+            Tok::Semi if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Which colour a token gets. What it is lexically decides most of it; the

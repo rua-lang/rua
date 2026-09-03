@@ -1,0 +1,47 @@
+// Types in rua: optional, checked, and there at run time.
+//
+// Nothing here is required — a name with no type is `any`, and `any` fits
+// everywhere. What is written is checked by `rua --check` and by the editor
+// as you type, and the same declaration guards data coming in from outside.
+
+type Point = #{ x: number, y: number }
+type Ids = [number]
+
+// A type may take parameters, and a function type may name its arguments —
+// which is the point, since what an argument is *for* is what sends a reader
+// to the source.
+type Handler<T, U> = fn(route: string, data: T) -> U
+
+fn dist2(p: Point, scale: number) -> number {
+    (p.x * p.x + p.y * p.y) * scale
+}
+
+let origin: Point = #{ x: 3, y: 4 }
+let ids: Ids = [1, 2, 3]
+print("dist2 {dist2(origin, 2)}, {ids.len()} ids")
+
+// A table with more fields than the shape asks for is still that shape.
+let labelled = #{ x: 6, y: 8, name: "corner" }
+print("labelled is {dist2(labelled, 1)} away")
+
+// ---------------------------------------------------------------- guarding
+// A type is also a value describing itself, so the declaration above is the
+// only place the shape is written. `typeis` answers the way `try` does: the
+// yes or no first, and why not after it.
+type Item = #{ sku: string, qty: number }
+type Order = #{ id: number, items: [Item] }
+
+fn describe(order) {
+    let (ok, why) = typeis(order, Order)
+    if !ok { return "rejected — {why}" }
+    "accepted, {order.items.len()} item(s)"
+}
+
+print(describe(#{ id: 1, items: [#{ sku: "a", qty: 2 }] }))
+print(describe(#{ id: 1, items: [#{ sku: "a", qty: "two" }] }))
+print(describe(#{ id: 1 }))
+
+// The shapes are ordinary tables, so a type can be passed like any value.
+fn guard(shape) { |v| { typeis(v, shape) } }
+let is_point = guard(Point)
+print("is_point: {is_point(origin)} {is_point(42)}")
