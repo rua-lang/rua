@@ -42,6 +42,18 @@ struct Lower {
 impl Lower {
     fn collect(&mut self, b: &Block) {
         for s in &b.stats {
+            // a type and its methods may be written inside a function, and
+            // are found the same way there
+            match s {
+                Stat::While(_, _, body) | Stat::Loop(_, body) => self.collect(body),
+                Stat::ForRange { body, .. } | Stat::ForIn { body, .. } => self.collect(body),
+                Stat::FnDecl(_, Expr::Func(def)) => self.collect(&def.body),
+                Stat::Expr(e) | Stat::FnSlot(_, e) => self.collect_expr(e),
+                Stat::Let(_, es) | Stat::Return(es) => {
+                    es.iter().for_each(|e| self.collect_expr(e))
+                }
+                _ => {}
+            }
             match s {
                 Stat::TypeAlias(name, _, t) => {
                     self.aliases.insert(name.text.clone(), t.clone());
@@ -64,6 +76,24 @@ impl Lower {
                 _ => {}
             }
         }
+        if let Some(t) = &b.tail {
+            self.collect_expr(t);
+        }
+    }
+
+    fn collect_expr(&mut self, e: &Expr) {
+        match e {
+            Expr::Func(def) => self.collect(&def.body),
+            Expr::Do(b) => self.collect(b),
+            Expr::If(arms, els) => {
+                arms.iter().for_each(|(_, b)| self.collect(b));
+                if let Some(b) = els {
+                    self.collect(b);
+                }
+            }
+            Expr::Match(_, arms) => arms.iter().for_each(|a| self.collect(&a.body)),
+            _ => {}
+        }
     }
 
     /// The name of the shape a type stands for, following aliases.
@@ -71,11 +101,16 @@ impl Lower {
         let mut cur = t.clone();
         for _ in 0..16 {
             let Type::Named(n, _, _) = &cur else { return None };
+            // a name with methods is the answer; so is one whose body is a
+            // shape, even with nothing implemented for it, because a field of
+            // it may lead somewhere that does have them
             if self.methods.contains_key(n) {
                 return Some(n.clone());
             }
             match self.aliases.get(n) {
-                Some(next) => cur = next.clone(),
+                // `type Alias = Vec2` — one name for another, so follow it
+                Some(next @ Type::Named(..)) => cur = next.clone(),
+                Some(_) => return Some(n.clone()),
                 None => return None,
             }
         }
@@ -97,6 +132,14 @@ impl Lower {
     fn shape(&self, e: &Expr) -> Option<Rc<str>> {
         match e {
             Expr::Var(n) => self.shape_in_scope(&n.text),
+            // `o.inner` — a field whose declared type is itself a shape
+            Expr::Index(base, key) => {
+                let Expr::Str(field) = &**key else { return None };
+                let outer = self.shape(base)?;
+                let Type::Record(fields, _) = self.aliases.get(&outer)? else { return None };
+                let ft = fields.iter().find(|(n, _)| n.text == *field).map(|(_, t)| t)?;
+                self.shape_of(ft)
+            }
             Expr::Call(f, _) => match &**f {
                 // `make(3, 4)` where `fn make(..) -> Vec2`
                 Expr::Var(n) => self.returns.get(&n.text).cloned(),

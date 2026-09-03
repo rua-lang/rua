@@ -204,6 +204,10 @@ impl Scan<'_> {
     }
 }
 
+/// Where a type keeps the description of itself, out of the way of the
+/// methods `impl` puts beside it.
+pub const SHAPE: &str = "__shape";
+
 /// A type, as a value that describes it.
 ///
 /// The shapes are ordinary tables, so nothing new is needed to build them,
@@ -466,9 +470,26 @@ impl Resolver {
     /// A block that shares the surrounding scope — a function body, whose
     /// parameters are already declared.
     fn block_inner(&mut self, b: &Block) -> Block {
-        let stats = b.stats.iter().map(|s| self.stat(s)).collect();
+        // What a type is has to be in place before an `impl` can put methods
+        // beside it, and nobody writes their declarations in dependency
+        // order. Declaring a type does nothing else, so the assignments those
+        // become are moved to the front of the block they were written in and
+        // nothing observable moves with them.
+        let resolved: Vec<Stat> = b.stats.iter().map(|s| self.stat(s)).collect();
+        let is_type: Vec<bool> =
+            b.stats.iter().map(|s| matches!(s, Stat::TypeAlias(..))).collect();
+        let mut stats = Vec::with_capacity(resolved.len());
+        let mut lines = Vec::with_capacity(resolved.len());
+        for pass in [true, false] {
+            for (i, st) in resolved.iter().enumerate() {
+                if is_type[i] == pass {
+                    stats.push(st.clone());
+                    lines.push(b.lines.get(i).copied().unwrap_or(0));
+                }
+            }
+        }
         let tail = b.tail.as_ref().map(|t| Box::new(self.expr(t)));
-        Block { stats, lines: b.lines.clone(), tail, tail_line: b.tail_line }
+        Block { stats, lines, tail, tail_line: b.tail_line }
     }
 
     fn stat(&mut self, st: &Stat) -> Stat {
@@ -518,9 +539,16 @@ impl Resolver {
             }
             Stat::TypeAlias(name, params, t) => {
                 if params.is_empty() {
+                    // The shape goes under a name of its own, because `impl`
+                    // puts methods on this same table and a method called
+                    // `kind` would otherwise overwrite what the shape is —
+                    // quietly, so that only a later `typeis` would say so.
                     Stat::Assign(
                         vec![Expr::Global(name.text.clone(), GlobalCache::new())],
-                        vec![describe(t)],
+                        vec![Expr::Map(vec![(
+                            Expr::Str(SHAPE.into()),
+                            describe(t),
+                        )])],
                     )
                 } else {
                     // one that takes parameters describes nothing on its own;

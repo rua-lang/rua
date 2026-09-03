@@ -254,7 +254,13 @@ fn fits(vm: &Vm, v: &Value, ty: &Value, at: &str, why: &mut String, depth: usize
     if depth > 64 {
         return false;
     }
-    let Value::Table(shape) = ty else { return false };
+    let Value::Table(outer) = ty else { return false };
+    // a named type keeps its description under a reserved key, since methods
+    // sit beside it; the shapes nested inside one are bare
+    let shape = match outer.borrow().get_field(&RStr::new(rua_syntax::resolve::SHAPE)) {
+        Value::Table(inner) => inner,
+        _ => outer.clone(),
+    };
     let kind = match &shape.borrow().get_field(&RStr::new("kind")) {
         Value::Str(s) => s.to_string(),
         _ => return false,

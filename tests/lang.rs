@@ -1929,7 +1929,10 @@ fn a_type_is_a_value_like_any_other() {
         type Points = [Point]
         fn guard(shape) { |v| { typeis(v, shape) } }
         let is_point = guard(Point)
-        return Point.kind, Point.fields.x.kind, Points.kind, Points.of.name,
+        // the description lives under a name of its own, so that a method
+        // called `kind` cannot overwrite what the shape is
+        return Point.__shape.kind, Point.__shape.fields.x.kind,
+               Points.__shape.kind, Points.__shape.of.name,
                typeof(Point), is_point(#{ x: 1, y: 2 }), is_point(3);
         "#,
         )
@@ -2126,6 +2129,85 @@ fn the_checker_checks_an_impl_method() {
     assert!(complaints("fn f(v: Vec2) -> number { v.scaled(2) }\n")[0].contains("expected number"));
     // a name the shape does not mention is the runtime's business
     assert!(complaints("fn f(v: Vec2) { v.wobble(1) }\n").is_empty());
+}
+
+/// A method may be called anything, including the words the description of a
+/// shape uses — those live under a name of their own so the two cannot
+/// collide. It failed quietly before: only a later `typeis` said so.
+#[test]
+fn a_method_may_share_a_name_with_the_shapes_own_description() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type P = #{ x: number }
+        impl P {
+            fn kind(self) -> number { 7 }
+            fn fields(self) -> number { 8 }
+        }
+        let p: P = #{ x: 1 }
+        return typeis(p, P), p.kind(), p.fields(), typeis(#{ y: 1 }, P);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].to_string(), "true", "the shape still knows what it is");
+    assert_eq!(out[1].as_num().unwrap(), 7.0);
+    assert_eq!(out[2].as_num().unwrap(), 8.0);
+    assert_eq!(out[3].to_string(), "false", "and still refuses what does not fit");
+}
+
+/// Nobody writes their declarations in dependency order. Declaring a type
+/// does nothing else, so those go first and the rest is unmoved.
+#[test]
+fn a_type_may_be_used_before_it_is_declared() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        impl Q { fn one(self) -> number { self.n + 1 } }
+        type Q = #{ n: number }
+        type A = #{ b: B }
+        type B = #{ n: number }
+        let q: Q = #{ n: 4 }
+        return q.one(), typeis(#{ b: #{ n: 1 } }, A), typeis(#{ b: #{ n: "x" } }, A);
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 5.0, "`impl` before the type it is for");
+    assert_eq!(out[1].to_string(), "true", "one type naming another below it");
+    assert_eq!(out[2].to_string(), "false");
+}
+
+/// A receiver is not always a plain name: it may be a field of something, or
+/// reached through a name for a name, and a type may be written inside the
+/// function that uses it.
+#[test]
+fn a_method_is_found_wherever_its_receiver_came_from() {
+    let mut vm = Vm::new();
+    let out = vm
+        .eval(
+            r#"
+        type Inner = #{ n: number }
+        impl Inner { fn twice(self) -> number { self.n * 2 } }
+        type Outer = #{ inner: Inner }
+        type Alias = Inner
+
+        fn nested() -> number {
+            type Local = #{ v: number }
+            impl Local { fn half(self) -> number { self.v / 2 } }
+            let l: Local = #{ v: 8 }
+            l.half()
+        }
+
+        let o: Outer = #{ inner: #{ n: 3 } }
+        let a: Alias = #{ n: 5 }
+        return o.inner.twice(), a.twice(), nested();
+        "#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(out[0].as_num().unwrap(), 6.0, "a field whose type has methods");
+    assert_eq!(out[1].as_num().unwrap(), 10.0, "one name for another");
+    assert_eq!(out[2].as_num().unwrap(), 4.0, "declared inside the function using it");
 }
 
 /// A shape with a method on it names itself, and comparing two of them must
