@@ -470,6 +470,7 @@ impl Vm {
             rt: RefCell::new(None),
             returns_nil: std::cell::Cell::new(false),
             returns_table: std::cell::Cell::new(false),
+            returns_bool: std::cell::Cell::new(false),
             upvals: Rc::new(Vec::new()),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -761,6 +762,7 @@ impl Vm {
                             // the syntax, so a small callee can be compiled
                             // into the caller's object and inlined there
                             def: Some(g.def().clone()),
+                            returns_bool: g.returns_bool.get(),
                         },
                     );
                 }
@@ -912,6 +914,9 @@ impl Vm {
             Value::Table(unsafe { rc_of(made) })
         } else if func.returns_nil.get() {
             Value::Nil
+        } else if func.returns_bool.get() {
+            // it travelled as 1 or 0; it was a boolean before and after
+            Value::Bool(n != 0.0)
         } else {
             Value::Num(n)
         };
@@ -1054,6 +1059,7 @@ impl Vm {
             rt: RefCell::new(None),
             returns_nil: std::cell::Cell::new(false),
             returns_table: std::cell::Cell::new(false),
+            returns_bool: std::cell::Cell::new(false),
             upvals: Rc::new(cells),
             hits: std::cell::Cell::new(0),
             jit: std::cell::Cell::new(None),
@@ -1173,6 +1179,7 @@ impl Vm {
                 *func.param_kinds.borrow_mut() = out.param_kinds;
                 func.returns_nil.set(out.returns_nil);
                 func.returns_table.set(out.returns_table);
+                func.returns_bool.set(out.returns_bool);
                 if let Some(old) = func.rt.borrow_mut().replace(ctx) {
                     // someone else's compiled code may still call through it
                     self.retired_ctx.push(old);

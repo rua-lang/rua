@@ -374,6 +374,8 @@ pub struct Function {
     /// Whether its result is a table it made, which comes back through the
     /// entry point's out parameter rather than as the `f64`.
     pub returns_table: Cell<bool>,
+    /// Whether its result is a boolean, carried in the `f64` as 1 or 0.
+    pub returns_bool: Cell<bool>,
     /// Captured variables, in the order `FuncDef::upvals` describes.
     pub upvals: Rc<Vec<CellRef>>,
     pub hits: Cell<u32>,

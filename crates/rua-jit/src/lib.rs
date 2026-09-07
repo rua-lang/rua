@@ -260,6 +260,9 @@ pub struct Compiled {
     /// The function's value is a table it made: the `f64` result means
     /// nothing and the address comes back through the out parameter.
     pub returns_table: bool,
+    /// The function's value is a boolean, carried as 1 or 0 in the `f64`, so
+    /// the runtime hands back a boolean rather than a number.
+    pub returns_bool: bool,
     /// Globals whose current value was compiled in as a direct call.
     pub inlined: Vec<String>,
     /// What each parameter has to be for the compiled code to apply.
@@ -352,15 +355,26 @@ impl Jit {
         // is both the cache key and what keeps dlopen — which caches by path —
         // honest when a function is recompiled into different code.
         let file_stem = symbol.clone();
+        // its value is a boolean when every way out of it is one
+        let returns_bool =
+            !returns_nil && hands_back_bool(&def.body, &self_ref.compiled_globals);
         let (src, inlined, keys, param_kinds, returns_table) =
-            self.lower_function(def, &symbol, self_ref, returns_nil)?;
+            self.lower_function(def, &symbol, self_ref, returns_nil, returns_bool)?;
 
         let addr = self.build(&file_stem, &symbol, &src, &def.name)?;
         // SAFETY: `build` returned the address of the `extern "C"` entry point
         // generated just above, which has exactly the `Entry` signature.
         let entry = unsafe { std::mem::transmute::<*const (), Entry>(addr) };
         let code = JitFn { entry, arity: def.params.len() };
-        Ok(Compiled { code, inlined, keys, param_kinds, returns_nil, returns_table })
+        Ok(Compiled {
+            code,
+            inlined,
+            keys,
+            param_kinds,
+            returns_nil,
+            returns_table,
+            returns_bool,
+        })
     }
 
     /// Compile one hot loop into a function over its live numeric locals.
@@ -448,6 +462,7 @@ impl Jit {
             arity: usize::MAX, // there is no self call from a loop body
             inlined: Vec::new(),
             self_param_kinds: Vec::new(),
+            returns_bool: false,
             keys: Vec::new(),
             writes,
             mutable_views: mutable_views.clone(),
@@ -758,6 +773,7 @@ impl Jit {
         symbol: &str,
         self_ref: SelfRef,
         returns_nil: bool,
+        returns_bool: bool,
     ) -> Lower<(String, Vec<String>, Vec<String>, Vec<Kind>, bool)> {
         if def.param_bindings.iter().any(|b| b.cell) {
             return Err("a parameter is captured by a closure".into());
@@ -849,6 +865,7 @@ impl Jit {
             on_trap: quote! { return 0.0; },
             ret_slot,
             returns_table: ret_slot.is_some() || hands_back_map,
+            returns_bool,
         };
         let body = if returns_nil {
             let inner = cx.block(&def.body, false)?;
@@ -1052,7 +1069,9 @@ impl Jit {
                 hooks,
             };
             let returns_nil = d.body.tail.is_none() && !ends_with_return;
-            let (callee_src, _, _, _, _) = self.lower_function(d, &sym, leaf, returns_nil)?;
+            let bools = !returns_nil && hands_back_bool(&d.body, &HashMap::new());
+            let (callee_src, _, _, _, _) =
+                self.lower_function(d, &sym, leaf, returns_nil, bools)?;
             extra.push_str(item_of(&callee_src, &sym));
         }
         let at = item_start(&src, symbol);
@@ -1905,6 +1924,8 @@ pub struct Callable {
     pub addr: usize,
     pub kinds: Vec<Kind>,
     pub def: Option<std::rc::Rc<FuncDef>>,
+    /// Its value is a boolean, carried in the `f64` as 1 or 0.
+    pub returns_bool: bool,
 }
 
 /// What the inference walk needs to know about the functions being called.
@@ -2632,6 +2653,8 @@ struct Ctx {
     /// direct self call is able to pass.
     /// What this function's own parameters are, for a recursive call.
     self_param_kinds: Vec<Kind>,
+    /// This function's value is a boolean, so its exits produce 1 or 0.
+    returns_bool: bool,
     /// What each slot holds: a number, or a table reached through the hooks.
     kinds: HashMap<u16, Kind>,
     /// True when this code appends to a table. Once it has written something,
@@ -2673,6 +2696,62 @@ struct Ctx {
 
 /// Does any path in this block return a value? A procedure may contain bare
 /// `return`s, but not a mix of the two.
+/// Is this expression's value a boolean?
+///
+/// Written syntactically, because that is all that is needed: a comparison,
+/// a `!`, a `true`, or an `&&`/`||` whose *both* sides are already booleans.
+/// That last condition is the one that matters — `a && b` in rua yields one
+/// of its operands rather than a boolean, and rua counts `0` as true, so
+/// flattening it to 1 or 0 is only faithful when both sides were booleans to
+/// begin with.
+fn boolean_valued(e: &Expr, callees: &Callees) -> bool {
+    match e {
+        Expr::Bool(_) => true,
+        Expr::Un(UnOp::Not, _) => true,
+        Expr::Bin(op, a, b) => match op {
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => true,
+            BinOp::And | BinOp::Or => {
+                boolean_valued(a, callees) && boolean_valued(b, callees)
+            }
+            _ => false,
+        },
+        // a call to something already compiled that hands one back
+        Expr::Call(f, _) => match &**f {
+            Expr::Global(name, _) => {
+                callees.get(&**name).is_some_and(|c| c.returns_bool)
+            }
+            _ => false,
+        },
+        Expr::Do(b) => b.tail.as_deref().is_some_and(|t| boolean_valued(t, callees)),
+        _ => false,
+    }
+}
+
+/// Does every way out of this body hand back a boolean?
+fn hands_back_bool(b: &Block, callees: &Callees) -> bool {
+    fn every_return(b: &Block, callees: &Callees) -> bool {
+        b.stats.iter().all(|st| match st {
+            Stat::Return(es) => match &es[..] {
+                [one] => boolean_valued(one, callees),
+                _ => true,
+            },
+            Stat::While(_, _, body) | Stat::Loop(_, body) => every_return(body, callees),
+            Stat::ForRange { body, .. } | Stat::ForIn { body, .. } => {
+                every_return(body, callees)
+            }
+            Stat::Expr(Expr::If(arms, els)) => {
+                arms.iter().all(|(_, blk)| every_return(blk, callees))
+                    && els.as_ref().is_none_or(|blk| every_return(blk, callees))
+            }
+            _ => true,
+        })
+    }
+    match b.tail.as_deref() {
+        Some(t) => boolean_valued(t, callees) && every_return(b, callees),
+        None => false,
+    }
+}
+
 fn returns_a_value(b: &Block) -> bool {
     let mut found = false;
     value_returns_block(b, &mut found);
@@ -3035,6 +3114,12 @@ impl Ctx {
                 let id = ident(b.slot);
                 quote! { { unsafe { *__ret = #id; } 0.0 } }
             }
+            // a boolean travels in the `f64` as 1 or 0, and the runtime
+            // turns it back into one on the way out
+            (Some(e), true) if self.returns_bool => {
+                let c = self.truthy(e)?;
+                quote! { (if #c { 1.0f64 } else { 0.0f64 }) }
+            }
             // the same exit, for a function whose value is the table itself
             (Some(e), true) if self.returns_table && ret_here.is_none() => {
                 let v = self.node_expr(e)?;
@@ -3310,6 +3395,10 @@ impl Ctx {
                 let id = ident(b.slot);
                 quote! { unsafe { *__ret = #id; } return 0.0; }
             }
+            Stat::Return(exprs) if self.returns_bool && exprs.len() == 1 => {
+                let c = self.truthy(&exprs[0])?;
+                quote! { return if #c { 1.0f64 } else { 0.0f64 }; }
+            }
             // `return #{ .. }`: the table leaves the same way the tail's does
             Stat::Return(exprs) if self.returns_table && exprs.len() == 1 => {
                 let v = self.node_expr(&exprs[0])?;
@@ -3536,6 +3625,19 @@ impl Ctx {
     /// would be encoded as are indistinguishable — and rua is Lua-shaped, where
     /// `0` is true. Rather than guess, anything that is not a comparison or a
     /// combination of comparisons sends the function back to the interpreter.
+    /// Is this callee one whose value is a boolean?
+    fn call_returns_bool(&self, f: &Expr) -> bool {
+        match f {
+            Expr::Global(name, _) => self
+                .self_ref
+                .compiled_globals
+                .get(&**name)
+                .is_some_and(|c| c.returns_bool),
+            Expr::Upval(i, _) => Some(*i) == self.self_ref.upval && self.returns_bool,
+            _ => false,
+        }
+    }
+
     fn truthy(&mut self, e: &Expr) -> Lower<TokenStream> {
         match e {
             Expr::Bool(b) => {
@@ -3575,6 +3677,12 @@ impl Ctx {
             Expr::Un(UnOp::Not, a) => {
                 let v = self.truthy(a)?;
                 Ok(quote! { (!#v) })
+            }
+            // a call to something that hands back a boolean, which arrives
+            // as 1 or 0
+            Expr::Call(f, _) if self.call_returns_bool(f) => {
+                let v = self.expr(e)?;
+                Ok(quote! { ((#v) != 0.0) })
             }
             // a local that only ever held a condition
             Expr::Local(b, _) if self.bools.contains(&b.slot) && self.known.contains(&b.slot) => {

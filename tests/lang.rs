@@ -2352,6 +2352,69 @@ fn a_container_may_be_built_from_what_it_replaces() {
     assert_eq!(out[7].as_num().unwrap(), 3.0);
 }
 
+/// A function whose value is a boolean. The `f64` an entry point hands back
+/// carries it as 1 or 0, and the runtime turns it into a boolean again — so
+/// the compiled answer and the interpreted one are the same value, not just
+/// the same truth.
+#[test]
+fn a_compiled_function_may_hand_back_a_boolean() {
+    let src = r#"
+        fn is_big(n) { n > 100 }
+        fn between(n) { n > 10 && n < 50 }
+        fn either(n) { n < 0 || n > 100 }
+        fn negated(n) { !(n > 5) }
+        // the caller uses the answer as a condition, which needs it to be
+        // known as a boolean rather than a number
+        fn count(k) {
+            let c = 0
+            let i = 0
+            while i < k { if is_big(i) { c += 1 } i += 1 }
+            c
+        }
+        let warm = count(400)
+        return warm, is_big(200), is_big(3), between(20), between(60),
+               either(-1), either(20), negated(1), typeof(is_big(1));
+    "#;
+    let mut interp = Vm::new();
+    interp.jit.enabled = false;
+    let a = interp.eval(src).unwrap();
+
+    let mut jitted = Vm::new();
+    jitted.jit.threshold = 2;
+    let b = jitted.eval(src).unwrap();
+
+    let shown = |v: &[Value]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    assert_eq!(shown(&a), shown(&b), "compiled and interpreted disagree");
+    assert_eq!(b[1].to_string(), "true");
+    assert_eq!(b[2].to_string(), "false");
+    assert_eq!(b[3].to_string(), "true", "`&&` of two comparisons");
+    assert_eq!(b[4].to_string(), "false");
+    assert_eq!(b[5].to_string(), "true", "`||` of two comparisons");
+    assert_eq!(b[8].to_string(), "boolean", "a boolean, not the number 1");
+    assert!(jitted.jit.compiled >= 2, "is_big and count should both compile");
+}
+
+/// Only when *every* way out is a boolean. One that hands back a number down
+/// some path is not one, and must not come back as `true`.
+#[test]
+fn a_function_that_sometimes_returns_a_number_is_not_a_boolean() {
+    let src = r#"
+        fn tail_is_a_number(n) { if n > 0 { return true } 5 }
+        fn a_return_is_a_number(n) { if n > 0 { return 5 } n > 1 }
+        let i = 0
+        while i < 60 { tail_is_a_number(i); a_return_is_a_number(i); i += 1 }
+        return typeof(tail_is_a_number(3)), typeof(tail_is_a_number(-1)),
+               a_return_is_a_number(3), typeof(a_return_is_a_number(-1));
+    "#;
+    let mut vm = Vm::new();
+    vm.jit.threshold = 2;
+    let out = vm.eval(src).unwrap();
+    assert_eq!(out[0].to_string(), "boolean");
+    assert_eq!(out[1].to_string(), "number", "the number 5, not `true`");
+    assert_eq!(out[2].as_num().unwrap(), 5.0);
+    assert_eq!(out[3].to_string(), "boolean");
+}
+
 /// `fs::lines` hands back one line at a time rather than a table of all of
 /// them, so a file larger than memory still goes through. Stopping early has
 /// to be allowed, and a file that isn't there has to say so at the call.

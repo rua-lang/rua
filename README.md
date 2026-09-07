@@ -531,6 +531,14 @@ the recursion in binarytrees and not by four field reads in a small function.
 Fields that hold tables stayed, because those are what a walk over a tree is
 made of.
 
+A function whose value is a boolean compiles now — `fn is_big(n) { n > 100 }`
+and an `&&` of two comparisons — and its caller may use the answer as a
+condition. It travels in the `f64` an entry point hands back, as 1 or 0, and
+comes out a boolean again. Worth 16x on a loop that asks one such question
+per iteration, and nothing at all on the benchmarks here, whose small
+predicates are stopped by something else: strings, or a slot that is a number
+in one place and a table in another.
+
 What is left is the value representation. Every register write releases a real
 handle and every read of a heap value takes one; removing that is a POD value
 with a tracing GC, which is a different interpreter rather than a patch to this
